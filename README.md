@@ -22,6 +22,24 @@ Collection is cursor-paginated and records per-source health. Crossref and
 OpenAlex are attempted independently, so a Crossref outage can degrade a source
 without discarding usable OpenAlex results.
 
+Feedback is stored both as current state and as an append-only audit history.
+Interested and not-interested judgments require a reason and are exported as
+balanced positive/negative examples in every later Codex screening queue.
+Favorites and unread/read/read-later state are independent of relevance.
+
+Research-profile edits never become active implicitly. Create a draft, review
+it, and confirm its numeric version to activate it:
+
+```bash
+academic-radar profile draft --db "$RADAR_STATE/papers.sqlite3" \
+  --file proposed-profile.md --summary "Add false-positive boundary"
+academic-radar profile confirm --db "$RADAR_STATE/papers.sqlite3" \
+  --id 2 --profile-file "$RADAR_STATE/research-profile.md"
+```
+
+The collector refuses to run when the profile file differs from the confirmed
+active database version. This makes accidental interest drift visible.
+
 ## Quick start
 
 Requires Python 3.9 or newer.

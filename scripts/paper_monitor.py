@@ -8,8 +8,12 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.0"
-SCHEMA_VERSION = 2
+PROJECT_SRC=Path(__file__).resolve().parents[1]/"src"
+if PROJECT_SRC.exists() and str(PROJECT_SRC) not in sys.path: sys.path.insert(0,str(PROJECT_SRC))
+from academic_radar.storage import upgrade_database
+
+VERSION = "0.3.0"
+SCHEMA_VERSION = 3
 
 try:
     import tomllib
@@ -114,6 +118,7 @@ def resolve_state(cfg: dict[str,Any], config_path: Path) -> Path:
     return raw if raw.is_absolute() else (config_path.parent / raw).resolve()
 
 def db_open(path: Path) -> sqlite3.Connection:
+    upgrade_database(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
@@ -352,6 +357,30 @@ def row_to_paper(row: sqlite3.Row) -> Paper:
     return Paper(row["identity"],row["doi"] or "",row["title"],row["abstract"] or "",row["venue"] or "",
       row["published"] or "",row["url"] or "",json.loads(row["authors_json"] or "[]"),"database")
 
+def confirmed_profile(db: sqlite3.Connection, profile_path: Path) -> sqlite3.Row:
+    content=profile_path.read_text(encoding="utf-8"); digest=hashlib.sha256(content.encode()).hexdigest()
+    active=db.execute("SELECT * FROM profile_versions WHERE status='active'").fetchone()
+    if not active:
+        now=dt.datetime.now(dt.timezone.utc).isoformat()
+        with db:
+            db.execute("""INSERT INTO profile_versions(
+              profile_hash,content,status,source,change_summary,created_at,confirmed_at
+            ) VALUES(?,?,'active','legacy_import','Imported existing profile',?,?)""",(digest,content,now,now))
+        active=db.execute("SELECT * FROM profile_versions WHERE status='active'").fetchone()
+    if active["profile_hash"]!=digest:
+        raise ValueError("research-profile.md differs from the confirmed active version; create and confirm a profile draft")
+    return active
+
+def feedback_snapshot(db: sqlite3.Connection, per_class: int=20) -> list[dict[str,Any]]:
+    examples=[]
+    for interest in ("interested","not_interested"):
+        rows=db.execute("""SELECT f.interest,f.reason,f.updated_at,p.identity,p.title,p.abstract,p.venue
+          FROM paper_feedback f JOIN papers p ON p.identity=f.identity
+          WHERE f.interest=? ORDER BY f.updated_at DESC LIMIT ?""",(interest,max(1,per_class))).fetchall()
+        examples.extend(dict(row) for row in rows)
+    examples.sort(key=lambda x:x["updated_at"],reverse=True)
+    return examples
+
 def update_source_health(db: sqlite3.Connection, source: str, status: str, now: str, error: str="") -> None:
     prior=db.execute("SELECT * FROM source_health WHERE source=?",(source,)).fetchone()
     failures=(int(prior["consecutive_failures"]) if prior else 0) + (1 if status=="failed" else 0)
@@ -411,8 +440,8 @@ def collect_into_db(cfg: dict[str,Any], db: sqlite3.Connection, now: str, run_id
 def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False) -> int:
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
     profile_path=state/cfg["profile_file"]
-    profile=profile_path.read_text(encoding="utf-8"); phash=hashlib.sha256(profile.encode()).hexdigest()
     now=dt.datetime.now(dt.timezone.utc).isoformat(); run_id=now.replace(":","-"); db=db_open(state/"papers.sqlite3")
+    active=confirmed_profile(db,profile_path); phash=active["profile_hash"]
     if no_collect: collected,new,failures=[],[],[]
     else: collected,new,failures=collect_into_db(cfg,db,now,run_id)
     if rescreen:
@@ -424,8 +453,11 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
     papers=[asdict(row_to_paper(row)) for row in rows]
     queue_dir=state/"agent_queue"; queue_dir.mkdir(exist_ok=True)
     queue_path=queue_dir/f"{run_id.replace('+','_')}.json"
-    payload={"schema_version":1,"run_id":run_id,"profile_hash":phash,"profile_path":str(profile_path),
-             "threshold":float(cfg.get("relevance_threshold",0.62)),"papers":papers,"source_failures":failures}
+    examples=feedback_snapshot(db,int(cfg.get("feedback_examples_per_class",20)))
+    payload={"schema_version":2,"run_id":run_id,"profile_hash":phash,"profile_version_id":active["id"],
+             "profile_confirmed_at":active["confirmed_at"],"profile_path":str(profile_path),
+             "feedback_examples":examples,"threshold":float(cfg.get("relevance_threshold",0.62)),
+             "papers":papers,"source_failures":failures}
     queue_path.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
     summary={"run_id":run_id,"collected":len(collected),"new":len(new),"candidates":len(papers),
              "queue_path":str(queue_path),"profile_path":str(profile_path),"source_failures":failures}
@@ -439,19 +471,22 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
         (run_id,"agent-export",run_status,profile_row[0] if profile_row else None,now,dt.datetime.now(dt.timezone.utc).isoformat(),len(collected),len(papers),0,
          "; ".join(x["error"] for x in failures) or None,json.dumps(summary,ensure_ascii=False)))
         db.execute("""INSERT OR REPLACE INTO agent_jobs(
-          run_id,profile_hash,status,queue_path,results_path,exported_count,imported_count,created_at,imported_at
-        ) VALUES(?,?,'exported',?,NULL,?,0,?,NULL)""",(run_id,phash,str(queue_path),len(papers),now))
+          run_id,profile_hash,status,queue_path,results_path,exported_count,imported_count,created_at,imported_at,
+          profile_version_id,feedback_snapshot_json
+        ) VALUES(?,?,'exported',?,NULL,?,0,?,NULL,?,?)""",
+        (run_id,phash,str(queue_path),len(papers),now,active["id"],json.dumps(examples,ensure_ascii=False)))
     required={s["name"] for s in cfg["sources"] if s.get("required",True)}
     failed_required={x["source"] for x in failures if x.get("status")=="failed" and x["source"] in required}
     print(json.dumps(summary,ensure_ascii=False,indent=2)); return 1 if required and failed_required==required else 0
 
 def agent_import(config_path: Path, results_path: Path) -> int:
-    cfg=config_load(config_path); state=resolve_state(cfg,config_path); profile=(state/cfg["profile_file"]).read_text(encoding="utf-8")
-    phash=hashlib.sha256(profile.encode()).hexdigest(); data=json.loads(results_path.read_text(encoding="utf-8"))
+    cfg=config_load(config_path); state=resolve_state(cfg,config_path); db=db_open(state/"papers.sqlite3")
+    active=confirmed_profile(db,state/cfg["profile_file"]); phash=active["profile_hash"]
+    data=json.loads(results_path.read_text(encoding="utf-8"))
     if data.get("profile_hash") != phash: raise ValueError("Result profile_hash does not match the current research profile")
     results=data.get("results");
     if not isinstance(results,list): raise ValueError("results must be a list")
-    db=db_open(state/"papers.sqlite3"); now=dt.datetime.now(dt.timezone.utc).isoformat(); selected=[]; imported=0
+    now=dt.datetime.now(dt.timezone.utc).isoformat(); selected=[]; imported=0
     run_id=data.get("run_id") or now.replace(":","-")
     job=db.execute("SELECT * FROM agent_jobs WHERE run_id=?",(run_id,)).fetchone()
     identities=[str(item.get("identity","")) for item in results]
@@ -470,9 +505,15 @@ def agent_import(config_path: Path, results_path: Path) -> int:
         identity_value=item.get("identity",""); row=db.execute("SELECT * FROM papers WHERE identity=?",(identity_value,)).fetchone()
         if not row: raise ValueError(f"Unknown paper identity: {identity_value}")
         result=extract_json(json.dumps(item,ensure_ascii=False)); result["relevant"]=result["score"]>=threshold
-        with db: db.execute("INSERT OR REPLACE INTO screenings VALUES(?,?,?,?,?,?,?,?,?,?)",
+        snapshot=job["feedback_snapshot_json"] if job else "[]"
+        version_id=job["profile_version_id"] if job else active["id"]
+        with db: db.execute("""INSERT OR REPLACE INTO screenings(
+          identity,profile_hash,provider,model,relevant,score,reasons,themes_json,confidence,screened_at,
+          profile_version_id,feedback_snapshot_json,run_id
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (identity_value,phash,"codex-agent",data.get("model","codex-host-model"),int(result["relevant"]),result["score"],
-           result["reasons"],json.dumps(result["matched_themes"],ensure_ascii=False),result["confidence"],now))
+           result["reasons"],json.dumps(result["matched_themes"],ensure_ascii=False),result["confidence"],now,
+           version_id,snapshot,run_id))
         imported += 1
         if result["relevant"]: selected.append((row_to_paper(row),result))
     digest_dir=state/"digests"; digest_dir.mkdir(exist_ok=True)

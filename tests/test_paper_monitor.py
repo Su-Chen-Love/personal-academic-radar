@@ -141,4 +141,24 @@ class MonitorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"complete queue"):
                 pm.agent_import(config,results)
 
+    def test_agent_export_snapshots_feedback_and_rejects_profile_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); profile=root/"research-profile.md"; profile.write_text("confirmed",encoding="utf-8")
+            config=root/"config.toml"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "A"\ntype = "crossref"\nissn = "1234"\n',encoding="utf-8")
+            db=pm.db_open(root/"papers.sqlite3")
+            paper=pm.Paper("doi:10.1/x","10.1/x","A","Abstract","V","2026-01-01","u",[],"s")
+            pm.upsert(db,paper,"now")
+            db.execute("INSERT INTO paper_feedback VALUES(?,?,?,?,?,?,?)",
+                       (paper.identity,"interested","Direct transfer",1,"read_later","now","now"))
+            db.commit(); db.close()
+            with patch("builtins.print") as output:
+                pm.agent_export(config,no_collect=True)
+            summary=json.loads(output.call_args.args[0]); queue=json.loads(Path(summary["queue_path"]).read_text())
+            self.assertEqual(queue["schema_version"],2)
+            self.assertEqual(queue["feedback_examples"][0]["reason"],"Direct transfer")
+            profile.write_text("unconfirmed edit",encoding="utf-8")
+            with self.assertRaisesRegex(ValueError,"confirmed active version"):
+                pm.agent_export(config,no_collect=True)
+
 if __name__ == "__main__": unittest.main()

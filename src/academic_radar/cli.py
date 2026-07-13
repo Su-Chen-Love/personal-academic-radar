@@ -8,6 +8,9 @@ import json
 from pathlib import Path
 
 from .storage import backup_database, database_status, migrate_state, restore_database, upgrade_database
+from .engagement import (
+    confirm_profile, create_profile_draft, feedback_examples, list_feedback, list_profiles, set_feedback
+)
 
 
 def _default_backup(db: Path) -> Path:
@@ -38,6 +41,32 @@ def parser() -> argparse.ArgumentParser:
     migrate.add_argument("--from", dest="source", required=True, type=Path)
     migrate.add_argument("--to", dest="destination", required=True, type=Path)
     migrate.add_argument("--merge", action="store_true")
+
+    feedback = groups.add_parser("feedback", help="record and inspect paper feedback")
+    feedback_commands = feedback.add_subparsers(dest="command", required=True)
+    feedback_set = feedback_commands.add_parser("set")
+    feedback_set.add_argument("--db", required=True, type=Path)
+    feedback_set.add_argument("--identity", required=True)
+    feedback_set.add_argument("--interest", choices=("interested", "not_interested", "none"), default="none")
+    feedback_set.add_argument("--reason", default="")
+    feedback_set.add_argument("--favorite", action="store_true")
+    feedback_set.add_argument("--reading-status", choices=("unread", "read", "read_later"), default="unread")
+    for name in ("list", "examples"):
+        command = feedback_commands.add_parser(name)
+        command.add_argument("--db", required=True, type=Path)
+
+    profile = groups.add_parser("profile", help="manage confirmed research-profile versions")
+    profile_commands = profile.add_subparsers(dest="command", required=True)
+    profile_list = profile_commands.add_parser("list")
+    profile_list.add_argument("--db", required=True, type=Path)
+    draft = profile_commands.add_parser("draft")
+    draft.add_argument("--db", required=True, type=Path)
+    draft.add_argument("--file", required=True, type=Path)
+    draft.add_argument("--summary", required=True)
+    confirm = profile_commands.add_parser("confirm")
+    confirm.add_argument("--db", required=True, type=Path)
+    confirm.add_argument("--id", required=True, type=int)
+    confirm.add_argument("--profile-file", required=True, type=Path)
     return root
 
 
@@ -46,6 +75,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.group == "state":
             result = migrate_state(args.source, args.destination, args.merge)
+        elif args.group == "feedback":
+            if args.command == "set":
+                result = set_feedback(args.db,args.identity,None if args.interest=="none" else args.interest,
+                                      args.reason,args.favorite,args.reading_status)
+            elif args.command == "examples":
+                result = feedback_examples(args.db)
+            else:
+                result = list_feedback(args.db)
+        elif args.group == "profile":
+            if args.command == "draft":
+                result = create_profile_draft(args.db,args.file.read_text(encoding="utf-8"),args.summary)
+            elif args.command == "confirm":
+                result = confirm_profile(args.db,args.id,args.profile_file)
+            else:
+                result = list_profiles(args.db)
         elif args.command == "status":
             result = database_status(args.db)
         elif args.command == "upgrade":
@@ -63,4 +107,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

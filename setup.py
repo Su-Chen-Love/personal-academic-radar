@@ -5,7 +5,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="personal-academic-radar",
-    version="0.2.0",
+    version="0.3.0",
     description="A local-first personal academic monitoring and recommendation system",
     package_dir={"": "src"},
     packages=find_packages("src"),

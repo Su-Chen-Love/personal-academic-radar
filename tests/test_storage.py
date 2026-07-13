@@ -22,10 +22,10 @@ class StorageTests(unittest.TestCase):
             db_path = Path(td) / "papers.sqlite3"
             first = upgrade_database(db_path)
             second = upgrade_database(db_path)
-            self.assertEqual(first["applied"], [1, 2])
+            self.assertEqual(first["applied"], [1, 2, 3])
             self.assertEqual(second["applied"], [])
             status = database_status(db_path)
-            self.assertEqual(status["schema_version"], 2)
+            self.assertEqual(status["schema_version"], 3)
             self.assertEqual(status["integrity"], "ok")
             self.assertIn("paper_feedback", status["counts"])
 
@@ -44,7 +44,7 @@ class StorageTests(unittest.TestCase):
             db.commit()
             db.close()
             result = upgrade_database(db_path)
-            self.assertEqual(result["applied"], [1, 2])
+            self.assertEqual(result["applied"], [1, 2, 3])
             self.assertEqual(database_status(db_path)["counts"]["papers"], 1)
 
     def test_backup_restore_and_pre_restore_preservation(self):

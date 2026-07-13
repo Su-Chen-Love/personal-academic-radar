@@ -3,7 +3,8 @@ profile_file = "research-profile.md"
 bootstrap_mode = "baseline"
 lookback_days = 14
 relevance_threshold = 0.62
-user_agent = "PersonalAcademicRadar/0.2 (mailto:you@example.com)"
+feedback_examples_per_class = 20
+user_agent = "PersonalAcademicRadar/0.3 (mailto:you@example.com)"
 
 [collection]
 rows_per_page = 80
