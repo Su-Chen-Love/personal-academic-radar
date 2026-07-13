@@ -66,11 +66,17 @@ Use the built-in online backup operation.
 
 ## macOS web service
 
-`assets/com.personal-academic-radar.web.plist` is a launchd template. Replace
-`__PROJECT_ROOT__` and `__STATE_DIR__` with absolute paths, place the rendered
-file in `~/Library/LaunchAgents`, and load it with the normal macOS service
-management command. It starts only the local web interface; Codex remains the
-semantic scheduler.
+Install the reversible per-user launchd service from the same virtual
+environment used by the application:
+
+```bash
+academic-radar service install-web --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar service status
+```
+
+Use `academic-radar service uninstall-web` to unload it and remove its plist.
+The service starts only the loopback web interface; Codex remains the semantic
+scheduler.
 
 ## Public or remote access
 

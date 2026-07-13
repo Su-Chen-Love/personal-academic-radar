@@ -6,11 +6,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from academic_radar.engagement import seed_active_profile
-from academic_radar.operations import verify_installation
+from academic_radar.operations import install_web_service, verify_installation
 from academic_radar.storage import connect, upgrade_database
 
 
 class OperationsTests(unittest.TestCase):
+    def test_web_service_plist_uses_private_config_and_selected_python(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); config=root/"config.toml"; launch_agents=root/"LaunchAgents"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "A"\ntype = "crossref"\nissn = "1234"\n',encoding="utf-8")
+            result=install_web_service(config,launch_agents_dir=launch_agents,python_executable=Path(sys.executable),activate=False)
+            self.assertFalse(result["loaded"])
+            text=Path(result["plist"]).read_text()
+            self.assertIn(str(config.resolve()),text)
+            self.assertIn("academic_radar.cli",text)
+
     def test_verify_reports_actionable_incomplete_state(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); config=root/"config.toml"; profile=root/"research-profile.md"

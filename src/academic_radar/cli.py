@@ -11,7 +11,7 @@ from .storage import backup_database, database_status, migrate_state, restore_da
 from .engagement import (
     confirm_profile, create_profile_draft, feedback_examples, list_feedback, list_profiles, set_feedback
 )
-from .operations import verify_installation
+from .operations import install_web_service, uninstall_web_service, verify_installation, web_service_status
 
 
 def _default_backup(db: Path) -> Path:
@@ -77,12 +77,25 @@ def parser() -> argparse.ArgumentParser:
 
     verify = groups.add_parser("verify", help="verify a complete daily-use installation")
     verify.add_argument("--config", required=True, type=Path)
+
+    service = groups.add_parser("service", help="manage the local web background service")
+    service_commands=service.add_subparsers(dest="command",required=True)
+    install_service=service_commands.add_parser("install-web")
+    install_service.add_argument("--config",required=True,type=Path)
+    service_commands.add_parser("status")
+    service_commands.add_parser("uninstall-web")
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.group == "service":
+            if args.command=="install-web": result=install_web_service(args.config)
+            elif args.command=="uninstall-web": result=uninstall_web_service()
+            else: result=web_service_status()
+            print(json.dumps(result,ensure_ascii=False,indent=2))
+            return 0 if result.get("healthy",True) or args.command!="status" else 1
         if args.group == "verify":
             result=verify_installation(args.config)
             print(json.dumps(result,ensure_ascii=False,indent=2))
