@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-academic-radar"
+version = "0.2.0"
+description = "A local-first personal academic monitoring and recommendation system"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{name = "Personal Academic Radar contributors"}]
+dependencies = []
+
+[project.scripts]
+academic-radar = "academic_radar.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+academic_radar = ["migrations/*.sql"]

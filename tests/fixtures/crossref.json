@@ -1,0 +1,20 @@
+{
+  "message": {
+    "items": [
+      {
+        "DOI": "10.1145/3706598.3710001",
+        "title": ["Grounded Human-AI Preference Collaboration"],
+        "abstract": "<jats:p>A user study.</jats:p>",
+        "container-title": ["Proceedings of the 2026 CHI Conference on Human Factors in Computing Systems"],
+        "published-online": {"date-parts": [[2026, 4, 20]]},
+        "URL": "https://doi.org/10.1145/3706598.3710001",
+        "author": [{"given": "A", "family": "Researcher"}]
+      },
+      {
+        "DOI": "10.1145/3706599.3710002",
+        "title": ["Poster"],
+        "container-title": ["CHI Conference Extended Abstracts"]
+      }
+    ]
+  }
+}

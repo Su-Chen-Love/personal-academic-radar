@@ -1,0 +1,40 @@
+name: Daily paper monitor
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: .paper-monitor-state
+          key: paper-monitor-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: paper-monitor-${{ runner.os }}-
+      - name: Prepare configuration
+        run: |
+          mkdir -p .paper-monitor-state
+          test -f .paper-monitor-state/config.toml || cp monitor-research-papers/assets/config.example.toml .paper-monitor-state/config.toml
+          test -f .paper-monitor-state/research-profile.md || cp monitor-research-papers/assets/research-profile.example.md .paper-monitor-state/research-profile.md
+          sed -i 's|state_dir = .*|state_dir = ".paper-monitor-state"|' .paper-monitor-state/config.toml
+      - name: Run monitor
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PAPER_MONITOR_SMTP_USERNAME: ${{ secrets.PAPER_MONITOR_SMTP_USERNAME }}
+          PAPER_MONITOR_SMTP_PASSWORD: ${{ secrets.PAPER_MONITOR_SMTP_PASSWORD }}
+        run: python monitor-research-papers/scripts/paper_monitor.py run --config .paper-monitor-state/config.toml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paper-monitor-output
+          path: |
+            .paper-monitor-state/digests
+            .paper-monitor-state/logs

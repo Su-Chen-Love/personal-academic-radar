@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Paper Monitor"
+  short_description: "Monitor, rank, and digest new research papers"
+  default_prompt: "Use $monitor-research-papers to check my configured venues, screen new papers against my research profile, and summarize the run."

@@ -1,0 +1,70 @@
+state_dir = "~/.local/share/research-paper-monitor"
+profile_file = "research-profile.md"
+bootstrap_mode = "baseline"
+lookback_days = 14
+relevance_threshold = 0.62
+user_agent = "PersonalAcademicRadar/0.2 (mailto:you@example.com)"
+
+[collection]
+rows_per_source = 80
+timeout_seconds = 30
+max_retries = 3
+backoff_seconds = 2.0
+openalex_fallback = true
+
+[llm]
+provider = "auto"
+model = "gpt-4.1-mini"
+api_key_env = "OPENAI_API_KEY"
+anthropic_api_key_env = "ANTHROPIC_API_KEY"
+
+[delivery]
+enabled = false
+send_when_empty = true
+smtp_host = "smtp.gmail.com"
+smtp_port = 465
+username_env = "PAPER_MONITOR_SMTP_USERNAME"
+password_env = "PAPER_MONITOR_SMTP_PASSWORD"
+from_address = "you@example.com"
+to_addresses = ["you@example.com"]
+
+[[sources]]
+name = "International Journal of Human-Computer Interaction"
+type = "crossref"
+issn = "1044-7318"
+openalex_id = "S165559636"
+
+[[sources]]
+name = "International Journal of Human-Computer Studies"
+type = "crossref"
+issn = "1071-5819"
+openalex_id = "S4210190811"
+
+[[sources]]
+name = "IEEE Transactions on Human-Machine Systems"
+type = "crossref"
+issn = "2168-2291"
+openalex_id = "S2476799526"
+
+[[sources]]
+name = "International Journal of Industrial Ergonomics"
+type = "crossref"
+issn = "0169-8141"
+openalex_id = "S92539022"
+
+[[sources]]
+name = "Computers in Human Behavior"
+type = "crossref"
+issn = "0747-5632"
+openalex_id = "S204030396"
+
+[[sources]]
+name = "Nature Human Behaviour"
+type = "crossref"
+issn = "2397-3374"
+openalex_id = "S2764866340"
+
+[[sources]]
+name = "ACM CHI Conference on Human Factors in Computing Systems"
+type = "crossref-query"
+query_container = "CHI Conference on Human Factors in Computing Systems"
