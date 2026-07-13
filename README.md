@@ -1,5 +1,7 @@
 # Personal Academic Radar
 
+[![Tests](https://github.com/Su-Chen-Love/personal-academic-radar/actions/workflows/test.yml/badge.svg)](https://github.com/Su-Chen-Love/personal-academic-radar/actions/workflows/test.yml)
+
 A local-first academic monitoring system for one researcher. It collects papers
 from Crossref, OpenAlex, and CHI proceedings, keeps durable SQLite history, and
 uses the model already available inside a Codex Automation for semantic
@@ -13,10 +15,10 @@ excluded from version control.
 
 ## Current status
 
-The existing collector and Codex export/import workflow remain available while
-the project is being evolved into the complete web application. Database
-migrations, verified backups, and legacy-state migration are already exposed by
-the `academic-radar` command.
+The collector, Codex export/import workflow, six-page web application, database
+migrations, verified backups, legacy-state migration, and persistent local web
+service are available through the `academic-radar` command. See the
+[completion audit](docs/completion-audit.md) for verified release evidence.
 
 Collection is cursor-paginated and records per-source health. Crossref and
 OpenAlex are attempted independently, so a Crossref outage can degrade a source
