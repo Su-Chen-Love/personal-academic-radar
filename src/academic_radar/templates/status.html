@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}运行状态 · 个人学术雷达{% endblock %}
+{% block content %}
+<header class="page-head"><div><p class="kicker">OPERATIONS · AUDITABLE</p><h1>运行状态</h1><p>采集、语义队列、导入和数据库完整性都可以逐次核对。</p></div><span class="health {{ 'healthy' if db_state.integrity == 'ok' else 'failed' }}">数据库 {{ db_state.integrity }}</span></header>
+<section class="metric-grid four"><div><strong>v{{ db_state.schema_version }}</strong><span>数据库结构</span></div><div><strong>{{ db_state.counts.papers or 0 }}</strong><span>论文</span></div><div><strong>{{ db_state.counts.screenings or 0 }}</strong><span>语义判断</span></div><div><strong>{{ db_state.counts.profile_versions or 0 }}</strong><span>画像版本</span></div></section>
+<div class="two-column status-columns">
+  <section class="panel"><div class="panel-head"><h2>流水线运行</h2><span>{{ runs|length }} 条</span></div><div class="table-wrap"><table><thead><tr><th>开始时间</th><th>类型</th><th>状态</th><th>采集</th><th>候选</th></tr></thead><tbody>{% for run in runs %}<tr><td>{{ run.started_at }}</td><td>{{ run.kind }}</td><td><span class="status {{ run.status }}">{{ run.status }}</span></td><td>{{ run.collected_count }}</td><td>{{ run.candidate_count }}</td></tr>{% else %}<tr><td colspan="5">尚无运行</td></tr>{% endfor %}</tbody></table></div></section>
+  <section class="panel"><div class="panel-head"><h2>Codex 语义任务</h2><span>{{ jobs|length }} 条</span></div><div class="table-wrap"><table><thead><tr><th>创建时间</th><th>状态</th><th>导出</th><th>导入</th><th>画像</th></tr></thead><tbody>{% for job in jobs %}<tr><td>{{ job.created_at }}</td><td><span class="status {{ job.status }}">{{ job.status }}</span></td><td>{{ job.exported_count }}</td><td>{{ job.imported_count }}</td><td>v{{ job.profile_version_id or '—' }}</td></tr>{% else %}<tr><td colspan="5">尚无任务</td></tr>{% endfor %}</tbody></table></div></section>
+</div>
+<section class="panel full"><div class="panel-head"><h2>最近来源运行</h2><span>{{ source_runs|length }} 条</span></div><div class="table-wrap"><table><thead><tr><th>来源</th><th>状态</th><th>数量</th><th>完成时间</th><th>异常</th></tr></thead><tbody>{% for item in source_runs %}<tr><td>{{ item.source }}</td><td><span class="status {{ item.status }}">{{ item.status }}</span></td><td>{{ item.count }}</td><td>{{ item.finished_at }}</td><td>{{ item.error or '—' }}</td></tr>{% endfor %}</tbody></table></div></section>
+{% endblock %}
+

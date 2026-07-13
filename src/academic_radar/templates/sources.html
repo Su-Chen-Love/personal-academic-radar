@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}来源配置 · 个人学术雷达{% endblock %}
+{% block content %}
+<header class="page-head"><div><p class="kicker">SOURCES · {{ sources|length }} WATCHED</p><h1>来源配置</h1><p>每个期刊与会议都保留独立健康状态；单一提供商故障不会抹掉已有数据。</p></div></header>
+<div class="source-grid">
+{% for source in sources %}
+  <article class="source-card">
+    <div class="source-top"><span class="health {{ source.health.status }}">{{ source.health.status }}</span><span>{{ source.type }}</span></div>
+    <h2>{{ source.name }}</h2>
+    <dl>
+      <div><dt>标识</dt><dd>{{ source.issn or source.query_container or '—' }}</dd></div>
+      <div><dt>最近结果</dt><dd>{{ source.latest.count if source.latest else 0 }} 篇</dd></div>
+      <div><dt>连续失败</dt><dd>{{ source.health.consecutive_failures or 0 }}</dd></div>
+      <div><dt>最近成功</dt><dd>{{ source.health.last_success_at or '尚无记录' }}</dd></div>
+    </dl>
+    {% if source.health.last_error %}<p class="warning">{{ source.health.last_error }}</p>{% endif %}
+  </article>
+{% endfor %}
+</div>
+<div class="note"><strong>配置说明</strong><p>当前页面只展示私有配置。为了避免误改监测范围，来源编辑将在保存前进行预览采集和确认。</p></div>
+<div class="source-config-layout">
+  <section class="panel"><div class="panel-head"><h2>新增监测来源</h2><span>先预览，再确认</span></div>
+    <form method="post" action="/sources/preview" class="source-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>来源名称<input name="name" required placeholder="例如：ACM Transactions on Computer-Human Interaction"></label>
+      <label>类型<select name="type"><option value="crossref">期刊（ISSN）</option><option value="crossref-query">会议（出版物名称）</option></select></label>
+      <label>ISSN<input name="issn" placeholder="例如：1073-0516"></label>
+      <label>OpenAlex 来源 ID（可选）<input name="openalex_id" placeholder="例如：S123456"></label>
+      <label>会议出版物查询<input name="query_container" placeholder="例如：CHI Conference on Human Factors in Computing Systems"></label>
+      <label>会议标题必须包含（可选）<input name="container_title_contains" placeholder="默认与查询名称相同"></label>
+      <button type="submit">预览真实元数据</button>
+    </form>
+  </section>
+  <section class="panel preview-panel"><div class="panel-head"><h2>预览结果</h2><span>{{ '待确认' if preview else '尚未预览' }}</span></div>
+    {% if preview %}<p class="preview-summary">从 {{ preview.since }} 起，Crossref 报告 {{ preview.total_results }} 个可能结果；下面是通过规则后的样例。</p>
+      <ul class="preview-list">{% for item in preview.samples %}<li><strong>{{ item.title }}</strong><span>{{ item.venue }}{% if item.doi %} · {{ item.doi }}{% endif %}</span></li>{% else %}<li class="muted">当前时间窗没有匹配样例。对年度会议这可能是正常的。</li>{% endfor %}</ul>
+      <form method="post" action="/sources/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="token" value="{{ preview.token }}"><button type="submit">确认添加“{{ preview.source.name }}”</button></form>
+    {% else %}<div class="empty mini">填写左侧信息后，系统会先查询少量真实结果，不会立即改变每日监测。</div>{% endif %}
+  </section>
+</div>
+{% endblock %}

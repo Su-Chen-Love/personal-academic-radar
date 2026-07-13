@@ -40,6 +40,21 @@ academic-radar profile confirm --db "$RADAR_STATE/papers.sqlite3" \
 The collector refuses to run when the profile file differs from the confirmed
 active database version. This makes accidental interest drift visible.
 
+## Web application
+
+Start the local single-user interface with:
+
+```bash
+academic-radar web --config ~/.local/share/personal-academic-radar/config.toml
+```
+
+Then open `http://127.0.0.1:8765`. The application contains Today, Library,
+Sources, Research Profile, Feedback, and Run Status pages. It binds only to the
+local machine by default, protects writes with an anti-forgery token, and sends
+restrictive browser security headers. A non-local bind is refused unless the
+operator explicitly supplies `--allow-remote`; that flag is not a substitute
+for authentication and should not be used for public deployment.
+
 ## Quick start
 
 Requires Python 3.9 or newer.

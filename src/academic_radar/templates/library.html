@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% from "_paper_card.html" import paper_card with context %}
+{% block title %}文献库 · 个人学术雷达{% endblock %}
+{% block content %}
+<header class="page-head"><div><p class="kicker">LIBRARY · {{ total }} RECORDS</p><h1>你的文献库</h1><p>所有采集历史、语义判断与个人阅读状态都在这里。</p></div></header>
+<form class="filter-bar" method="get">
+  <label class="search"><span>⌕</span><input name="q" value="{{ q }}" placeholder="搜索标题、摘要或期刊"></label>
+  <select name="interest" aria-label="兴趣判断"><option value="">全部兴趣</option><option value="interested" {{ 'selected' if interest == 'interested' }}>感兴趣</option><option value="not_interested" {{ 'selected' if interest == 'not_interested' }}>不感兴趣</option></select>
+  <select name="reading" aria-label="阅读状态"><option value="">全部状态</option><option value="unread" {{ 'selected' if reading == 'unread' }}>未读</option><option value="read_later" {{ 'selected' if reading == 'read_later' }}>稍后阅读</option><option value="read" {{ 'selected' if reading == 'read' }}>已读</option></select>
+  <button>筛选</button>
+</form>
+<div class="paper-list compact">
+  {% for paper in papers %}{{ paper_card(paper, request.url.path ~ ('?' ~ request.url.query if request.url.query else '')) }}
+  {% else %}<div class="empty"><strong>没有匹配的论文</strong><p>试试放宽搜索或筛选条件。</p></div>{% endfor %}
+</div>
+<nav class="pagination" aria-label="分页">
+  {% if page_no > 1 %}<a href="?q={{ q|urlencode }}&interest={{ interest }}&reading={{ reading }}&page_no={{ page_no-1 }}">← 上一页</a>{% endif %}
+  <span>第 {{ page_no }} 页</span>
+  {% if has_next %}<a href="?q={{ q|urlencode }}&interest={{ interest }}&reading={{ reading }}&page_no={{ page_no+1 }}">下一页 →</a>{% endif %}
+</nav>
+{% endblock %}
+

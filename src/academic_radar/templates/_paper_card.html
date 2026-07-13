@@ -1,0 +1,46 @@
+{% macro paper_card(paper, return_to) %}
+<article class="paper-card">
+  <div class="paper-score">
+    {% if paper.score is not none %}<strong>{{ "%.0f"|format(paper.score * 100) }}</strong><span>匹配度</span>{% else %}<strong>—</strong><span>待判断</span>{% endif %}
+  </div>
+  <div class="paper-body">
+    <div class="eyebrow"><span>{{ paper.venue or '未知来源' }}</span><time>{{ paper.published or '日期未知' }}</time></div>
+    <h2><a href="{{ paper.url }}" target="_blank" rel="noreferrer">{{ paper.title }}</a></h2>
+    {% if paper.reasons %}<p class="reason">{{ paper.reasons }}</p>{% endif %}
+    <p class="abstract">{{ paper.abstract or '暂无摘要。' }}</p>
+    <details class="feedback-drawer" {{ 'open' if paper.interest }}>
+      <summary>
+        {% if paper.interest == 'interested' %}已标记感兴趣
+        {% elif paper.interest == 'not_interested' %}已标记不感兴趣
+        {% else %}标记与反馈{% endif %}
+        {% if paper.favorite %}<span class="star">★ 已收藏</span>{% endif %}
+      </summary>
+      <form method="post" action="/feedback" class="feedback-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="identity" value="{{ paper.identity }}">
+        <input type="hidden" name="return_to" value="{{ return_to }}">
+        <label>我的判断
+          <select name="interest">
+            <option value="" {{ 'selected' if not paper.interest }}>暂不判断</option>
+            <option value="interested" {{ 'selected' if paper.interest == 'interested' }}>感兴趣</option>
+            <option value="not_interested" {{ 'selected' if paper.interest == 'not_interested' }}>不感兴趣</option>
+          </select>
+        </label>
+        <label class="grow">理由（选择兴趣判断时必填）
+          <input name="reason" value="{{ paper.feedback_reason or '' }}" placeholder="它为什么适合，或为什么偏离我的研究？">
+        </label>
+        <label>阅读状态
+          <select name="reading_status">
+            <option value="unread" {{ 'selected' if paper.reading_status == 'unread' }}>未读</option>
+            <option value="read_later" {{ 'selected' if paper.reading_status == 'read_later' }}>稍后阅读</option>
+            <option value="read" {{ 'selected' if paper.reading_status == 'read' }}>已读</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" name="favorite" {{ 'checked' if paper.favorite }}> 收藏</label>
+        <button type="submit">保存反馈</button>
+      </form>
+    </details>
+  </div>
+</article>
+{% endmacro %}
+

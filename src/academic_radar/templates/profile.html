@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}研究画像 · 个人学术雷达{% endblock %}
+{% block content %}
+<header class="page-head"><div><p class="kicker">RESEARCH PROFILE · VERSIONED</p><h1>研究画像</h1><p>推荐以已确认版本为准。任何修改先成为草稿，确认后才影响后续筛选。</p></div>{% if active %}<span class="version-pill">当前 v{{ active.id }}</span>{% endif %}</header>
+<div class="profile-layout">
+  <section class="panel profile-editor"><div class="panel-head"><h2>当前画像</h2><span>已确认</span></div>
+    <form method="post" action="/profile/draft">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <textarea name="content" rows="28">{{ active.content if active else '' }}</textarea>
+      <label>本次修改说明<input name="summary" required placeholder="例如：排除仅做通用可用性评估的论文"></label>
+      <button type="submit">保存为草稿</button>
+    </form>
+  </section>
+  <aside class="panel version-list"><div class="panel-head"><h2>版本记录</h2><span>{{ versions|length }} 个版本</span></div>
+    {% for version in versions %}<article>
+      <div><strong>v{{ version.id }}</strong><span class="status {{ version.status }}">{{ version.status }}</span></div>
+      <p>{{ version.change_summary or '无修改说明' }}</p><small>{{ version.created_at }}</small>
+      {% if version.status == 'draft' %}<form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ version.id }}"><button class="secondary">确认并激活 v{{ version.id }}</button></form>{% endif %}
+    </article>{% endfor %}
+  </aside>
+</div>
+{% endblock %}
+

@@ -12,7 +12,7 @@ PROJECT_SRC=Path(__file__).resolve().parents[1]/"src"
 if PROJECT_SRC.exists() and str(PROJECT_SRC) not in sys.path: sys.path.insert(0,str(PROJECT_SRC))
 from academic_radar.storage import upgrade_database
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SCHEMA_VERSION = 3
 
 try:

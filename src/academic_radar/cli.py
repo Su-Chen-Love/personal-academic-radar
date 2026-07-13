@@ -67,12 +67,25 @@ def parser() -> argparse.ArgumentParser:
     confirm.add_argument("--db", required=True, type=Path)
     confirm.add_argument("--id", required=True, type=int)
     confirm.add_argument("--profile-file", required=True, type=Path)
+
+    web = groups.add_parser("web", help="run the local web application")
+    web.add_argument("--config", required=True, type=Path)
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", default=8765, type=int)
+    web.add_argument("--allow-remote", action="store_true")
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.group == "web":
+            if args.host not in ("127.0.0.1", "localhost", "::1") and not args.allow_remote:
+                raise ValueError("Remote binding requires --allow-remote and an access-control review")
+            import uvicorn
+            from .web import create_app
+            uvicorn.run(create_app(args.config), host=args.host, port=args.port)
+            return 0
         if args.group == "state":
             result = migrate_state(args.source, args.destination, args.merge)
         elif args.group == "feedback":

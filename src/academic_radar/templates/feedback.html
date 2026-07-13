@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}反馈管理 · 个人学术雷达{% endblock %}
+{% block content %}
+<header class="page-head"><div><p class="kicker">FEEDBACK · CALIBRATION</p><h1>反馈管理</h1><p>每一条明确理由都会成为后续语义判断的边界样例，但不会自动改变研究画像。</p></div></header>
+<section class="metric-grid four"><div><strong>{{ stats.total or 0 }}</strong><span>有反馈</span></div><div><strong>{{ stats.interested or 0 }}</strong><span>感兴趣</span></div><div><strong>{{ stats.not_interested or 0 }}</strong><span>不感兴趣</span></div><div><strong>{{ stats.favorites or 0 }}</strong><span>收藏</span></div></section>
+<div class="two-column">
+  <section class="panel"><div class="panel-head"><h2>当前反馈</h2><span>{{ items|length }} 篇</span></div>
+    <div class="feedback-list">{% for item in items %}<article><div><span class="status {{ item.interest or 'neutral' }}">{{ item.interest or '仅阅读状态' }}</span><time>{{ item.updated_at }}</time></div><h3>{{ item.title }}</h3><p>{{ item.reason or '未填写兴趣理由' }}</p><small>{{ item.venue }} · {{ item.reading_status }}{% if item.favorite %} · ★ 收藏{% endif %}</small></article>{% else %}<div class="empty mini">还没有反馈。到文献库标记第一篇论文吧。</div>{% endfor %}</div>
+  </section>
+  <section class="panel"><div class="panel-head"><h2>变更历史</h2><span>最近 {{ events|length }} 条</span></div>
+    <ol class="timeline">{% for event in events %}<li><span></span><div><strong>{{ event.title }}</strong><p>{{ event.interest or event.reading_status }} · {{ event.reason or '无理由' }}</p><small>{{ event.created_at }}</small></div></li>{% else %}<li class="muted">尚无历史记录</li>{% endfor %}</ol>
+  </section>
+</div>
+{% endblock %}
+

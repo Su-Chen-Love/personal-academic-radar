@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{% block title %}个人学术雷达{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/">
+      <span class="brand-mark">R</span>
+      <span><strong>个人学术雷达</strong><small>Personal Academic Radar</small></span>
+    </a>
+    <nav aria-label="主导航">
+      <a class="{{ 'active' if page == 'today' }}" href="/"><span>01</span>今日雷达</a>
+      <a class="{{ 'active' if page == 'library' }}" href="/library"><span>02</span>文献库</a>
+      <a class="{{ 'active' if page == 'sources' }}" href="/sources"><span>03</span>来源配置</a>
+      <a class="{{ 'active' if page == 'profile' }}" href="/profile"><span>04</span>研究画像</a>
+      <a class="{{ 'active' if page == 'feedback' }}" href="/feedback"><span>05</span>反馈管理</a>
+      <a class="{{ 'active' if page == 'status' }}" href="/status"><span>06</span>运行状态</a>
+    </nav>
+    <div class="sidebar-foot">
+      <span class="pulse"></span> 本地私有数据
+      <small>{{ state_path }}</small>
+    </div>
+  </aside>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
+
