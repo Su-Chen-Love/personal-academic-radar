@@ -49,7 +49,11 @@ Favor papers with a meaningful connection to the research questions, methods, or
 
 ## Scheduling
 
-The skill itself performs one idempotent cycle and does not impersonate a scheduler. For Codex or Claude scheduled-task features, schedule the agent export/judge/import workflow daily. For a headless workstation, use the direct-API instructions in `references/deployment.md`. For GitHub Actions, adapt `assets/github-actions-daily.yml` and configure encrypted repository secrets.
+The skill itself performs one idempotent cycle and does not impersonate a
+scheduler. Use a Codex scheduled task for the daily export/judge/import workflow
+and the local web service for browsing and feedback. The supported personal
+workflow does not require a model API key; see `references/deployment.md` for
+backup, recovery, and service guidance.
 
 ## Troubleshooting
 

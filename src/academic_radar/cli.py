@@ -11,6 +11,7 @@ from .storage import backup_database, database_status, migrate_state, restore_da
 from .engagement import (
     confirm_profile, create_profile_draft, feedback_examples, list_feedback, list_profiles, set_feedback
 )
+from .operations import verify_installation
 
 
 def _default_backup(db: Path) -> Path:
@@ -73,12 +74,19 @@ def parser() -> argparse.ArgumentParser:
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", default=8765, type=int)
     web.add_argument("--allow-remote", action="store_true")
+
+    verify = groups.add_parser("verify", help="verify a complete daily-use installation")
+    verify.add_argument("--config", required=True, type=Path)
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.group == "verify":
+            result=verify_installation(args.config)
+            print(json.dumps(result,ensure_ascii=False,indent=2))
+            return 0 if result["ok"] else 1
         if args.group == "web":
             if args.host not in ("127.0.0.1", "localhost", "::1") and not args.allow_remote:
                 raise ValueError("Remote binding requires --allow-remote and an access-control review")

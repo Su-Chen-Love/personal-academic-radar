@@ -1,57 +1,89 @@
-# Deployment and operations
+# Deployment and daily operation
 
-## Local setup
+## Supported daily architecture
 
-Requires Python 3.9+ and uses only the standard library. Copy the example config and profile into a writable state directory. Run `doctor`, then `run --dry-run`, then a normal run. The SQLite database, digests, and logs live under `state_dir`.
+The recommended single-researcher installation has three explicit boundaries:
 
-Install the complete `monitor-research-papers` folder in `~/.claude/skills/` for Claude, or `${CODEX_HOME:-~/.codex}/skills/` for Codex. A project-local installation may instead live under `.claude/skills/` or the skill directory configured by the host. Keep the folder name unchanged.
+1. this public code repository;
+2. a private state directory containing configuration, SQLite, queues, results,
+   feedback, logs, digests, and backups; and
+3. the Codex Automation that runs export, host-model semantic judgment, and
+   atomic import every morning.
 
-In Codex or Claude scheduled tasks, prefer `agent-export` followed by host-model judgment and `agent-import`. This uses the model already supplied by the scheduled task and does not require `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`.
+No `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is required. The old heuristic
+fallback is not part of the supported daily workflow and the direct runner now
+fails closed when no semantic API provider is explicitly configured.
 
-Direct API selection is only needed for headless runs outside an AI host:
+## Local installation
 
-- `provider = "auto"`: use OpenAI when `OPENAI_API_KEY` exists, otherwise Anthropic when `ANTHROPIC_API_KEY` exists, otherwise deterministic scoring.
-- `provider = "openai"`: call the OpenAI Responses API using `api_key_env`.
-- `provider = "anthropic"`: call the Anthropic Messages API using `anthropic_api_key_env`.
-- `provider = "heuristic"`: never make an LLM call.
-
-For Gmail SMTP, create an app password after enabling two-step verification. Set `PAPER_MONITOR_SMTP_USERNAME` and `PAPER_MONITOR_SMTP_PASSWORD`; never use the normal Google password.
-
-On macOS, use `scripts/macos_runner.sh` from `launchd`. It reads optional secrets from Keychain without writing them into the plist. Add only the credentials you intend to use:
+Create a virtual environment, install the package, copy the example config and
+profile to `~/.local/share/personal-academic-radar`, then run:
 
 ```bash
-security add-generic-password -U -a "$USER" -s research-paper-monitor-openai -w
-security add-generic-password -U -a "$USER" -s research-paper-monitor-anthropic -w
-security add-generic-password -U -a "$USER" -s research-paper-monitor-gmail -w
+academic-radar db upgrade --db ~/.local/share/personal-academic-radar/papers.sqlite3
+python scripts/paper_monitor.py doctor --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar verify --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar web --config ~/.local/share/personal-academic-radar/config.toml
 ```
 
-Each command securely prompts for the value. OpenAI and Anthropic are alternatives; one LLM key is enough. The Gmail entry must be a Google app password, not the account password.
+The web app listens on `127.0.0.1:8765` by default. Do not use
+`--allow-remote` without adding an authenticated reverse proxy and reviewing
+the threat model.
 
-After changing the research profile, model, or relevance threshold, run once with `--rescreen` to evaluate the stored corpus again. This does not duplicate paper records; previously emailed papers remain marked as sent.
+## Codex Automation
 
-## Scheduler examples
+Schedule one local project automation daily at 08:00. Its prompt must:
 
-Cron, daily at 08:00:
+- read `SKILL.md` and `references/profile-guidance.md`;
+- call `agent-export` with the private config;
+- read the complete confirmed profile and `feedback_examples`;
+- semantically judge every queued identity with the host model;
+- preserve run, profile, and source-failure metadata;
+- write results only into the private state directory; and
+- call `agent-import`, then report collection, candidate, selected, and failure
+  counts.
 
-```cron
-0 8 * * * /usr/bin/python3 /absolute/path/monitor-research-papers/scripts/paper_monitor.py run --config /absolute/path/state/config.toml >> /absolute/path/state/cron.log 2>&1
+A newer export abandons an unfinished older queue. Import is all-or-nothing and
+rejects partial, duplicate, stale, or mismatched results.
+
+## Backups and recovery
+
+Create a consistent, verified backup before migrations and periodically during
+normal use:
+
+```bash
+academic-radar db backup \
+  --db ~/.local/share/personal-academic-radar/papers.sqlite3 \
+  --output ~/.local/share/personal-academic-radar/backups/manual.sqlite3
 ```
 
-On macOS prefer `launchd`; on Linux prefer a user `systemd` timer. In Claude or Codex, create a daily scheduled task whose prompt invokes this skill and runs the same command. A sleeping laptop cannot execute local schedules.
+Test a backup without touching production by restoring to a temporary path and
+running `db status`. Restoring over production requires `--replace`; the tool
+first preserves the current database as a timestamped pre-restore backup.
 
-## GitHub Actions
+Never synchronize a live SQLite WAL database with ordinary file-copy tools.
+Use the built-in online backup operation.
 
-Copy `assets/github-actions-daily.yml` to `.github/workflows/paper-monitor.yml`. Add repository secrets for LLM and SMTP credentials. The template restores and saves the state directory via Actions cache, but cache storage is not a transactional database backup. For critical history, upload an encrypted artifact or use durable external storage.
+## macOS web service
 
-## Collection behavior
+`assets/com.personal-academic-radar.web.plist` is a launchd template. Replace
+`__PROJECT_ROOT__` and `__STATE_DIR__` with absolute paths, place the rendered
+file in `~/Library/LaunchAgents`, and load it with the normal macOS service
+management command. It starts only the local web interface; Codex remains the
+semantic scheduler.
 
-Crossref collection uses cursor pagination and an overlapping created-date window;
-SQLite dedup makes overlaps safe. OpenAlex is attempted independently for
-configured sources, so one provider can fail while the other still contributes
-records. Existing database abstracts are reused before any DOI-level enrichment
-request. Inspect `source_health`, `source_runs`, and `pipeline_runs` when a source
-is degraded. Conference proceedings metadata is less uniform than journal
-metadata, so periodically inspect CHI results and adjust the container include
-and exclude rules if false positives appear.
+## Public or remote access
 
-The phrase “International Journal of Industrial Economics” is ambiguous and does not match a well-known title in the requested area. The example uses *International Journal of Industrial Ergonomics*. Replace it if a different journal was intended.
+Public access is intentionally not enabled by default because the application
+contains a private research profile and behavioral feedback. Choose and approve
+an authentication and persistence design before deployment. A public code
+repository must never include the state directory, configuration, database,
+queues, results, logs, or backups.
+
+## Source behavior
+
+Crossref uses cursor pagination and an overlapping created-date window.
+OpenAlex is attempted independently, so one provider may degrade while the
+other still supplies records. Existing abstracts are reused before DOI-level
+enrichment. Inspect the Sources and Run Status pages or the `source_health`,
+`source_runs`, and `pipeline_runs` tables when a source is degraded.
