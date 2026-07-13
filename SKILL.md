@@ -19,6 +19,9 @@ Use the bundled deterministic runner for collection, normalization, deduplicatio
 6. For a Claude/Codex scheduled task, export papers awaiting model judgment:
    `python3 scripts/paper_monitor.py agent-export --config <state>/config.toml`
    Read the returned queue JSON and complete every paper using the rubric in `references/profile-guidance.md`. Write a results JSON with the same `run_id` and `profile_hash`, a `model` label, and a `results` array. Each result must contain `identity`, `relevant`, `score`, `reasons`, `matched_themes`, and `confidence`.
+   Treat `feedback_examples` as confirmed positive/negative calibration evidence,
+   while keeping the confirmed profile as the primary decision rubric. Never
+   change the profile from feedback without creating a draft for user approval.
 7. Import the judgments and generate the digest:
    `python3 scripts/paper_monitor.py agent-import --config <state>/config.toml --results <results.json>`
    After materially changing the profile, add `--rescreen` to the export once.
@@ -32,6 +35,9 @@ Use the bundled deterministic runner for collection, normalization, deduplicatio
 - Prefer Crossref for DOI/publisher metadata and use OpenAlex as a fallback/enrichment source. Do not scrape publisher HTML unless the user explicitly accepts brittle scraping and applicable terms permit it.
 - A source failure must not erase prior state or mark unseen papers as processed. Retry transient errors and continue other sources.
 - Prefer the host-model agent export/import workflow in Claude/Codex automations. Use direct API providers only for headless operation outside an AI host. Never silently replace requested semantic model judgment with keyword matching.
+- Imports are all-or-nothing. They must cover every exported identity exactly
+  once and preserve run, profile, feedback snapshot, and source-failure metadata.
+  A newer export abandons any older unfinished queue.
 - Send email only when `delivery.enabled = true`; respect `send_when_empty`.
 - SQLite is single-host state. For GitHub Actions, persist the state directory with an artifact/cache or use an external durable store; otherwise every run bootstraps anew.
 

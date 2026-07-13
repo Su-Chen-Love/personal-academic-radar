@@ -115,7 +115,10 @@ class MonitorTests(unittest.TestCase):
             p=pm.Paper("doi:10.1/x","10.1/x","Preference-aware routing","Abstract","V","2026-01-01","u",[],"s")
             pm.upsert(db,p,"now"); db.commit(); db.close()
             profile_hash=__import__("hashlib").sha256(b"interactive optimization").hexdigest()
-            results={"run_id":"r1","profile_hash":profile_hash,"model":"codex-test","results":[{
+            with patch("builtins.print") as output:
+                pm.agent_export(root/"config.toml",no_collect=True)
+            run_id=json.loads(output.call_args.args[0])["run_id"]
+            results={"run_id":run_id,"profile_hash":profile_hash,"model":"codex-test","results":[{
               "identity":p.identity,"relevant":True,"score":0.9,"reasons":"Directly studies the core problem",
               "matched_themes":["interactive optimization"],"confidence":0.95}]}
             path=root/"results.json"; path.write_text(json.dumps(results),encoding="utf-8")
@@ -140,6 +143,36 @@ class MonitorTests(unittest.TestCase):
                                            "model":"codex-test","results":[]}),encoding="utf-8")
             with self.assertRaisesRegex(ValueError,"complete queue"):
                 pm.agent_import(config,results)
+
+    def test_agent_import_is_atomic_and_new_export_abandons_old_job(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/"research-profile.md").write_text("profile",encoding="utf-8")
+            config=root/"config.toml"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "A"\ntype = "crossref"\nissn = "1234"\n',encoding="utf-8")
+            db=pm.db_open(root/"papers.sqlite3")
+            for suffix in ("a","b"):
+                pm.upsert(db,pm.Paper(f"doi:10.1/{suffix}",f"10.1/{suffix}",suffix,"Abstract","V","2026-01-01","u",[],"s"),"now")
+            db.commit(); db.close()
+            with patch("builtins.print") as output: pm.agent_export(config,no_collect=True)
+            first=json.loads(output.call_args.args[0])
+            with patch("builtins.print") as output: pm.agent_export(config,no_collect=True)
+            second=json.loads(output.call_args.args[0]); queue=json.loads(Path(second["queue_path"]).read_text())
+            results=[]
+            for index,paper in enumerate(queue["papers"]):
+                item={"identity":paper["identity"],"relevant":False,"score":0.1,"reasons":"Not related",
+                      "matched_themes":[],"confidence":0.9}
+                if index==1: item.pop("reasons")
+                results.append(item)
+            result_path=root/"invalid.json"
+            result_path.write_text(json.dumps({"run_id":queue["run_id"],"profile_hash":queue["profile_hash"],
+                                               "model":"codex-test","results":results}),encoding="utf-8")
+            with self.assertRaisesRegex(ValueError,"missing fields"):
+                pm.agent_import(config,result_path)
+            db=pm.db_open(root/"papers.sqlite3")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM screenings").fetchone()[0],0)
+            self.assertEqual(db.execute("SELECT status FROM agent_jobs WHERE run_id=?",(first["run_id"],)).fetchone()[0],"abandoned")
+            self.assertEqual(db.execute("SELECT status FROM agent_jobs WHERE run_id=?",(second["run_id"],)).fetchone()[0],"exported")
+            db.close()
 
     def test_agent_export_snapshots_feedback_and_rejects_profile_drift(self):
         with tempfile.TemporaryDirectory() as td:

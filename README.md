@@ -91,9 +91,9 @@ The scheduled Codex task should:
 3. Judge every queued paper with the host model.
 4. Run `agent-import` to validate and persist the judgments.
 
-Do not use the legacy `run` command without an API-backed model: its heuristic
-fallback exists only for backward compatibility and is not the product's
-recommended screening path.
+Do not use the legacy `run` command without an API-backed model. It now fails
+closed when no direct key exists; it never silently substitutes keyword or
+heuristic scoring for the Codex semantic workflow.
 
 ## Data safety
 
