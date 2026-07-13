@@ -45,6 +45,13 @@ Copy `assets/github-actions-daily.yml` to `.github/workflows/paper-monitor.yml`.
 
 ## Collection behavior
 
-Crossref filters use online publication dates and a lookback overlap; SQLite dedup makes overlapping windows safe. Crossref may omit abstracts. With `openalex_fallback = true`, the runner queries OpenAlex by DOI to reconstruct an abstract when available. Conference proceedings metadata is less uniform than journal metadata, so periodically inspect CHI results and adjust `query_container` if false positives appear.
+Crossref collection uses cursor pagination and an overlapping created-date window;
+SQLite dedup makes overlaps safe. OpenAlex is attempted independently for
+configured sources, so one provider can fail while the other still contributes
+records. Existing database abstracts are reused before any DOI-level enrichment
+request. Inspect `source_health`, `source_runs`, and `pipeline_runs` when a source
+is degraded. Conference proceedings metadata is less uniform than journal
+metadata, so periodically inspect CHI results and adjust the container include
+and exclude rules if false positives appear.
 
 The phrase “International Journal of Industrial Economics” is ambiguous and does not match a well-known title in the requested area. The example uses *International Journal of Industrial Ergonomics*. Replace it if a different journal was intended.

@@ -1,4 +1,4 @@
-import importlib.util, json, sqlite3, sys, tempfile, unittest
+import importlib.util, io, json, sqlite3, sys, tempfile, unittest, urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,6 +26,59 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(len(papers),1)
         self.assertEqual(papers[0].doi,"10.1145/3706598.3710001")
         self.assertIn("Human-AI",papers[0].title)
+
+    def test_crossref_cursor_pagination_and_deduplication(self):
+        def page(doi,title,next_cursor):
+            return {"message":{"items":[{"DOI":doi,"title":[title],"container-title":["Venue"]}],
+                               "next-cursor":next_cursor}}
+        responses=[page("10.1/a","A","next"),page("10.1/b","B",None)]
+        cfg={"collection":{"rows_per_page":1,"max_pages_per_source":3},"user_agent":"test"}
+        with patch.object(pm,"request_json",side_effect=responses) as request:
+            papers=pm.crossref_collect({"name":"V","type":"crossref","issn":"1234"},cfg,"2026-01-01")
+        self.assertEqual([p.doi for p in papers],["10.1/a","10.1/b"])
+        self.assertEqual(request.call_count,2)
+        self.assertIn("cursor=next",request.call_args_list[1].args[0])
+
+    def test_retry_honors_retry_after_then_succeeds(self):
+        error=urllib.error.HTTPError("https://example.test",429,"limited",{"Retry-After":"0"},io.BytesIO())
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self,*args): return False
+            def read(self): return b'{"ok": true}'
+        with patch.object(pm.urllib.request,"urlopen",side_effect=[error,Response()]), patch.object(pm.time,"sleep") as sleep:
+            result=pm.request_json("https://example.test",{},1,1,0.1)
+        self.assertTrue(result["ok"]); sleep.assert_called_once_with(0.0)
+
+    def test_openalex_survives_crossref_failure_and_marks_degraded(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=pm.db_open(Path(td)/"x.sqlite3")
+            paper=pm.Paper("doi:10.1/x","10.1/x","A","Abstract","V","2026-01-01","u",[],"V / OpenAlex")
+            cfg={"lookback_days":1,"collection":{"openalex_fallback":True},"sources":[
+                {"name":"V","type":"crossref","issn":"1234","openalex_id":"S1"}]}
+            with patch.object(pm,"crossref_collect",side_effect=RuntimeError("down")), \
+                 patch.object(pm,"openalex_collect",return_value=[paper]):
+                collected,new,failures=pm.collect_into_db(cfg,db,"now","run")
+            self.assertEqual((len(collected),len(new)),(1,1))
+            self.assertEqual(failures[0]["status"],"degraded")
+            health=db.execute("select status,consecutive_failures from source_health where source='V'").fetchone()
+            self.assertEqual(tuple(health),("degraded",0))
+
+    def test_duplicate_provider_records_share_one_abstract_lookup(self):
+        a=pm.Paper("doi:10.1/x","10.1/x","A","","V","2026-01-01","u",[],"crossref")
+        b=pm.Paper("doi:10.1/x","10.1/x","A","","V","2026-01-01","u",[],"openalex")
+        with patch.object(pm,"openalex_abstract",return_value="Shared abstract") as lookup:
+            pm.enrich_missing_abstracts([a,b],{"collection":{"openalex_fallback":True}})
+        lookup.assert_called_once(); self.assertEqual((a.abstract,b.abstract),("Shared abstract","Shared abstract"))
+
+    def test_existing_database_abstract_avoids_network_lookup(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=pm.db_open(Path(td)/"x.sqlite3")
+            stored=pm.Paper("doi:10.1/x","10.1/x","A","Stored abstract","V","2026-01-01","u",[],"old")
+            pm.upsert(db,stored,"now"); db.commit()
+            incoming=pm.Paper("doi:10.1/x","10.1/x","A","","V","2026-01-01","u",[],"new")
+            with patch.object(pm,"openalex_abstract") as lookup:
+                pm.enrich_missing_abstracts([incoming],{},db)
+            lookup.assert_not_called(); self.assertEqual(incoming.abstract,"Stored abstract")
 
     def test_upsert_is_idempotent_and_enriches_abstract(self):
         with tempfile.TemporaryDirectory() as td:
@@ -70,5 +123,22 @@ class MonitorTests(unittest.TestCase):
             db=pm.db_open(root/"papers.sqlite3")
             row=db.execute("select provider,relevant,score from screenings").fetchone()
             self.assertEqual((row[0],row[1],row[2]),("codex-agent",1,0.9))
+
+    def test_agent_import_rejects_partial_exported_queue(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/"research-profile.md").write_text("profile",encoding="utf-8")
+            config=root/"config.toml"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "A"\ntype = "crossref"\nissn = "1234"\n',encoding="utf-8")
+            db=pm.db_open(root/"papers.sqlite3")
+            paper=pm.Paper("doi:10.1/x","10.1/x","A","Abstract","V","2026-01-01","u",[],"s")
+            pm.upsert(db,paper,"now"); db.commit(); db.close()
+            with patch("builtins.print") as output:
+                self.assertEqual(pm.agent_export(config,no_collect=True),0)
+            summary=json.loads(output.call_args.args[0]); queue=json.loads(Path(summary["queue_path"]).read_text())
+            results=root/"partial.json"
+            results.write_text(json.dumps({"run_id":queue["run_id"],"profile_hash":queue["profile_hash"],
+                                           "model":"codex-test","results":[]}),encoding="utf-8")
+            with self.assertRaisesRegex(ValueError,"complete queue"):
+                pm.agent_import(config,results)
 
 if __name__ == "__main__": unittest.main()

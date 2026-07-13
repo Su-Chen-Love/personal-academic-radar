@@ -18,6 +18,10 @@ the project is being evolved into the complete web application. Database
 migrations, verified backups, and legacy-state migration are already exposed by
 the `academic-radar` command.
 
+Collection is cursor-paginated and records per-source health. Crossref and
+OpenAlex are attempted independently, so a Crossref outage can degrade a source
+without discarding usable OpenAlex results.
+
 ## Quick start
 
 Requires Python 3.9 or newer.

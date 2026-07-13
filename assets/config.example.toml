@@ -1,4 +1,4 @@
-state_dir = "~/.local/share/research-paper-monitor"
+state_dir = "~/.local/share/personal-academic-radar"
 profile_file = "research-profile.md"
 bootstrap_mode = "baseline"
 lookback_days = 14
@@ -6,7 +6,8 @@ relevance_threshold = 0.62
 user_agent = "PersonalAcademicRadar/0.2 (mailto:you@example.com)"
 
 [collection]
-rows_per_source = 80
+rows_per_page = 80
+max_pages_per_source = 3
 timeout_seconds = 30
 max_retries = 3
 backoff_seconds = 2.0

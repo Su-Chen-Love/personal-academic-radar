@@ -2,14 +2,14 @@
 """Idempotent academic paper monitor. Python 3.9+, standard library only."""
 from __future__ import annotations
 
-import argparse, datetime as dt, email.message, hashlib, html, json, os, random, re
+import argparse, datetime as dt, email.message, email.utils, hashlib, html, json, os, random, re
 import smtplib, sqlite3, ssl, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.0.0"
-SCHEMA_VERSION = 1
+VERSION = "0.2.0"
+SCHEMA_VERSION = 2
 
 try:
     import tomllib
@@ -86,7 +86,15 @@ def request_json(url: str, headers: dict[str,str], timeout: int, retries: int, b
             transient = status in (408, 429, 500, 502, 503, 504) or status is None
             if attempt >= retries or not transient: raise
             retry_after = getattr(exc, "headers", {}).get("Retry-After") if getattr(exc, "headers", None) else None
-            delay = float(retry_after) if retry_after and retry_after.isdigit() else backoff * 2**attempt + random.random()
+            delay = None
+            if retry_after:
+                try: delay = max(0.0,float(retry_after))
+                except ValueError:
+                    try:
+                        retry_at=email.utils.parsedate_to_datetime(retry_after)
+                        delay=max(0.0,(retry_at-dt.datetime.now(dt.timezone.utc)).total_seconds())
+                    except (TypeError,ValueError): pass
+            if delay is None: delay = backoff * 2**attempt + random.uniform(0, max(0.1,backoff))
             time.sleep(min(delay, 60))
     raise RuntimeError("unreachable")
 
@@ -132,6 +140,26 @@ def db_open(path: Path) -> sqlite3.Connection:
       run_id TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL, count INTEGER NOT NULL,
       error TEXT, finished_at TEXT NOT NULL, PRIMARY KEY(run_id, source)
     );
+    CREATE TABLE IF NOT EXISTS source_health(
+      source TEXT PRIMARY KEY, status TEXT NOT NULL, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      last_success_at TEXT, last_failure_at TEXT, last_error TEXT, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS pipeline_runs(
+      run_id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL, profile_version_id INTEGER,
+      started_at TEXT NOT NULL, finished_at TEXT, collected_count INTEGER NOT NULL DEFAULT 0,
+      candidate_count INTEGER NOT NULL DEFAULT 0, relevant_count INTEGER NOT NULL DEFAULT 0,
+      error_summary TEXT, details_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE TABLE IF NOT EXISTS profile_versions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, profile_hash TEXT NOT NULL UNIQUE, content TEXT NOT NULL,
+      status TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'manual', change_summary TEXT,
+      created_at TEXT NOT NULL, confirmed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS agent_jobs(
+      run_id TEXT PRIMARY KEY, profile_hash TEXT NOT NULL, status TEXT NOT NULL, queue_path TEXT,
+      results_path TEXT, exported_count INTEGER NOT NULL DEFAULT 0, imported_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL, imported_at TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi);
     CREATE INDEX IF NOT EXISTS idx_papers_seen ON papers(first_seen);
     """)
@@ -139,7 +167,8 @@ def db_open(path: Path) -> sqlite3.Connection:
     db.commit(); return db
 
 def crossref_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> list[Paper]:
-    c = cfg.get("collection", {}); rows = int(c.get("rows_per_source",80))
+    c = cfg.get("collection", {}); rows = min(1000,int(c.get("rows_per_page",c.get("rows_per_source",80))))
+    max_pages=max(1,int(c.get("max_pages_per_source",3)))
     base = "https://api.crossref.org"
     params: dict[str, str] = {"rows":str(rows), "select":"DOI,title,abstract,container-title,published-online,published-print,published,created,URL,author,type,ISSN"}
     filters = [f"from-created-date:{since}"]
@@ -148,21 +177,30 @@ def crossref_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> l
     else:
         url = f"{base}/works"; filters.extend(["prefix:10.1145", "type:proceedings-article"])
         params["query.container-title"] = source["query_container"]
-    params["filter"] = ",".join(filters); params["sort"]="created"; params["order"]="desc"
-    url += "?" + urllib.parse.urlencode(params)
-    data = request_json(url, {"User-Agent":cfg.get("user_agent","ResearchPaperMonitor/1.0")},
-                        int(c.get("timeout_seconds",30)), int(c.get("max_retries",3)), float(c.get("backoff_seconds",2)))
-    result=[]
-    for item in data.get("message",{}).get("items",[]):
-        venue = clean_text(item.get("container-title"))
-        if source["type"] == "crossref-query":
-            low = venue.lower()
-            if "chi conference on human factors in computing systems" not in low or "extended abstracts" in low: continue
-        title=clean_text(item.get("title")); doi=normalize_doi(item.get("DOI",""))
-        if not title: continue
-        authors=[clean_text(" ".join(filter(None,(a.get("given"),a.get("family"))))) for a in item.get("author",[])]
-        result.append(Paper(identity(doi,title),doi,title,clean_text(item.get("abstract")),venue or source["name"],
-                            date_parts(item),item.get("URL","") or ("https://doi.org/"+doi if doi else ""),authors,source["name"]))
+    params["filter"] = ",".join(filters); params["sort"]="created"; params["order"]="desc"; params["cursor"]="*"
+    result=[]; seen=set()
+    for _ in range(max_pages):
+        data = request_json(url+"?"+urllib.parse.urlencode(params), {"User-Agent":cfg.get("user_agent","ResearchPaperMonitor/1.0")},
+                            int(c.get("timeout_seconds",30)), int(c.get("max_retries",3)), float(c.get("backoff_seconds",2)))
+        message=data.get("message",{}); items=message.get("items",[])
+        for item in items:
+            venue = clean_text(item.get("container-title"))
+            if source["type"] == "crossref-query":
+                low = venue.lower()
+                expected=source.get("container_title_contains","chi conference on human factors in computing systems").lower()
+                excluded=[x.lower() for x in source.get("exclude_container_contains",["extended abstracts"])]
+                if expected not in low or any(x in low for x in excluded): continue
+            title=clean_text(item.get("title")); doi=normalize_doi(item.get("DOI",""))
+            if not title: continue
+            ident=identity(doi,title)
+            if ident in seen: continue
+            seen.add(ident)
+            authors=[clean_text(" ".join(filter(None,(a.get("given"),a.get("family"))))) for a in item.get("author",[])]
+            result.append(Paper(ident,doi,title,clean_text(item.get("abstract")),venue or source["name"],
+                                date_parts(item),item.get("URL","") or ("https://doi.org/"+doi if doi else ""),authors,source["name"]))
+        next_cursor=message.get("next-cursor")
+        if not next_cursor or len(items)<rows: break
+        params["cursor"]=next_cursor
     return result
 
 def openalex_abstract(doi: str, cfg: dict[str,Any]) -> str:
@@ -186,21 +224,30 @@ def inverted_abstract(data: dict[str,Any]) -> str:
 def openalex_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> list[Paper]:
     source_id=source.get("openalex_id")
     if not source_id or not cfg.get("collection",{}).get("openalex_fallback",True): return []
-    c=cfg.get("collection",{}); rows=min(200,int(c.get("rows_per_source",80)))
+    c=cfg.get("collection",{}); rows=min(200,int(c.get("rows_per_page",c.get("rows_per_source",80))))
+    max_pages=max(1,int(c.get("max_pages_per_source",3)))
     params={"filter":f"primary_location.source.id:{source_id},from_publication_date:{since}",
-            "sort":"publication_date:desc","per-page":str(rows)}
+            "sort":"publication_date:desc","per-page":str(rows),"cursor":"*"}
     mail=re.search(r"mailto:([^\s;)]+)",cfg.get("user_agent",""))
     if mail: params["mailto"]=mail.group(1)
-    data=request_json("https://api.openalex.org/works?"+urllib.parse.urlencode(params),
-      {"User-Agent":cfg.get("user_agent","")},int(c.get("timeout_seconds",30)),int(c.get("max_retries",3)),float(c.get("backoff_seconds",2)))
-    result=[]
-    for item in data.get("results",[]):
-        title=clean_text(item.get("title")); doi=normalize_doi(item.get("doi",""))
-        if not title: continue
-        loc=item.get("primary_location") or {}; src=loc.get("source") or {}
-        authors=[clean_text(x.get("author",{}).get("display_name")) for x in item.get("authorships",[])]
-        result.append(Paper(identity(doi,title),doi,title,inverted_abstract(item),clean_text(src.get("display_name")) or source["name"],
-          item.get("publication_date","") or "",loc.get("landing_page_url","") or ("https://doi.org/"+doi if doi else ""),authors,source["name"]+" / OpenAlex"))
+    result=[]; seen=set()
+    for _ in range(max_pages):
+        data=request_json("https://api.openalex.org/works?"+urllib.parse.urlencode(params),
+          {"User-Agent":cfg.get("user_agent","")},int(c.get("timeout_seconds",30)),int(c.get("max_retries",3)),float(c.get("backoff_seconds",2)))
+        items=data.get("results",[])
+        for item in items:
+            title=clean_text(item.get("title")); doi=normalize_doi(item.get("doi",""))
+            if not title: continue
+            ident=identity(doi,title)
+            if ident in seen: continue
+            seen.add(ident)
+            loc=item.get("primary_location") or {}; src=loc.get("source") or {}
+            authors=[clean_text(x.get("author",{}).get("display_name")) for x in item.get("authorships",[])]
+            result.append(Paper(ident,doi,title,inverted_abstract(item),clean_text(src.get("display_name")) or source["name"],
+              item.get("publication_date","") or "",loc.get("landing_page_url","") or ("https://doi.org/"+doi if doi else ""),authors,source["name"]+" / OpenAlex"))
+        next_cursor=(data.get("meta") or {}).get("next_cursor")
+        if not next_cursor or len(items)<rows: break
+        params["cursor"]=next_cursor
     return result
 
 KEYWORDS = {
@@ -305,24 +352,61 @@ def row_to_paper(row: sqlite3.Row) -> Paper:
     return Paper(row["identity"],row["doi"] or "",row["title"],row["abstract"] or "",row["venue"] or "",
       row["published"] or "",row["url"] or "",json.loads(row["authors_json"] or "[]"),"database")
 
+def update_source_health(db: sqlite3.Connection, source: str, status: str, now: str, error: str="") -> None:
+    prior=db.execute("SELECT * FROM source_health WHERE source=?",(source,)).fetchone()
+    failures=(int(prior["consecutive_failures"]) if prior else 0) + (1 if status=="failed" else 0)
+    if status!="failed": failures=0
+    last_success=now if status in ("healthy","degraded") else (prior["last_success_at"] if prior else None)
+    last_failure=now if status in ("degraded","failed") else (prior["last_failure_at"] if prior else None)
+    db.execute("""INSERT INTO source_health VALUES(?,?,?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET
+      status=excluded.status, consecutive_failures=excluded.consecutive_failures,
+      last_success_at=excluded.last_success_at, last_failure_at=excluded.last_failure_at,
+      last_error=excluded.last_error, updated_at=excluded.updated_at""",
+      (source,status,failures,last_success,last_failure,error or None,now))
+
+def enrich_missing_abstracts(papers: list[Paper], cfg: dict[str,Any], db: sqlite3.Connection | None=None) -> None:
+    grouped: dict[str,list[Paper]]={}
+    for paper in papers: grouped.setdefault(paper.identity,[]).append(paper)
+    for group in grouped.values():
+        abstract=max((paper.abstract for paper in group),key=len,default="")
+        if not abstract and db is not None:
+            prior=db.execute("SELECT abstract FROM papers WHERE identity=?",(group[0].identity,)).fetchone()
+            abstract=(prior[0] or "") if prior else ""
+        if not abstract:
+            abstract=openalex_abstract(group[0].doi,cfg)
+        if abstract:
+            for paper in group:
+                if not paper.abstract: paper.abstract=abstract
+
 def collect_into_db(cfg: dict[str,Any], db: sqlite3.Connection, now: str, run_id: str) -> tuple[list[Paper],list[Paper],list[dict[str,str]]]:
     since=(dt.date.today()-dt.timedelta(days=int(cfg.get("lookback_days",14)))).isoformat()
     failures=[]; collected=[]
     for source in cfg["sources"]:
-        try:
-            papers=crossref_collect(source,cfg,since)
-            papers.extend(openalex_collect(source,cfg,since))
-            for p in papers:
-                if not p.abstract: p.abstract=openalex_abstract(p.doi,cfg)
-            collected.extend(papers); status="ok"; err=""
-        except Exception as e:
-            papers=[]; status="failed"; err=f"{type(e).__name__}: {str(e)[:240]}"; failures.append({"source":source["name"],"error":err})
-        db.execute("INSERT OR REPLACE INTO source_runs VALUES(?,?,?,?,?,?)",(run_id,source["name"],status,len(papers),err,now)); db.commit()
+        papers=[]; errors=[]; attempted=0; succeeded=0
+        attempted += 1
+        try: papers.extend(crossref_collect(source,cfg,since)); succeeded += 1
+        except Exception as e: errors.append("Crossref: "+f"{type(e).__name__}: {str(e)[:200]}")
+        if source.get("openalex_id") and cfg.get("collection",{}).get("openalex_fallback",True):
+            attempted += 1
+            try: papers.extend(openalex_collect(source,cfg,since)); succeeded += 1
+            except Exception as e: errors.append("OpenAlex: "+f"{type(e).__name__}: {str(e)[:200]}")
+        if papers: enrich_missing_abstracts(papers,cfg,db)
+        collected.extend(papers)
+        status="healthy" if succeeded==attempted else ("degraded" if succeeded else "failed")
+        err="; ".join(errors)
+        unique_count=len({paper.identity for paper in papers})
+        db.execute("INSERT OR REPLACE INTO source_runs VALUES(?,?,?,?,?,?)",
+                   (run_id,source["name"],"ok" if status=="healthy" else status,unique_count,err,now))
+        update_source_health(db,source["name"],status,now,err)
+        if errors: failures.append({"source":source["name"],"status":status,"error":err})
+        db.commit()
     new=[]
     for p in collected:
         with db:
             if upsert(db,p,now): new.append(p)
-    return collected,new,failures
+    unique_collected=list({paper.identity:paper for paper in collected}.values())
+    unique_new=list({paper.identity:paper for paper in new}.values())
+    return unique_collected,unique_new,failures
 
 def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False) -> int:
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
@@ -345,7 +429,21 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
     queue_path.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
     summary={"run_id":run_id,"collected":len(collected),"new":len(new),"candidates":len(papers),
              "queue_path":str(queue_path),"profile_path":str(profile_path),"source_failures":failures}
-    print(json.dumps(summary,ensure_ascii=False,indent=2)); return 1 if len(failures)==len(cfg["sources"]) else 0
+    run_status="partial" if failures else "succeeded"
+    if failures and all(x.get("status")=="failed" for x in failures): run_status="failed"
+    profile_row=db.execute("SELECT id FROM profile_versions WHERE profile_hash=? AND status='active'",(phash,)).fetchone()
+    with db:
+        db.execute("""INSERT OR REPLACE INTO pipeline_runs(
+          run_id,kind,status,profile_version_id,started_at,finished_at,collected_count,candidate_count,relevant_count,error_summary,details_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (run_id,"agent-export",run_status,profile_row[0] if profile_row else None,now,dt.datetime.now(dt.timezone.utc).isoformat(),len(collected),len(papers),0,
+         "; ".join(x["error"] for x in failures) or None,json.dumps(summary,ensure_ascii=False)))
+        db.execute("""INSERT OR REPLACE INTO agent_jobs(
+          run_id,profile_hash,status,queue_path,results_path,exported_count,imported_count,created_at,imported_at
+        ) VALUES(?,?,'exported',?,NULL,?,0,?,NULL)""",(run_id,phash,str(queue_path),len(papers),now))
+    required={s["name"] for s in cfg["sources"] if s.get("required",True)}
+    failed_required={x["source"] for x in failures if x.get("status")=="failed" and x["source"] in required}
+    print(json.dumps(summary,ensure_ascii=False,indent=2)); return 1 if required and failed_required==required else 0
 
 def agent_import(config_path: Path, results_path: Path) -> int:
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); profile=(state/cfg["profile_file"]).read_text(encoding="utf-8")
@@ -354,6 +452,19 @@ def agent_import(config_path: Path, results_path: Path) -> int:
     results=data.get("results");
     if not isinstance(results,list): raise ValueError("results must be a list")
     db=db_open(state/"papers.sqlite3"); now=dt.datetime.now(dt.timezone.utc).isoformat(); selected=[]; imported=0
+    run_id=data.get("run_id") or now.replace(":","-")
+    job=db.execute("SELECT * FROM agent_jobs WHERE run_id=?",(run_id,)).fetchone()
+    identities=[str(item.get("identity","")) for item in results]
+    if len(identities)!=len(set(identities)): raise ValueError("results contain duplicate paper identities")
+    if job:
+        queue_path=Path(job["queue_path"])
+        if not queue_path.exists(): raise FileNotFoundError(f"Agent queue not found: {queue_path}")
+        queue=json.loads(queue_path.read_text(encoding="utf-8"))
+        expected={paper["identity"] for paper in queue.get("papers",[])}
+        received=set(identities)
+        if received != expected:
+            missing=sorted(expected-received); extra=sorted(received-expected)
+            raise ValueError(f"Results must cover the complete queue (missing={len(missing)}, extra={len(extra)})")
     threshold=float(cfg.get("relevance_threshold",0.62))
     for item in results:
         identity_value=item.get("identity",""); row=db.execute("SELECT * FROM papers WHERE identity=?",(identity_value,)).fetchone()
@@ -364,9 +475,15 @@ def agent_import(config_path: Path, results_path: Path) -> int:
            result["reasons"],json.dumps(result["matched_themes"],ensure_ascii=False),result["confidence"],now))
         imported += 1
         if result["relevant"]: selected.append((row_to_paper(row),result))
-    digest_dir=state/"digests"; digest_dir.mkdir(exist_ok=True); run_id=data.get("run_id") or now.replace(":","-")
+    digest_dir=state/"digests"; digest_dir.mkdir(exist_ok=True)
     markdown,_=render_digest(selected,data.get("source_failures",[]),run_id)
     digest_path=digest_dir/f"{str(run_id).replace('+','_')}-agent.md"; digest_path.write_text(markdown,encoding="utf-8")
+    with db:
+        db.execute("""UPDATE pipeline_runs SET status='succeeded',finished_at=?,relevant_count=?,details_json=?
+          WHERE run_id=?""",(now,len(selected),json.dumps({"results_path":str(results_path),"digest_path":str(digest_path)},ensure_ascii=False),run_id))
+        if job:
+            db.execute("""UPDATE agent_jobs SET status='imported',results_path=?,imported_count=?,imported_at=?
+              WHERE run_id=?""",(str(results_path),imported,now,run_id))
     print(json.dumps({"run_id":run_id,"imported":imported,"relevant":len(selected),"digest_path":str(digest_path)},ensure_ascii=False,indent=2))
     return 0
 
