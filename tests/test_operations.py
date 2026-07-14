@@ -29,7 +29,8 @@ class OperationsTests(unittest.TestCase):
             self.assertEqual(result["state_dir"],str(state.resolve()))
             self.assertTrue((state/"papers.sqlite3").exists())
             self.assertTrue(result["verification"]["database"]["schema_current"])
-            self.assertIn("跳过后台服务",result["service"]["manual_boundary"])
+            expected = "跳过后台服务" if sys.platform == "darwin" else "Linux 与 Windows"
+            self.assertIn(expected,result["service"]["manual_boundary"])
 
     def test_setup_migrates_old_state_without_modifying_source(self):
         with tempfile.TemporaryDirectory() as td, \
