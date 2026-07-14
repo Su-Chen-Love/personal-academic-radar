@@ -198,3 +198,42 @@ def list_feedback(db_path: Path) -> list[dict[str, Any]]:
     finally:
         db.close()
 
+
+def clear_feedback(db_path: Path, identity: str) -> dict[str, Any]:
+    """Clear current user-facing feedback while retaining internal recovery evidence."""
+
+    upgrade_database(db_path)
+    db = connect(db_path)
+    try:
+        if not db.execute("SELECT 1 FROM papers WHERE identity=?", (identity,)).fetchone():
+            raise ValueError(f"Unknown paper identity: {identity}")
+        prior = db.execute("SELECT * FROM paper_feedback WHERE identity=?", (identity,)).fetchone()
+        with db:
+            db.execute("DELETE FROM paper_feedback WHERE identity=?", (identity,))
+            if prior:
+                db.execute(
+                    """INSERT INTO feedback_events(
+                    identity,interest,reason,favorite,reading_status,created_at
+                    ) VALUES(?,NULL,'用户清除当前反馈',0,'unread',?)""",
+                    (identity, utc_now()),
+                )
+        return {"identity": identity, "cleared": bool(prior)}
+    finally:
+        db.close()
+
+
+def set_favorite(db_path: Path, identity: str, favorite: bool) -> dict[str, Any]:
+    upgrade_database(db_path)
+    db = connect(db_path)
+    try:
+        prior = db.execute("SELECT * FROM paper_feedback WHERE identity=?", (identity,)).fetchone()
+    finally:
+        db.close()
+    return set_feedback(
+        db_path,
+        identity,
+        prior["interest"] if prior else None,
+        prior["reason"] or "" if prior else "",
+        favorite,
+        prior["reading_status"] if prior else "unread",
+    )

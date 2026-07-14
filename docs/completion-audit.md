@@ -1,20 +1,27 @@
-# Completion audit
+# v0.8.0 完成审计（2026-07-14）
 
-This audit maps the requested outcome to current, inspectable evidence. It is
-updated before the project is declared complete.
+## 产品与数据
 
-| Requirement | Status | Evidence |
-| --- | --- | --- |
-| Independent public repository | Proven remotely | [`Su-Chen-Love/personal-academic-radar`](https://github.com/Su-Chen-Love/personal-academic-radar) is a public, standalone repository with `main` as its default branch and the audited `v0.6.0` tag. Private state, databases, profiles, feedback, and credentials are excluded. |
-| Reliable Crossref, OpenAlex, and CHI collection | Proven locally | Cursor pagination, retry/backoff, independent provider degradation, DOI/title deduplication, abstract reuse, `source_runs`, and `source_health`; seven configured sources reported healthy in a real run. |
-| Codex Automation semantic judgment without another model key | Proven locally | Active `hci` task runs daily at 08:00 and uses export/judge/import. The direct path fails closed without a semantic provider. A real host-model run imported all 102 queued results atomically. |
-| Today, Library, Sources, Profile, Feedback, and Status web pages | Proven locally | All six server-rendered pages return HTTP 200 against the private production state. Browser inspection showed real cards, metrics, forms, styling, and no console errors. |
-| Interest, non-interest, reason, favorite, read, and read-later feedback | Proven by tests | Current feedback plus append-only events, reason validation, CSRF-protected web forms, filters, and balanced export examples are covered by automated integration tests. |
-| Feedback calibration and confirmed profile versions | Proven by tests and queue data | Queues snapshot positive/negative examples and the confirmed profile ID. Profile edits remain drafts until explicit confirmation; drift blocks collection. |
-| Migrations, recovery, tests, and real end-to-end verification | Proven locally | Schema v3 migrations, consistent SQLite backup, pre-restore preservation, integrity checks, wheel build, 28 automated tests, real collection, real 102/102 semantic import, and verified digest. |
-| Accessible page, real results, and maintainable operation | Proven locally | `http://127.0.0.1:8765` serves 107 papers and 28 relevant results. A healthy per-user launchd service keeps the web app running; `verify`, backup, restore, service install/status/uninstall, and deployment documentation are present. |
+- 产品边界固定为单用户、本地优先、私有 SQLite 和回环地址网页；没有云同步、公共站点或直接模型 API。
+- 真实 v5 数据库先后创建迁移前备份和两轮清洗备份，并全部通过 `PRAGMA integrity_check`；v6 迁移保留 120 篇论文、227 条历史判断和用户反馈。
+- 初始 120 条记录经首轮治理保留 112 条、排除 8 条；随后完整日常运行采集 20 条新记录。最终 140 条中 130 条符合 allowlist、10 条排除、待核查为 0。排除原因为：评论性内容 4、编辑性内容 2、来信或短评 2、研究简报 1、更正/勘误 1。
+- 初始 55 条缺失摘要经本地同 DOI、Crossref、OpenAlex、Semantic Scholar 批量/逐条接口、Europe PMC、PubMed 和出版商结构化元数据核查，找回 16 条。新采集记录含 16 条可追溯摘要，因此总覆盖由 65/120（54.2%）变为 97/140（69.3%）；合格论文覆盖为 96/130（73.8%），正式可见论文为 27/33（81.8%）。剩余 34 条合格论文通过公开渠道未找到摘要，已导出含逐项原因的严格人工证据任务包。
+- 16 条补摘要论文已使用已激活完整画像和反馈重新判断并原子导入，2 条达到 0.62 阈值；最终日常运行的 19 条队列全部导入，3 条达到阈值。合格论文 130 条均有最新判断，97 条低于 0.62，`needs_rescreen` 归零。
 
-The public application code and local-first operating model are now verified.
-Public exposure of the research profile, feedback, and paper database remains
-deliberately out of scope: those artifacts stay in the external private state
-directory unless the operator makes a separate deployment decision.
+## 交互与运维
+
+- 来源搜索在 320ms 防抖后走本地 JSON API，不再提交 `/sources/match`；真实浏览器验证结果出现前后 URL 不变且不回到顶部。
+- 键盘上下选择维护 `aria-activedescendant`/`aria-selected`，Enter 打开真实作品预览，已添加来源禁用；来源移除使用确认、配置备份和原子替换。
+- 今日雷达使用最新导入运行的 `selected_new`，文献库支持组合筛选/排序/分页、收藏、详情和溢出摘要展开；PDF 入口集中在页头对话框。
+- 反馈历史不再作为产品模块；画像页移除备用 API；状态页提供补摘要、采集/建队列、复查、失败重试和任务包导出。
+- 静态 CSS/JS URL 带版本号，防止升级后浏览器混用旧交互代码。
+
+## 验证证据
+
+- Python 3.9、3.11、3.13：83 项测试全部通过，并将警告视为失败。
+- 实际浏览器：1280×720 与 390×844 下六页均无横向溢出；验证来源键盘搜索、筛选参数、摘要展开、PDF 对话框和状态按钮。移动 PDF 对话框尺寸 362×439，完整位于 390×844 视口。
+- Wheel：包含 6 个迁移、9 个模板、CSS、JS、默认配置/画像和 `paper_monitor.py`；全新 Python 3.9 wheel 安装执行 `setup --no-service` 成功，七个 HTTP 端点均为 200。
+- 旧状态演练：真实 v5 在线备份在临时目录由 wheel 自动备份并升级到 v6，120 篇保留，完整性为 `ok`。
+- 真实后台服务：macOS 用户级 launchd 服务使用私有配置运行，`/healthz` 与六页均为 200。
+
+该审计不把无法公开获取的摘要伪装为完成；人工证据任务包和逐项失败原因是剩余工作的恢复入口。

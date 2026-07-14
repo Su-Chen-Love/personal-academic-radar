@@ -1,6 +1,6 @@
 ---
 name: monitor-research-papers
-description: Monitor configured academic journals and conferences for newly published papers, maintain a local SQLite history, infer or update a research-interest profile from user papers and project materials, screen titles and abstracts with an LLM or deterministic fallback, produce daily Markdown/HTML digests, and optionally email relevant results. Use when Codex or Claude needs to set up, run, troubleshoot, schedule, or review an automated literature-monitoring workflow.
+description: Monitor configured academic journals and conferences for newly published papers, maintain private local SQLite history, enrich traceable abstracts, govern publication types, and use the Codex host export/judge/import workflow for relevance. Use when Codex needs to set up, run, troubleshoot, schedule, or review this local literature-monitoring workflow.
 ---
 
 # Monitor Research Papers
@@ -14,9 +14,9 @@ Use the bundled deterministic runner for collection, normalization, deduplicatio
 3. Refine the profile from user-provided papers, proposals, notes, and explicit feedback. Read `references/profile-guidance.md` before changing it. Preserve negative interests and boundary conditions, not just keywords.
 4. Validate without changing state:
    `python3 scripts/paper_monitor.py doctor --config <state>/config.toml`
-5. Preview collection when changing sources:
-   `python3 scripts/paper_monitor.py run --config <state>/config.toml --dry-run`
-6. For a Claude/Codex scheduled task, export papers awaiting model judgment:
+5. Enrich traceable abstracts and publication-type evidence:
+   `academic-radar abstracts enrich --config <state>/config.toml`
+6. For a Codex scheduled task, export papers awaiting model judgment:
    `python3 scripts/paper_monitor.py agent-export --config <state>/config.toml`
    Read the returned queue JSON and complete every paper using the rubric in `references/profile-guidance.md`. Write a results JSON with the same `run_id` and `profile_hash`, a `model` label, and a `results` array. Each result must contain `identity`, `relevant`, `score`, `reasons`, `matched_themes`, and `confidence`.
    Treat `feedback_examples` as confirmed positive/negative calibration evidence,
@@ -29,17 +29,17 @@ Use the bundled deterministic runner for collection, normalization, deduplicatio
 
 ## Safety and operational rules
 
-- Keep API keys and SMTP credentials in environment variables. Never write secrets into the skill, config, database, logs, or digest.
+- Never add a direct model provider or inspect/output environment-variable secrets. Semantic judgment is performed only by the Codex host export/import workflow.
 - Default the first successful run to baseline mode: persist observed papers without emailing old backlog. Set `bootstrap_mode = "include"` only when the user explicitly wants historical results.
 - Treat DOI as the preferred identity; otherwise use a normalized title hash. Upserts must be idempotent.
-- Prefer Crossref for DOI/publisher metadata and use OpenAlex as a fallback/enrichment source. Do not scrape publisher HTML unless the user explicitly accepts brittle scraping and applicable terms permit it.
+- Prefer Crossref for DOI/publisher metadata, then OpenAlex, Semantic Scholar, Europe PMC, PubMed, and verified publisher structured metadata. Store only clearly identified original abstracts with source URL and time; never treat search snippets or generated summaries as abstracts.
 - A source failure must not erase prior state or mark unseen papers as processed. Retry transient errors and continue other sources.
-- Prefer the host-model agent export/import workflow in Claude/Codex automations. Use direct API providers only for headless operation outside an AI host. Never silently replace requested semantic model judgment with keyword matching.
+- Use only the host-model agent export/import workflow in Codex automations. Never silently replace semantic judgment with keyword matching.
 - Imports are all-or-nothing. They must cover every exported identity exactly
   once and preserve run, profile, feedback snapshot, and source-failure metadata.
   A newer export abandons any older unfinished queue.
 - Send email only when `delivery.enabled = true`; respect `send_when_empty`.
-- SQLite is single-host state. For GitHub Actions, persist the state directory with an artifact/cache or use an external durable store; otherwise every run bootstraps anew.
+- SQLite is private single-host state. Never upload it, its WAL, queues, results, logs, PDFs, feedback, or configuration to GitHub or a synchronization service.
 
 ## Research-interest judgment
 
@@ -57,4 +57,4 @@ backup, recovery, and service guidance.
 
 ## Troubleshooting
 
-Read `references/deployment.md` for provider, email, scheduling, and persistence details. Run `doctor` before diagnosis. Inspect the latest JSON run log in `<state>/logs/` and the `source_runs` table; avoid deleting the database as a first response.
+Read `references/deployment.md` for metadata sources, scheduling, recovery, and persistence details. Run `doctor` or `academic-radar verify` before diagnosis. Inspect the latest JSON run log in `<state>/logs/` and the `source_runs`, `task_runs`, and `abstract_attempts` tables; avoid deleting the database as a first response.

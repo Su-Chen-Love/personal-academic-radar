@@ -2,21 +2,34 @@
 {% from "_paper_card.html" import paper_card with context %}
 {% block title %}文献库 · 个人学术雷达{% endblock %}
 {% block content %}
-<header class="page-head"><div><p class="kicker">LIBRARY · {{ total }} RECORDS</p><h1>你的文献库</h1><p>所有采集历史、语义判断与个人阅读状态都在这里。</p></div></header>
+<header class="page-head"><div><p class="kicker">LIBRARY · {{ total }} RECORDS</p><h1>你的文献库</h1><p>默认只显示出版类型合格且达到当前匹配阈值的论文。</p></div><button type="button" data-open-pdf>导入全文 PDF</button></header>
 <form class="filter-bar" method="get">
-  <label class="search"><span>⌕</span><input name="q" value="{{ q }}" placeholder="搜索标题、摘要或期刊"></label>
-  <select name="interest" aria-label="兴趣判断"><option value="">全部兴趣</option><option value="interested" {{ 'selected' if interest == 'interested' }}>感兴趣</option><option value="not_interested" {{ 'selected' if interest == 'not_interested' }}>不感兴趣</option></select>
-  <select name="reading" aria-label="阅读状态"><option value="">全部状态</option><option value="unread" {{ 'selected' if reading == 'unread' }}>未读</option><option value="read_later" {{ 'selected' if reading == 'read_later' }}>稍后阅读</option><option value="read" {{ 'selected' if reading == 'read' }}>已读</option></select>
-  <button>筛选</button>
+  <label class="search"><span>⌕</span><input name="q" value="{{ q }}" placeholder="搜索标题、摘要或期刊" aria-label="搜索文献"></label>
+  <label><span class="sr-only">兴趣判断</span><select name="interest"><option value="">全部兴趣</option><option value="interested" {{ 'selected' if interest == 'interested' }}>感兴趣</option><option value="not_interested" {{ 'selected' if interest == 'not_interested' }}>不感兴趣</option></select></label>
+  <label><span class="sr-only">阅读状态</span><select name="reading"><option value="">全部阅读状态</option><option value="unread" {{ 'selected' if reading == 'unread' }}>未读</option><option value="read_later" {{ 'selected' if reading == 'read_later' }}>稍后阅读</option><option value="read" {{ 'selected' if reading == 'read' }}>已读</option></select></label>
+  <label><span class="sr-only">收藏筛选</span><select name="favorite"><option value="">全部论文</option><option value="yes" {{ 'selected' if favorite == 'yes' }}>只看收藏</option></select></label>
+  <label><span class="sr-only">排序方式</span><select name="sort"><option value="score_desc" {{ 'selected' if sort == 'score_desc' }}>匹配度：高到低</option><option value="score_asc" {{ 'selected' if sort == 'score_asc' }}>匹配度：低到高</option><option value="date_desc" {{ 'selected' if sort == 'date_desc' }}>发布日期：最新</option><option value="date_asc" {{ 'selected' if sort == 'date_asc' }}>发布日期：最早</option><option value="title_asc" {{ 'selected' if sort == 'title_asc' }}>标题：A–Z</option></select></label>
+  <button>应用</button>
 </form>
 <div class="paper-list compact">
   {% for paper in papers %}{{ paper_card(paper, request.url.path ~ ('?' ~ request.url.query if request.url.query else '')) }}
-  {% else %}<div class="empty"><strong>没有匹配的论文</strong><p>试试放宽搜索或筛选条件。</p></div>{% endfor %}
+  {% else %}<div class="empty"><strong>没有匹配的论文</strong><p>试试清除筛选条件；低匹配或非研究型内容不会出现在正式文献库。</p></div>{% endfor %}
 </div>
 <nav class="pagination" aria-label="分页">
-  {% if page_no > 1 %}<a href="?q={{ q|urlencode }}&interest={{ interest }}&reading={{ reading }}&page_no={{ page_no-1 }}">← 上一页</a>{% endif %}
+  {% if page_no > 1 %}<a href="?{{ previous_query }}">← 上一页</a>{% endif %}
   <span>第 {{ page_no }} 页</span>
-  {% if has_next %}<a href="?q={{ q|urlencode }}&interest={{ interest }}&reading={{ reading }}&page_no={{ page_no+1 }}">下一页 →</a>{% endif %}
+  {% if has_next %}<a href="?{{ next_query }}">下一页 →</a>{% endif %}
 </nav>
+<dialog id="pdf-dialog" class="modal">
+  <form method="post" action="/fulltext" enctype="multipart/form-data" class="modal-form" data-pdf-form>
+    <div class="panel-head"><h2>导入全文 PDF</h2><button type="button" class="icon-button" data-close-dialog aria-label="关闭">×</button></div>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="return_to" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}">
+    <label>搜索论文<input type="search" data-paper-search placeholder="输入标题关键词"></label>
+    <label>绑定到论文<select name="identity" data-paper-select required><option value="">请选择论文</option>{% for item in pdf_papers %}<option value="{{ item.identity }}">{{ item.title }}</option>{% endfor %}</select></label>
+    <label>选择 PDF<input type="file" name="pdf" accept="application/pdf,.pdf" required data-pdf-file></label>
+    <div class="file-summary" data-file-summary>尚未选择文件</div>
+    <button type="submit">确认导入</button>
+  </form>
+</dialog>
 {% endblock %}
-

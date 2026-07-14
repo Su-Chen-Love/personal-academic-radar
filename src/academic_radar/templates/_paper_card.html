@@ -1,14 +1,26 @@
 {% macro paper_card(paper, return_to) %}
-<article class="paper-card">
+<article class="paper-card" id="paper-{{ paper.identity|replace(':','-')|replace('/','-')|replace('.','-') }}">
   <div class="paper-score">
     {% if paper.score is not none %}<strong>{{ "%.0f"|format(paper.score * 100) }}</strong><span>匹配度</span>{% else %}<strong>—</strong><span>待判断</span>{% endif %}
   </div>
   <div class="paper-body">
     <div class="eyebrow"><span>{{ paper.venue or '未知来源' }}</span><time>{{ paper.published or '日期未知' }}</time></div>
-    <h2><a href="{{ paper.url }}" target="_blank" rel="noreferrer">{{ paper.title }}</a></h2>
-    {% if paper.reasons %}<p class="reason">{{ paper.reasons }}</p>{% endif %}
-    <p class="abstract">{{ paper.abstract or '暂无摘要。' }}</p>
-    <details class="feedback-drawer" {{ 'open' if paper.interest }}>
+    <div class="paper-title-row"><h2>{{ paper.title }}</h2>
+      <button type="button" class="favorite-button {{ 'is-favorite' if paper.favorite }}" data-favorite data-identity="{{ paper.identity }}" aria-pressed="{{ 'true' if paper.favorite else 'false' }}" aria-label="{{ '取消收藏' if paper.favorite else '收藏到本地文献库' }}">{{ '★' if paper.favorite else '☆' }}</button>
+    </div>
+    <div class="paper-tags">
+      {% if paper.publication_type %}<span class="tag">{{ paper.publication_type }}</span>{% endif %}
+      {% if paper.fulltext_count %}<span class="tag">全文 {{ paper.fulltext_count }} 个</span>{% endif %}
+    </div>
+    {% if paper.reasons %}<p class="reason"><strong>AI 推荐理由：</strong>{{ paper.reasons }}</p>{% endif %}
+    <details class="paper-details">
+      <summary>展开详情</summary>
+      <div class="paper-detail-content">
+      {% if not paper.abstract %}<p class="warning">公开渠道暂未找到原始摘要；系统不会生成或改写摘要冒充原文。</p>{% endif %}
+      <div class="abstract-wrap" data-abstract-wrap><p class="abstract" data-abstract>{{ paper.abstract or '公开渠道未找到原始摘要。' }}</p><button type="button" class="text-button abstract-toggle" data-abstract-toggle hidden aria-expanded="false">展开摘要</button></div>
+      <dl class="paper-meta"><div><dt>作者</dt><dd>{{ paper.authors_json|authors }}</dd></div><div><dt>摘要来源</dt><dd>{{ paper.abstract_source or '未找到' }}</dd></div><div><dt>DOI</dt><dd>{{ paper.doi or '无' }}</dd></div></dl>
+      <div class="paper-actions">{% if paper.url %}<a class="button secondary" href="{{ paper.url }}" target="_blank" rel="noreferrer">打开原文</a>{% endif %}<button type="button" class="button secondary" data-open-pdf data-identity="{{ paper.identity }}" data-title="{{ paper.title }}">导入全文 PDF</button></div>
+      <details class="feedback-drawer" {{ 'open' if paper.interest }}>
       <summary>
         {% if paper.interest == 'interested' %}已标记感兴趣
         {% elif paper.interest == 'not_interested' %}已标记不感兴趣
@@ -39,8 +51,9 @@
         <label class="check"><input type="checkbox" name="favorite" {{ 'checked' if paper.favorite }}> 收藏</label>
         <button type="submit">保存反馈</button>
       </form>
+      </details>
+      </div>
     </details>
   </div>
 </article>
 {% endmacro %}
-

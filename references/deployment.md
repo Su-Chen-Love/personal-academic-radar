@@ -1,95 +1,112 @@
-# Deployment and daily operation
+# 本地部署与每日运行
 
-## Supported daily architecture
+## 支持边界
 
-The recommended single-researcher installation has three explicit boundaries:
+v0.8.0 只支持单用户本地部署：代码仓库与私有状态目录严格分离，SQLite 只由本机应用写入，网页默认监听 `127.0.0.1:8765`。不支持云同步、共享数据库、公共网站或直接模型 API。
 
-1. this public code repository;
-2. a private state directory containing configuration, SQLite, queues, results,
-   feedback, logs, digests, and backups; and
-3. the Codex Automation that runs export, host-model semantic judgment, and
-   atomic import every morning.
+## 一条命令完成设置
 
-No `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is required. The old heuristic
-fallback is not part of the supported daily workflow and the direct runner now
-fails closed when no semantic API provider is explicitly configured.
-
-## Local installation
-
-Create a virtual environment, install the package, copy the example config and
-profile to `~/.local/share/personal-academic-radar`, then run:
+在虚拟环境中安装后运行：
 
 ```bash
-academic-radar db upgrade --db ~/.local/share/personal-academic-radar/papers.sqlite3
-python scripts/paper_monitor.py doctor --config ~/.local/share/personal-academic-radar/config.toml
-academic-radar verify --config ~/.local/share/personal-academic-radar/config.toml
-academic-radar web --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar setup
 ```
 
-The web app listens on `127.0.0.1:8765` by default. Do not use
-`--allow-remote` without adding an authenticated reverse proxy and reviewing
-the threat model.
+该入口会：
 
-## Codex Automation
+1. 检测并升级默认私有状态，不静默读取项目内旧 `state/`；
+2. 仅在显式指定 `--from-state` 且目标为空时迁移旧状态，不修改原目录；
+3. 初始化缺失文件，备份并升级旧数据库；
+4. 移除旧 `[llm]` 配置并保留完整配置备份；
+5. 运行数据库完整性、画像、来源、语义和摘要验证；
+6. 在 macOS 安装并启动可逆的用户级 launchd 服务；
+7. 返回本地 URL、状态目录、配置、数据库和日志路径。
 
-Schedule one local project automation daily at 08:00. Its prompt must:
+指定旧状态或暂不安装服务：
 
-- read `SKILL.md` and `references/profile-guidance.md`;
-- call `agent-export` with the private config;
-- read the complete confirmed profile and `feedback_examples`;
-- semantically judge every queued identity with the host model;
-- preserve run, profile, and source-failure metadata;
-- write results only into the private state directory; and
-- call `agent-import`, then report collection, candidate, selected, and failure
-  counts.
+```bash
+academic-radar setup --from-state /path/to/old/state
+academic-radar setup --no-service
+```
 
-A newer export abandons an unfinished older queue. Import is all-or-nothing and
-rejects partial, duplicate, stale, or mismatched results.
+`setup` 与 `init` 都可以安全重复运行。目标目录已有数据时不会自动覆盖或合并另一个状态。
+只有显式提供 `--from-state` 才会从其他目录迁移，避免把仓库里的示例或历史 `state/` 误当成当前私有库；迁移会自动备份、升级并验证。
 
-## Backups and recovery
+## macOS 后台服务
 
-Create a consistent, verified backup before migrations and periodically during
-normal use:
+```bash
+academic-radar service status --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar service restart-web --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar service logs --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar service uninstall-web
+```
+
+服务仅在当前用户登录后运行，失败会自动重启；卸载只移除启动项，不删除私有状态。
+
+## Linux 与 Windows 边界
+
+v0.8.0 会在 Linux/Windows 完成初始化、迁移和 verify，但不会自动创建后台服务。
+
+Linux 可创建 systemd user service，`ExecStart` 指向虚拟环境中的：
+
+```text
+academic-radar web --config /home/USER/.local/share/personal-academic-radar/config.toml
+```
+
+Windows 可为当前用户创建“登录时”任务，程序为虚拟环境中的 `academic-radar.exe`，参数为：
+
+```text
+web --config %LOCALAPPDATA%\PersonalAcademicRadar\config.toml
+```
+
+两者都必须只监听回环地址；是否启用 linger、特权账户或防火墙例外属于人工管理员决定。
+
+## 每日 Codex 自动任务
+
+每天 08:00（`Asia/Shanghai`）只保留一个任务，按顺序执行：
+
+1. 采集新论文；
+2. 从可追溯渠道补全摘要；
+3. 排除非研究出版类型，隔离证据不足项；
+4. 导出全部待判断/待重判队列；
+5. 用完整已激活画像和反馈样例判断每一项；
+6. 原子导入严格 JSON；
+7. 运行 verify 并输出新增、入选、排除、摘要和失败摘要。
+
+新导出会将未完成旧队列标为已放弃；导入拒绝部分、重复、画像不匹配或元数据不匹配的结果。自动任务不得上传状态或调用独立模型 API。
+
+## 摘要服务约束
+
+补全器依次使用本地同 DOI、Crossref、OpenAlex、Semantic Scholar、Europe PMC、PubMed 和出版商结构化元数据。实现遵循各官方服务的限流和标识要求，缓存短期失败并支持重试。单个来源失败只记录在 `abstract_attempts`，不会中止其他来源，也不会覆盖已有摘要。
+
+手动任务包和导入：
+
+```bash
+academic-radar abstracts export-missing --config ~/.local/share/personal-academic-radar/config.toml --output missing.json
+academic-radar abstracts import --config ~/.local/share/personal-academic-radar/config.toml --input evidence.json --preview
+academic-radar abstracts import --config ~/.local/share/personal-academic-radar/config.toml --input evidence.json
+```
+
+只接受明确的原始摘要证据；搜索片段、模型总结和改写文本一律拒绝作为摘要。
+
+## 备份与恢复
 
 ```bash
 academic-radar db backup \
   --db ~/.local/share/personal-academic-radar/papers.sqlite3 \
   --output ~/.local/share/personal-academic-radar/backups/manual.sqlite3
+
+academic-radar db restore --backup /path/to/backup.sqlite3 \
+  --db ~/.local/share/personal-academic-radar/papers.sqlite3 --replace
 ```
 
-Test a backup without touching production by restoring to a temporary path and
-running `db status`. Restoring over production requires `--replace`; the tool
-first preserves the current database as a timestamped pre-restore backup.
+备份使用 SQLite 在线备份 API并执行 `PRAGMA integrity_check`。覆盖恢复前会再次保存当前数据库。不要用普通同步工具复制正在写入的 SQLite/WAL 文件。
 
-Never synchronize a live SQLite WAL database with ordinary file-copy tools.
-Use the built-in online backup operation.
-
-## macOS web service
-
-Install the reversible per-user launchd service from the same virtual
-environment used by the application:
+## 故障定位
 
 ```bash
-academic-radar service install-web --config ~/.local/share/personal-academic-radar/config.toml
-academic-radar service status
+academic-radar verify --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar service logs --config ~/.local/share/personal-academic-radar/config.toml
 ```
 
-Use `academic-radar service uninstall-web` to unload it and remove its plist.
-The service starts only the loopback web interface; Codex remains the semantic
-scheduler.
-
-## Public or remote access
-
-Public access is intentionally not enabled by default because the application
-contains a private research profile and behavioral feedback. Choose and approve
-an authentication and persistence design before deployment. A public code
-repository must never include the state directory, configuration, database,
-queues, results, logs, or backups.
-
-## Source behavior
-
-Crossref uses cursor pagination and an overlapping created-date window.
-OpenAlex is attempted independently, so one provider may degrade while the
-other still supplies records. Existing abstracts are reused before DOI-level
-enrichment. Inspect the Sources and Run Status pages or the `source_health`,
-`source_runs`, and `pipeline_runs` tables when a source is degraded.
+再检查私有 `logs/` 中最近运行报告，以及 SQLite 的 `source_runs`、`task_runs` 和 `abstract_attempts`。不要把删库重建作为修复手段。

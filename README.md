@@ -2,117 +2,99 @@
 
 [![Tests](https://github.com/Su-Chen-Love/personal-academic-radar/actions/workflows/test.yml/badge.svg)](https://github.com/Su-Chen-Love/personal-academic-radar/actions/workflows/test.yml)
 
-A local-first academic monitoring system for one researcher. It collects papers
-from Crossref, OpenAlex, and CHI proceedings, keeps durable SQLite history, and
-uses the model already available inside a Codex Automation for semantic
-relevance judgments. No separate LLM API key is required for the recommended
-workflow.
+Personal Academic Radar 是面向单个研究者的本地优先文献雷达。代码可以公开；配置、研究画像、SQLite、反馈、队列、摘要结果、日志和 PDF 始终保存在私有状态目录，默认是 `~/.local/share/personal-academic-radar`。
 
-This repository contains application code only. Your configuration, research
-profile, feedback, database, logs, and generated digests belong in an external
-state directory (by default `~/.local/share/personal-academic-radar`) and are
-excluded from version control.
+语义判断只使用 Codex 宿主的“导出队列 → 判断 → 原子导入”流程，不需要也不支持独立模型 API。摘要只从可追溯元数据或官方论文页获取，绝不生成或改写后冒充原始摘要。
 
-## Current status
+## 最短安装流程
 
-The collector, Codex export/import workflow, six-page web application, database
-migrations, verified backups, legacy-state migration, and persistent local web
-service are available through the `academic-radar` command. See the
-[completion audit](docs/completion-audit.md) for verified release evidence.
-
-Collection is cursor-paginated and records per-source health. Crossref and
-OpenAlex are attempted independently, so a Crossref outage can degrade a source
-without discarding usable OpenAlex results.
-
-Feedback is stored both as current state and as an append-only audit history.
-Interested and not-interested judgments require a reason and are exported as
-balanced positive/negative examples in every later Codex screening queue.
-Favorites and unread/read/read-later state are independent of relevance.
-
-Research-profile edits never become active implicitly. Create a draft, review
-it, and confirm its numeric version to activate it:
-
-```bash
-academic-radar profile draft --db "$RADAR_STATE/papers.sqlite3" \
-  --file proposed-profile.md --summary "Add false-positive boundary"
-academic-radar profile confirm --db "$RADAR_STATE/papers.sqlite3" \
-  --id 2 --profile-file "$RADAR_STATE/research-profile.md"
-```
-
-The collector refuses to run when the profile file differs from the confirmed
-active database version. This makes accidental interest drift visible.
-
-## Web application
-
-Start the local single-user interface with:
-
-```bash
-academic-radar web --config ~/.local/share/personal-academic-radar/config.toml
-```
-
-Then open `http://127.0.0.1:8765`. The application contains Today, Library,
-Sources, Research Profile, Feedback, and Run Status pages. It binds only to the
-local machine by default, protects writes with an anti-forgery token, and sends
-restrictive browser security headers. A non-local bind is refused unless the
-operator explicitly supplies `--allow-remote`; that flag is not a substitute
-for authentication and should not be used for public deployment.
-
-## Quick start
-
-Requires Python 3.9 or newer.
+需要 Python 3.9 或更高版本：
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install .
-mkdir -p ~/.local/share/personal-academic-radar
-cp assets/config.example.toml ~/.local/share/personal-academic-radar/config.toml
-cp assets/research-profile.example.md ~/.local/share/personal-academic-radar/research-profile.md
-academic-radar db upgrade --db ~/.local/share/personal-academic-radar/papers.sqlite3
-python scripts/paper_monitor.py doctor --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar setup
 ```
 
-To migrate an older project-local `state/` directory without modifying it:
+`setup` 会初始化或升级私有状态、在升级前在线备份 SQLite、运行完整性与配置验证，并在 macOS 安装可逆的用户级后台服务。完成后打开 <http://127.0.0.1:8765>。
+
+已有旧状态位于其他目录时使用 `academic-radar setup --from-state /path/to/old/state`。程序不会静默导入仓库内的 `state/`，以免把示例或历史数据误当成当前私有库。
+
+Linux 和 Windows 会完成初始化与验证，但 v0.8.0 不自动安装后台服务；请按 [部署说明](references/deployment.md) 配置用户级启动项。非技术用户可以把 [Codex 辅助安装提示词](docs/ai-assisted-install.md) 交给 Codex。
+
+## 六个页面
+
+- 今日雷达：最近一次成功导入中新入选的论文，默认只显示紧凑推荐信息。
+- 文献库：只显示出版类型合格且达到当前阈值的论文，支持排序、筛选、收藏和统一 PDF 导入。
+- 来源：实时搜索并预览可验证的期刊/会议来源，支持安全添加和移除。
+- 研究画像：画像草稿、明确激活、版本回滚和 Codex 本地辅助提示词。
+- 反馈：编辑兴趣、理由、收藏和阅读状态；历史审计不作为用户模块展示。
+- 运行状态：直接启动摘要补全、采集/建队列、状态复查和失败任务重试。
+
+所有用户可见筛选都排除 Editorial、Corrigendum、Extended Abstract 等非正式研究内容，以及低于相关性阈值的记录。被排除记录只在内部保留最小身份和审计证据，避免反复抓取。
+
+## 每日 Codex 流程
+
+每天一次的本地 Codex 自动任务应依次：采集论文、补全真实摘要、治理出版类型、导出待判断队列、使用完整画像与反馈判断全部队列、原子导入并报告结果。核心命令为：
 
 ```bash
-academic-radar state migrate \
-  --from ./state \
-  --to ~/.local/share/personal-academic-radar
+python scripts/paper_monitor.py agent-export \
+  --config ~/.local/share/personal-academic-radar/config.toml
+
+python scripts/paper_monitor.py agent-import \
+  --config ~/.local/share/personal-academic-radar/config.toml \
+  --results ~/.local/share/personal-academic-radar/agent-results/<results.json>
 ```
 
-The command makes a consistent SQLite backup, verifies it, copies non-secret
-state artifacts, and then applies versioned schema migrations to the new copy.
-It refuses to overwrite an existing destination unless `--merge` is supplied.
+队列与结果必须覆盖相同的全部 identity；画像哈希、反馈快照、运行编号或来源失败信息不一致时，导入会整体拒绝。
 
-## Recommended daily workflow
-
-The scheduled Codex task should:
-
-1. Run `agent-export` to collect and create a semantic screening queue.
-2. Read the complete active research profile and confirmed feedback examples.
-3. Judge every queued paper with the host model.
-4. Run `agent-import` to validate and persist the judgments.
-
-Do not use the legacy `run` command without an API-backed model. It now fails
-closed when no direct key exists; it never silently substitutes keyword or
-heuristic scoring for the Codex semantic workflow.
-
-## Data safety
-
-- Never commit the state directory or `.env` files.
-- Credentials are read only from environment variables or the system keychain.
-- DOI is the preferred paper identity; normalized title hashes are the fallback.
-- Backups are created with SQLite's online backup API and checked with
-  `PRAGMA integrity_check` before success is reported.
-- Restore requires an explicit `--replace` flag and preserves the current
-  database as a timestamped pre-restore backup.
-
-## Development
+## 摘要补全与人工证据
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
-python -m academic_radar.cli db status --db /path/to/papers.sqlite3
+academic-radar abstracts enrich \
+  --config ~/.local/share/personal-academic-radar/config.toml
+
+academic-radar abstracts export-missing \
+  --config ~/.local/share/personal-academic-radar/config.toml \
+  --output missing-abstracts.json
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the system boundaries and
-planned product modules.
+自动流程依次复用同 DOI 本地记录，并访问 Crossref、OpenAlex、Semantic Scholar、Europe PMC、PubMed 和出版商结构化元数据。每次尝试都记录来源、URL、时间和失败原因；失败项可从运行状态页重试。人工导入接受严格 JSON/CSV 证据包，并校验 identity、URL、重复项和明显截断内容。
+
+## 清洗、备份与恢复
+
+清洗必须先预览：
+
+```bash
+academic-radar cleanup preview --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar cleanup apply --config ~/.local/share/personal-academic-radar/config.toml --report <preview.json>
+```
+
+预览使用 SQLite 在线备份并运行 `PRAGMA integrity_check`，输出逐项身份、原因、前后统计和恢复命令。应用只更新治理状态，不删库、不抹除收藏、反馈或 PDF。
+
+常规检查：
+
+```bash
+academic-radar verify --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar service status --config ~/.local/share/personal-academic-radar/config.toml
+academic-radar service logs --config ~/.local/share/personal-academic-radar/config.toml
+```
+
+## 安全边界
+
+- GitHub 只保存代码、测试、迁移和通用示例。
+- 不提交 `state/`、配置、SQLite/WAL、备份、队列、结果、PDF、日志、`.env` 或任何密钥。
+- 网页默认只绑定 `127.0.0.1`；本版本不提供公共网站、云同步、共享数据库或多用户部署。
+- 来源配置以原子方式写入并先备份；SQLite 恢复要求显式 `--replace`，且会先保存当前库。
+- PDF 保存在私有目录，校验类型和大小，并用 SHA-256 去重。
+
+## 开发与验证
+
+```bash
+PYTHONPATH=src PYTHONWARNINGS=error python -m unittest discover -s tests -v
+git diff --check
+python -m build
+```
+
+系统边界与运维细节见 [架构说明](docs/architecture.md) 和 [部署说明](references/deployment.md)。

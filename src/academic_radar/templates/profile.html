@@ -13,11 +13,14 @@
   </section>
   <aside class="panel version-list"><div class="panel-head"><h2>版本记录</h2><span>{{ versions|length }} 个版本</span></div>
     {% for version in versions %}<article>
-      <div><strong>v{{ version.id }}</strong><span class="status {{ version.status }}">{{ version.status }}</span></div>
-      <p>{{ version.change_summary or '无修改说明' }}</p><small>{{ version.created_at }}</small>
+      <div><strong>v{{ version.id }}</strong><span class="status {{ version.status }}">{{ version.status|status_label }}</span></div>
+      <p>{{ version.change_summary or '无修改说明' }}</p><small>{{ version.created_at|human_time }}</small>
       {% if version.status == 'draft' %}<form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ version.id }}"><button class="secondary">确认并激活 v{{ version.id }}</button></form>{% endif %}
     </article>{% endfor %}
   </aside>
 </div>
+<section class="panel full profile-prompt"><div class="panel-head"><h2>本地论文解析 Prompt</h2><span>复制到你的 AI，再把草稿贴回上方</span></div>
+  <p class="muted">把提示词交给本机 Codex，并附上代表论文或研究笔记；将生成的画像草稿贴回上方，检查后再明确激活。</p>
+  <textarea rows="16" readonly>{{ profile_prompt }}</textarea>
+</section>
 {% endblock %}
-

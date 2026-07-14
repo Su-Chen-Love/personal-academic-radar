@@ -5,13 +5,25 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import sqlite3
 from pathlib import Path
 
 from .storage import backup_database, database_status, migrate_state, restore_database, upgrade_database
 from .engagement import (
     confirm_profile, create_profile_draft, feedback_examples, list_feedback, list_profiles, set_feedback
 )
-from .operations import install_web_service, uninstall_web_service, verify_installation, web_service_status
+from .operations import (
+    init_installation,
+    install_web_service,
+    restart_web_service,
+    setup_installation,
+    uninstall_web_service,
+    verify_installation,
+    web_service_status,
+)
+from .enrichment import apply_manual_import, enrich_abstracts, export_missing_task_package, preview_manual_import
+from .governance import apply_cleanup_preview, preview_cleanup
+from .product import load_config, resolve_state
 
 
 def _default_backup(db: Path) -> Path:
@@ -22,6 +34,17 @@ def _default_backup(db: Path) -> Path:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="academic-radar")
     groups = root.add_subparsers(dest="group", required=True)
+
+    init = groups.add_parser("init", help="create or repair a local private state directory")
+    init.add_argument("--state", type=Path, default=Path("~/.local/share/personal-academic-radar"))
+    init.add_argument("--config", type=Path)
+
+    setup_command = groups.add_parser("setup", help="initialize, verify, and start the private local application")
+    setup_command.add_argument("--state", type=Path, default=Path("~/.local/share/personal-academic-radar"))
+    setup_command.add_argument("--config", type=Path)
+    setup_command.add_argument("--from-state", type=Path)
+    setup_command.add_argument("--no-service", action="store_true")
+    setup_command.add_argument("--port", default=8765, type=int)
 
     db = groups.add_parser("db", help="manage the SQLite database")
     db_commands = db.add_subparsers(dest="command", required=True)
@@ -79,27 +102,91 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--config", required=True, type=Path)
 
     service = groups.add_parser("service", help="manage the local web background service")
-    service_commands=service.add_subparsers(dest="command",required=True)
-    install_service=service_commands.add_parser("install-web")
-    install_service.add_argument("--config",required=True,type=Path)
-    service_commands.add_parser("status")
+    service_commands = service.add_subparsers(dest="command", required=True)
+    install_service = service_commands.add_parser("install-web")
+    install_service.add_argument("--config", required=True, type=Path)
+    install_service.add_argument("--port", default=8765, type=int)
+    status_service = service_commands.add_parser("status")
+    status_service.add_argument("--config", type=Path)
+    status_service.add_argument("--port", default=8765, type=int)
+    restart_service = service_commands.add_parser("restart-web")
+    restart_service.add_argument("--config", type=Path)
+    restart_service.add_argument("--port", default=8765, type=int)
+    logs_service = service_commands.add_parser("logs")
+    logs_service.add_argument("--config", required=True, type=Path)
     service_commands.add_parser("uninstall-web")
+
+    abstracts = groups.add_parser("abstracts", help="enrich, export, and import traceable abstracts")
+    abstract_commands = abstracts.add_subparsers(dest="command", required=True)
+    enrich = abstract_commands.add_parser("enrich")
+    enrich.add_argument("--config", required=True, type=Path)
+    enrich.add_argument("--limit", type=int, default=500)
+    enrich.add_argument("--retry", action="store_true")
+    export_missing = abstract_commands.add_parser("export-missing")
+    export_missing.add_argument("--config", required=True, type=Path)
+    export_missing.add_argument("--output", required=True, type=Path)
+    import_abstracts = abstract_commands.add_parser("import")
+    import_abstracts.add_argument("--config", required=True, type=Path)
+    import_abstracts.add_argument("--file", required=True, type=Path)
+    import_abstracts.add_argument("--apply", action="store_true")
+
+    cleanup = groups.add_parser("cleanup", help="preview or apply recoverable library governance")
+    cleanup_commands = cleanup.add_subparsers(dest="command", required=True)
+    cleanup_preview = cleanup_commands.add_parser("preview")
+    cleanup_preview.add_argument("--config", required=True, type=Path)
+    cleanup_apply = cleanup_commands.add_parser("apply")
+    cleanup_apply.add_argument("--config", required=True, type=Path)
+    cleanup_apply.add_argument("--report", required=True, type=Path)
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        if args.group == "service":
-            if args.command=="install-web": result=install_web_service(args.config)
-            elif args.command=="uninstall-web": result=uninstall_web_service()
-            else: result=web_service_status()
+        if args.group == "init":
+            result=init_installation(args.state,args.config)
             print(json.dumps(result,ensure_ascii=False,indent=2))
-            return 0 if result.get("healthy",True) or args.command!="status" else 1
+            return 0 if result.get("ok") else 1
+        if args.group == "setup":
+            result=setup_installation(args.state,args.config,source_state=args.from_state,
+                                      install_service=not args.no_service,port=args.port)
+            print(json.dumps(result,ensure_ascii=False,indent=2))
+            return 0 if result.get("ok") else 1
+        if args.group == "service":
+            if args.command == "install-web":
+                result = install_web_service(args.config, port=args.port)
+            elif args.command == "restart-web":
+                result = restart_web_service(args.config, args.port)
+            elif args.command == "uninstall-web":
+                result = uninstall_web_service()
+            else:
+                result = web_service_status(args.config, getattr(args, "port", 8765))
+                if args.command == "logs":
+                    result = {
+                        "stdout_log": result["stdout_log"],
+                        "stderr_log": result["stderr_log"],
+                        "tip": "先查看 stderr 日志；日志只保存在本机私有 state 目录。",
+                    }
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         if args.group == "verify":
             result=verify_installation(args.config)
             print(json.dumps(result,ensure_ascii=False,indent=2))
             return 0 if result["ok"] else 1
+        if args.group in {"abstracts","cleanup"}:
+            cfg=load_config(args.config); state_dir=resolve_state(args.config,cfg); db_path=state_dir/"papers.sqlite3"
+            if args.group=="abstracts":
+                if args.command=="enrich": result=enrich_abstracts(db_path,cfg,limit=args.limit,retry=args.retry)
+                elif args.command=="export-missing": result=export_missing_task_package(db_path,args.output)
+                else:
+                    preview=preview_manual_import(db_path,args.file)
+                    result=apply_manual_import(db_path,preview) if args.apply else preview
+            elif args.command=="preview":
+                result=preview_cleanup(db_path,state_dir,float(cfg.get("relevance_threshold",0.62)))
+            else:
+                result=apply_cleanup_preview(db_path,state_dir,args.report)
+            print(json.dumps(result,ensure_ascii=False,indent=2))
+            return 0
         if args.group == "web":
             if args.host not in ("127.0.0.1", "localhost", "::1") and not args.allow_remote:
                 raise ValueError("Remote binding requires --allow-remote and an access-control review")
@@ -127,7 +214,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             result = database_status(args.db)
         elif args.command == "upgrade":
+            before = database_status(args.db)
+            backup = None
+            if before.get("exists") and not before.get("schema_current", False):
+                backup = _default_backup(args.db)
+                backup_database(args.db, backup)
             result = upgrade_database(args.db)
+            result["pre_upgrade_backup"] = str(backup) if backup else None
         elif args.command == "backup":
             result = backup_database(args.db, args.output or _default_backup(args.db))
         else:
@@ -135,7 +228,15 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
+        if isinstance(exc, sqlite3.DatabaseError):
+            message = "本地数据库无法读取；数据文件未被删除。请先做文件备份，再运行 db status 或从已验证备份恢复。"
+        elif isinstance(exc, FileNotFoundError):
+            message = f"找不到所需文件：{exc}。请检查 config/state 路径或重新运行 init。"
+        elif isinstance(exc, RuntimeError) and "migration" in str(exc).lower():
+            message = f"数据库结构版本不兼容：{exc}。请保留数据库并使用匹配版本升级，不要直接删除。"
+        else:
+            message = str(exc)
+        print(json.dumps({"ok": False, "error": message}, ensure_ascii=False))
         return 2
 
 

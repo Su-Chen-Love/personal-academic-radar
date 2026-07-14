@@ -23,7 +23,9 @@ class EngagementTests(unittest.TestCase):
         db = connect(db_path)
         with db:
             db.execute(
-                """INSERT INTO papers VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO papers(
+                identity,doi,title,abstract,venue,published,url,authors_json,first_seen,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (identity, "10.1/example", "Example paper", "Abstract", "Venue", "2026-01-01",
                  "https://doi.org/10.1/example", "[]", "now", "now"),
             )

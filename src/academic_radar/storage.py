@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -65,6 +66,48 @@ def _ensure_migration_table(db: sqlite3.Connection) -> None:
     db.commit()
 
 
+def latest_schema_version() -> int:
+    """Return the newest schema version shipped with this installation."""
+
+    return load_migrations()[-1].version
+
+
+def _legacy_safe_sql(db: sqlite3.Connection, sql: str) -> str:
+    """Make ADD COLUMN migrations safe for partially upgraded legacy databases.
+
+    Releases before the migration ledger existed sometimes created newer
+    columns directly from the runner.  Such databases need the migration to be
+    recorded without attempting to add an already-present column again.
+    """
+
+    output: list[str] = []
+    statement = ""
+    for line in sql.splitlines(keepends=True):
+        statement += line
+        if not sqlite3.complete_statement(statement):
+            continue
+        match = re.match(
+            r"\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+"
+            r"ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            statement,
+            re.IGNORECASE,
+        )
+        if match:
+            table, column = match.groups()
+            existing = {
+                str(row[1]).lower()
+                for row in db.execute(f'PRAGMA table_info("{table}")').fetchall()
+            }
+            if column.lower() in existing:
+                statement = ""
+                continue
+        output.append(statement)
+        statement = ""
+    if statement.strip():
+        output.append(statement)
+    return "".join(output)
+
+
 def upgrade_database(path: Path) -> dict[str, object]:
     migrations = load_migrations()
     db = connect(path)
@@ -93,9 +136,10 @@ def upgrade_database(path: Path) -> dict[str, object]:
                 migration.checksum.replace("'", "''"),
                 utc_now().replace("'", "''"),
             )
+            compatible_sql = _legacy_safe_sql(db, migration.sql)
             script = (
                 "BEGIN IMMEDIATE;\n"
-                + migration.sql
+                + compatible_sql
                 + "\nINSERT INTO schema_migrations(version,name,checksum,applied_at) "
                 + f"VALUES({values[0]},'{values[1]}','{values[2]}','{values[3]}');\nCOMMIT;"
             )
@@ -137,17 +181,29 @@ def database_status(path: Path) -> dict[str, object]:
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         )]
         version = 0
+        applied_versions: list[int] = []
         if "schema_migrations" in tables:
-            version = int(db.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0])
+            applied_versions = [int(row[0]) for row in db.execute("SELECT version FROM schema_migrations ORDER BY version")]
+            version = max(applied_versions, default=0)
         counts = {}
-        for table in ("papers", "screenings", "paper_feedback", "profile_versions", "pipeline_runs"):
+        for table in (
+            "papers",
+            "screenings",
+            "paper_feedback",
+            "profile_versions",
+            "pipeline_runs",
+            "fulltext_files",
+        ):
             if table in tables:
                 counts[table] = int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
         integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
+        latest = latest_schema_version()
         return {
             "database": str(path),
             "exists": True,
             "schema_version": version,
+            "latest_schema_version": latest,
+            "schema_current": applied_versions == list(range(1, latest + 1)),
             "integrity": integrity,
             "counts": counts,
         }
@@ -252,11 +308,46 @@ def migrate_state(source: Path, destination: Path, merge: bool = False) -> dict[
             copied.append(str(relative))
     source_db = source / "papers.sqlite3"
     destination_db = destination / "papers.sqlite3"
+    database_copied = False
     if source_db.exists() and not destination_db.exists():
         backup_database(source_db, destination_db)
+        database_copied = True
     elif source_db.exists() and destination_db.exists():
         skipped.append("papers.sqlite3")
     upgrade = upgrade_database(destination_db)
+    config_rebased = False
+    destination_config = destination / "config.toml"
+    if destination_config.exists():
+        config_text = destination_config.read_text(encoding="utf-8")
+        rebased_text, replacements = re.subn(
+            r'^state_dir\s*=.*$', 'state_dir = "."', config_text, count=1, flags=re.MULTILINE
+        )
+        if replacements and rebased_text != config_text:
+            destination_config.write_text(rebased_text, encoding="utf-8")
+            config_rebased = True
+
+    fulltext_paths_rebased = 0
+    destination_db_connection = connect(destination_db)
+    try:
+        fulltext_rows = destination_db_connection.execute(
+            "SELECT id,stored_path FROM fulltext_files"
+        ).fetchall() if database_copied else []
+        with destination_db_connection:
+            for item in fulltext_rows:
+                stored = Path(item["stored_path"]).expanduser()
+                try:
+                    relative = stored.resolve().relative_to(source)
+                except ValueError:
+                    continue
+                target = destination / relative
+                if target.exists():
+                    destination_db_connection.execute(
+                        "UPDATE fulltext_files SET stored_path=? WHERE id=?",
+                        (str(target.resolve()), item["id"]),
+                    )
+                    fulltext_paths_rebased += 1
+    finally:
+        destination_db_connection.close()
     profile_seeded = False
     profile_path = destination / "research-profile.md"
     if profile_path.exists():
@@ -283,6 +374,8 @@ def migrate_state(source: Path, destination: Path, merge: bool = False) -> dict[
         "skipped": skipped,
         "database": upgrade,
         "profile_seeded": profile_seeded,
+        "config_rebased": config_rebased,
+        "fulltext_paths_rebased": fulltext_paths_rebased,
     }
     (destination / "migration-manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
