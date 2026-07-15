@@ -228,11 +228,12 @@ def dismiss_profile_suggestion(db_path: Path, version_id: int) -> dict[str, Any]
             raise ValueError("只能忽略尚未处理的反馈画像建议")
         now = utc_now()
         with db:
-            db.execute("UPDATE profile_versions SET status='superseded' WHERE id=?", (version_id,))
             db.execute(
-                "UPDATE profile_review_runs SET status='dismissed',updated_at=? WHERE profile_version_id=?",
+                """UPDATE profile_review_runs SET status='dismissed',profile_version_id=NULL,updated_at=?
+                WHERE profile_version_id=?""",
                 (now, version_id),
             )
+            db.execute("DELETE FROM profile_versions WHERE id=?", (version_id,))
         return {"status": "dismissed", "version_id": version_id}
     finally:
         db.close()

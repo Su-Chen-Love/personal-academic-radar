@@ -328,6 +328,39 @@ class WebTests(unittest.TestCase):
             self.assertNotIn("feedback-drawer", response.text)
             self.assertIn("AI",response.text)
 
+    def test_today_places_completed_feedback_after_unfinished_papers(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            db = connect(db_path)
+            with db:
+                active = db.execute("SELECT profile_hash,id FROM profile_versions WHERE status='active'").fetchone()
+                for identity, title in (("doi:10.1/second", "Second paper"), ("doi:10.1/third", "Third paper")):
+                    db.execute("""INSERT INTO papers(identity,doi,title,abstract,venue,published,url,authors_json,first_seen,updated_at,
+                      publication_type,eligibility_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      (identity, identity[4:], title, "Abstract", "Test Venue", "2026-07-13", "", "[]", "now", "now",
+                       "Journal Article", "eligible"))
+                    db.execute("""INSERT INTO screenings(identity,profile_hash,provider,model,relevant,score,reasons,themes_json,confidence,
+                      screened_at,profile_version_id,feedback_snapshot_json,run_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      (identity, active[0], "codex-agent", "test", 1, .8, "Direct match", "[]", .9,
+                       "2026-07-13T08:00:00+00:00", active[1], "[]", "run"))
+                db.execute("INSERT INTO pipeline_runs(run_id,kind,status,started_at,finished_at) VALUES('run','agent-export','succeeded','now','now')")
+                db.execute("""INSERT INTO agent_jobs(run_id,profile_hash,status,exported_count,imported_count,created_at,imported_at,profile_version_id)
+                  VALUES('run',?,'imported',3,3,'now','now',?)""", (active[0], active[1]))
+                db.executemany("INSERT INTO run_papers VALUES('run',?,'selected_new')",
+                               [("doi:10.1/test",), ("doi:10.1/second",), ("doi:10.1/third",)])
+            db.close()
+            with TestClient(app) as client:
+                for identity, interest, reason in (("doi:10.1/second", "interested", "Useful"),
+                                                   ("doi:10.1/third", "not_interested", "Out of scope")):
+                    client.post("/feedback", data={"csrf_token": app.state.csrf_token, "identity": identity,
+                                                     "interest": interest, "reason": reason, "reading_status": "unread"})
+                page = client.get("/").text
+            unfinished = page.index('data-interest=""')
+            interested = page.index('data-interest="interested"')
+            not_interested = page.index('data-interest="not_interested"')
+            self.assertLess(unfinished, interested)
+            self.assertLess(interested, not_interested)
+
     def test_feedback_api_returns_completion_status(self):
         with tempfile.TemporaryDirectory() as td:
             app, db_path, _ = self.make_app(Path(td))
@@ -386,6 +419,7 @@ class WebTests(unittest.TestCase):
             self.assertIn("preventDefault",script.text)
             self.assertIn("aria-activedescendant",script.text)
             self.assertIn("aria-selected",script.text)
+            self.assertIn("比如：Management Science 或 International Journal of Human-Computer Interaction", page.text)
 
     def test_duplicate_source_is_marked_and_cannot_preview(self):
         with tempfile.TemporaryDirectory() as td:

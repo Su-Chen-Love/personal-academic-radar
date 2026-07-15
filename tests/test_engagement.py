@@ -93,7 +93,8 @@ class EngagementTests(unittest.TestCase):
             dismiss_profile_suggestion(db_path, suggestion["version"]["id"])
             self.assertIsNone(pending_profile_review(db_path)["pending_suggestion"])
             db = connect(db_path)
-            self.assertEqual(db.execute("SELECT status FROM profile_versions WHERE id=?", (suggestion["version"]["id"],)).fetchone()[0], "superseded")
+            self.assertIsNone(db.execute("SELECT id FROM profile_versions WHERE id=?", (suggestion["version"]["id"],)).fetchone())
+            self.assertIsNone(db.execute("SELECT profile_version_id FROM profile_review_runs").fetchone()[0])
             db.close()
 
     def test_feedback_review_can_record_no_change(self):
