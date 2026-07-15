@@ -254,8 +254,8 @@ def source_coverage(db_path: Path, configured_sources: list[dict[str, Any]]) -> 
             rows = db.execute(
                 """SELECT DISTINCT p.identity,p.published,p.abstract,p.first_seen FROM observations o
                 JOIN papers p ON p.identity=o.identity
-                WHERE o.source=? OR o.source=?""",
-                (name, name + " / OpenAlex"),
+                WHERE o.source=? OR o.source LIKE ? ESCAPE '\\'""",
+                (name, name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + " / %"),
             ).fetchall()
             count = len(rows)
             abstracts = sum(1 for item in rows if item["abstract"])
@@ -361,25 +361,6 @@ def import_fulltext(db_path: Path, state_dir: Path, identity: str, original_name
         return dict(row) | {"deduplicated": False}
     finally:
         db.close()
-
-
-def profile_assistant_prompt() -> str:
-    return """请根据我提供的论文全文、摘要、关键词、研究问题、贡献、方法、实验设置、结果、局限和未来工作，生成 Personal Academic Radar 可用的研究画像草稿。
-
-输出必须包含以下 Markdown 小节：
-
-1. Core problem：用一段话描述我真正关心的研究问题。
-2. High-priority themes：列出 4-8 个高优先级主题，主题要包含对象、方法和应用语境。
-3. Methodological interests：总结可迁移的方法、实验范式、测量指标或系统设计模式。
-4. Relevance boundaries：列出应排除或降低优先级的近邻主题。
-5. Feedback history：如果我给了正负例，请总结 false positive / false negative 边界。
-
-要求：
-- 不要堆关键词。
-- 区分“我自己的研究兴趣”和论文 related work 中只是被讨论的方向。
-- 保留负向边界和不感兴趣的内容。
-- 不要把 venue 或作者声望当作相关性证据。
-- 输出是一份可直接粘贴到系统研究画像页面的草稿。"""
 
 
 def source_candidates(query: str, user_agent: str = "PersonalAcademicRadar/0.8") -> list[dict[str, Any]]:

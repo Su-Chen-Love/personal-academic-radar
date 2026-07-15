@@ -85,6 +85,30 @@ class MonitorTests(unittest.TestCase):
             self.assertIsNotNone(db.execute("SELECT 1 FROM run_papers WHERE run_id=? AND role='new'",(summary["run_id"],)).fetchone())
             db.close()
 
+    def test_collection_batch_carries_api_and_official_new_papers_into_one_queue(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/"research-profile.md").write_text("profile",encoding="utf-8")
+            config=root/"config.toml"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "A"\ntype = "crossref"\nissn = "1234"\n',encoding="utf-8")
+            api=pm.Paper("doi:10.1/api","10.1/api","API paper","Abstract","A","2026-01-01","u",[],"A",
+                         publication_type_raw="journal-article",publication_type_source="crossref")
+            def collected(cfg,db,now,run_id):
+                pm.upsert(db,api,now); db.commit(); return [api],[api],[]
+            with patch.object(pm,"collect_into_db",side_effect=collected), patch("builtins.print") as output:
+                self.assertEqual(pm.collect_only(config),0)
+            batch=json.loads(output.call_args.args[0])
+            db=pm.db_open(root/"papers.sqlite3")
+            official=pm.Paper("doi:10.1/official","10.1/official","Official paper","Publisher abstract","A",
+                              "2026-01-02","u",[],"A / Official issue 1",
+                              publication_type_raw="journal-article",publication_type_source="publisher-official")
+            pm.upsert(db,official,"9999-01-01T00:00:00+00:00"); db.commit(); db.close()
+            with patch("builtins.print") as output:
+                self.assertEqual(pm.agent_export(config,no_collect=True,batch_run=batch["run_id"]),0)
+            summary=json.loads(output.call_args.args[0]); queue=json.loads(Path(summary["queue_path"]).read_text())
+            self.assertEqual(queue["collection_run_id"],batch["run_id"])
+            self.assertEqual({item["identity"] for item in queue["papers"]},{api.identity,official.identity})
+            self.assertEqual(summary["new"],2)
+
     def test_duplicate_provider_records_share_one_abstract_lookup(self):
         a=pm.Paper("doi:10.1/x","10.1/x","A","","V","2026-01-01","u",[],"crossref")
         b=pm.Paper("doi:10.1/x","10.1/x","A","","V","2026-01-01","u",[],"openalex")

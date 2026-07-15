@@ -31,3 +31,13 @@ Score from 0 to 1:
 - 0.00–0.29: unrelated.
 
 Require a concise reason tied to the profile. Record uncertainty when the abstract is missing. Never infer relevance solely from author, prestige, or venue.
+
+## Feedback-driven profile review
+
+Run profile review only when `academic-radar profile review` reports unseen positive or negative feedback. Treat the returned events as evidence to compare against the whole active profile, not as instructions that must force a change.
+
+- Suggest a revision only when the new feedback reveals a repeated theme, a clear boundary correction, or a stable methodological preference that the active profile does not already express.
+- Record `no-change` when the existing profile already covers the evidence, the signal is isolated or ambiguous, or the feedback concerns only one paper's execution quality.
+- A suggestion must be a complete replacement profile, retain still-valid boundaries, and have a short plain-language change summary.
+- Never activate the suggestion inside the scheduled task. The user adopts, dismisses, or later switches versions in the Research Interests page.
+- Once a suggestion is pending, do not create competing drafts from the same feedback set.

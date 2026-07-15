@@ -13,10 +13,9 @@ if PROJECT_SRC.exists() and str(PROJECT_SRC) not in sys.path: sys.path.insert(0,
 from academic_radar.enrichment import enrich_abstracts as run_enrichment
 from academic_radar.governance import publication_decision
 from academic_radar.product import abstract_source_for, classify_low_priority
-from academic_radar.storage import upgrade_database
+from academic_radar.storage import latest_schema_version, upgrade_database
 
 VERSION = "0.8.0"
-SCHEMA_VERSION = 6
 
 try:
     import tomllib
@@ -189,7 +188,7 @@ def db_open(path: Path) -> sqlite3.Connection:
     CREATE INDEX IF NOT EXISTS idx_papers_seen ON papers(first_seen);
     CREATE INDEX IF NOT EXISTS idx_fulltext_identity ON fulltext_files(identity, imported_at DESC);
     """)
-    db.execute("INSERT OR REPLACE INTO meta VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
+    db.execute("INSERT OR REPLACE INTO meta VALUES('schema_version',?)", (str(latest_schema_version()),))
     db.commit(); return db
 
 def crossref_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> list[Paper]:
@@ -469,7 +468,43 @@ def collect_into_db(cfg: dict[str,Any], db: sqlite3.Connection, now: str, run_id
     unique_new=list({paper.identity:paper for paper in new}.values())
     return unique_collected,unique_new,failures
 
-def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False) -> int:
+def collect_only(config_path: Path) -> int:
+    """Collect the 14-day API window before official issue checks and queue freezing."""
+
+    cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
+    now=dt.datetime.now(dt.timezone.utc).isoformat(); run_id="collect-"+now.replace(":","-")
+    db=db_open(state/"papers.sqlite3")
+    collected,new,failures=collect_into_db(cfg,db,now,run_id)
+    required={s["name"] for s in cfg["sources"] if s.get("required",True)}
+    failed_required={x["source"] for x in failures if x.get("status")=="failed" and x["source"] in required}
+    status="partial" if failures else "succeeded"
+    if required and failed_required==required: status="failed"
+    summary={
+        "run_id":run_id,
+        "started_at":now,
+        "collected":len(collected),
+        "new":len(new),
+        "new_identities":[paper.identity for paper in new],
+        "source_failures":failures,
+        "next_step":"Run official two-issue imports, then agent-export --no-collect --batch-run " + run_id,
+    }
+    with db:
+        db.execute("""INSERT OR REPLACE INTO pipeline_runs(
+          run_id,kind,status,started_at,finished_at,collected_count,candidate_count,relevant_count,error_summary,details_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (run_id,"collection",status,now,dt.datetime.now(dt.timezone.utc).isoformat(),len(collected),0,0,
+         "; ".join(x["error"] for x in failures) or None,json.dumps(summary,ensure_ascii=False)))
+        for paper in collected:
+            db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'collected')",(run_id,paper.identity))
+        for paper in new:
+            db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'new')",(run_id,paper.identity))
+    db.close()
+    print(json.dumps(summary,ensure_ascii=False,indent=2))
+    return 1 if required and failed_required==required else 0
+
+
+def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False,
+                 batch_run: str | None=None) -> int:
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
     profile_path=state/cfg["profile_file"]
     now=dt.datetime.now(dt.timezone.utc).isoformat(); run_id=now.replace(":","-"); db=db_open(state/"papers.sqlite3")
@@ -482,7 +517,19 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
             db.execute(f"UPDATE pipeline_runs SET status='abandoned',finished_at=? WHERE run_id IN ({marks})",
                        (now,*stale))
     enrichment: dict[str,Any] | None = None
-    if no_collect: collected,new,failures=[],[],[]
+    if batch_run and not no_collect:
+        raise ValueError("--batch-run requires --no-collect")
+    if no_collect:
+        collected,new,failures=[],[],[]
+        if batch_run:
+            batch=db.execute("SELECT * FROM pipeline_runs WHERE run_id=? AND kind='collection'",(batch_run,)).fetchone()
+            if not batch:
+                raise ValueError(f"Unknown collection batch: {batch_run}")
+            details=json.loads(batch["details_json"] or "{}")
+            failures=list(details.get("source_failures") or [])
+            fresh=db.execute("SELECT * FROM papers WHERE first_seen>=? ORDER BY first_seen",(batch["started_at"],)).fetchall()
+            collected=[row_to_paper(row) for row in fresh]
+            new=list(collected)
     else:
         collected,new,failures=collect_into_db(cfg,db,now,run_id)
         # Complete traceable metadata before freezing the one authoritative
@@ -501,11 +548,12 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
     examples=feedback_snapshot(db,int(cfg.get("feedback_examples_per_class",20)))
     payload={"schema_version":2,"run_id":run_id,"profile_hash":phash,"profile_version_id":active["id"],
              "profile_confirmed_at":active["confirmed_at"],"profile_path":str(profile_path),
-             "feedback_examples":examples,"threshold":float(cfg.get("relevance_threshold",0.62)),
-             "papers":papers,"source_failures":failures}
+             "feedback_examples":examples,"threshold":float(cfg.get("relevance_threshold",0.70)),
+             "papers":papers,"source_failures":failures,"collection_run_id":batch_run}
     queue_path.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
     summary={"run_id":run_id,"collected":len(collected),"new":len(new),"candidates":len(papers),
-             "queue_path":str(queue_path),"profile_path":str(profile_path),"source_failures":failures}
+             "queue_path":str(queue_path),"profile_path":str(profile_path),"source_failures":failures,
+             "collection_run_id":batch_run}
     if enrichment is not None: summary["enrichment"]=enrichment
     run_status="partial" if failures else "succeeded"
     if failures and all(x.get("status")=="failed" for x in failures): run_status="failed"
@@ -559,7 +607,7 @@ def agent_import(config_path: Path, results_path: Path) -> int:
     if received != expected:
         missing=sorted(expected-received); extra=sorted(received-expected)
         raise ValueError(f"Results must cover the complete queue (missing={len(missing)}, extra={len(extra)})")
-    threshold=float(cfg.get("relevance_threshold",0.62))
+    threshold=float(cfg.get("relevance_threshold",0.70))
     validated=[]
     for item in results:
         identity_value=item.get("identity",""); row=db.execute("SELECT * FROM papers WHERE identity=?",(identity_value,)).fetchone()
@@ -608,11 +656,12 @@ def enrich_abstracts(config_path: Path, limit: int=100) -> int:
 def main() -> int:
     parser=argparse.ArgumentParser(description=__doc__); parser.add_argument("--version",action="version",version=VERSION)
     sub=parser.add_subparsers(dest="command",required=True)
-    for name in ("doctor","agent-export","agent-import","enrich-abstracts"):
+    for name in ("doctor","collect-only","agent-export","agent-import","enrich-abstracts"):
         p=sub.add_parser(name); p.add_argument("--config",required=True,type=Path)
         if name=="agent-export":
             p.add_argument("--rescreen",action="store_true",help="export all stored papers, including previously judged papers")
             p.add_argument("--no-collect",action="store_true",help="export from the database without network collection")
+            p.add_argument("--batch-run",help="collection run to carry into this frozen queue")
         elif name=="agent-import":
             p.add_argument("--results",required=True,type=Path)
         elif name=="enrich-abstracts":
@@ -620,7 +669,8 @@ def main() -> int:
     a=parser.parse_args()
     try:
         if a.command=="doctor": return doctor(a.config)
-        if a.command=="agent-export": return agent_export(a.config,a.rescreen,a.no_collect)
+        if a.command=="collect-only": return collect_only(a.config)
+        if a.command=="agent-export": return agent_export(a.config,a.rescreen,a.no_collect,a.batch_run)
         if a.command=="agent-import": return agent_import(a.config,a.results)
         if a.command=="enrich-abstracts": return enrich_abstracts(a.config,a.limit)
         raise ValueError("Unsupported command")

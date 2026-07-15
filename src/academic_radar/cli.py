@@ -10,7 +10,16 @@ from pathlib import Path
 
 from .storage import backup_database, database_status, migrate_state, restore_database, upgrade_database
 from .engagement import (
-    confirm_profile, create_profile_draft, feedback_examples, list_feedback, list_profiles, set_feedback
+    confirm_profile,
+    create_feedback_profile_suggestion,
+    create_profile_draft,
+    dismiss_profile_suggestion,
+    feedback_examples,
+    list_feedback,
+    list_profiles,
+    pending_profile_review,
+    record_profile_review_no_change,
+    set_feedback,
 )
 from .operations import (
     init_installation,
@@ -23,6 +32,14 @@ from .operations import (
 )
 from .enrichment import apply_manual_import, enrich_abstracts, export_missing_task_package, preview_manual_import
 from .governance import apply_cleanup_preview, preview_cleanup
+from .official import (
+    apply_official_import,
+    collect_supported_official,
+    official_status,
+    preview_official_import,
+    record_official_failure,
+    write_official_plan,
+)
 from .product import load_config, resolve_state
 
 
@@ -91,6 +108,19 @@ def parser() -> argparse.ArgumentParser:
     confirm.add_argument("--db", required=True, type=Path)
     confirm.add_argument("--id", required=True, type=int)
     confirm.add_argument("--profile-file", required=True, type=Path)
+    review = profile_commands.add_parser("review", help="show feedback changes awaiting profile review")
+    review.add_argument("--db", required=True, type=Path)
+    suggest = profile_commands.add_parser("suggest", help="save an AI-generated profile recommendation")
+    suggest.add_argument("--db", required=True, type=Path)
+    suggest.add_argument("--file", required=True, type=Path,
+                         help="JSON with fingerprint, content, and change_summary")
+    no_change = profile_commands.add_parser("no-change", help="record that new feedback needs no profile edit")
+    no_change.add_argument("--db", required=True, type=Path)
+    no_change.add_argument("--fingerprint", required=True)
+    no_change.add_argument("--reason", required=True)
+    dismiss = profile_commands.add_parser("dismiss", help="dismiss a pending feedback profile recommendation")
+    dismiss.add_argument("--db", required=True, type=Path)
+    dismiss.add_argument("--id", required=True, type=int)
 
     web = groups.add_parser("web", help="run the local web application")
     web.add_argument("--config", required=True, type=Path)
@@ -129,6 +159,28 @@ def parser() -> argparse.ArgumentParser:
     import_abstracts.add_argument("--config", required=True, type=Path)
     import_abstracts.add_argument("--file", required=True, type=Path)
     import_abstracts.add_argument("--apply", action="store_true")
+
+    official = groups.add_parser("official", help="plan and import verified publisher issue checks")
+    official_commands = official.add_subparsers(dest="command", required=True)
+    official_plan = official_commands.add_parser("plan")
+    official_plan.add_argument("--config", required=True, type=Path)
+    official_plan.add_argument("--output", required=True, type=Path)
+    official_status_command = official_commands.add_parser("status")
+    official_status_command.add_argument("--config", required=True, type=Path)
+    official_collect = official_commands.add_parser("collect-supported")
+    official_collect.add_argument("--config", required=True, type=Path)
+    official_collect.add_argument("--output", required=True, type=Path)
+    official_collect.add_argument("--source", default="")
+    official_import = official_commands.add_parser("import")
+    official_import.add_argument("--config", required=True, type=Path)
+    official_import.add_argument("--file", required=True, type=Path)
+    official_import.add_argument("--apply", action="store_true")
+    official_fail = official_commands.add_parser("fail")
+    official_fail.add_argument("--config", required=True, type=Path)
+    official_fail.add_argument("--source", required=True)
+    official_fail.add_argument("--issue-key", required=True)
+    official_fail.add_argument("--issue-url", required=True)
+    official_fail.add_argument("--detail", required=True)
 
     cleanup = groups.add_parser("cleanup", help="preview or apply recoverable library governance")
     cleanup_commands = cleanup.add_subparsers(dest="command", required=True)
@@ -173,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
             result=verify_installation(args.config)
             print(json.dumps(result,ensure_ascii=False,indent=2))
             return 0 if result["ok"] else 1
-        if args.group in {"abstracts","cleanup"}:
+        if args.group in {"abstracts","cleanup","official"}:
             cfg=load_config(args.config); state_dir=resolve_state(args.config,cfg); db_path=state_dir/"papers.sqlite3"
             if args.group=="abstracts":
                 if args.command=="enrich": result=enrich_abstracts(db_path,cfg,limit=args.limit,retry=args.retry)
@@ -181,8 +233,20 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     preview=preview_manual_import(db_path,args.file)
                     result=apply_manual_import(db_path,preview) if args.apply else preview
+            elif args.group=="official":
+                if args.command=="plan": result=write_official_plan(db_path,cfg,args.output)
+                elif args.command=="status": result=official_status(db_path,cfg)
+                elif args.command=="collect-supported":
+                    result=collect_supported_official(db_path,cfg,args.output,args.source)
+                elif args.command=="fail":
+                    result=record_official_failure(
+                        db_path,cfg,args.source,args.issue_key,args.issue_url,args.detail
+                    )
+                else:
+                    preview=preview_official_import(db_path,cfg,args.file)
+                    result=apply_official_import(db_path,preview) if args.apply else preview
             elif args.command=="preview":
-                result=preview_cleanup(db_path,state_dir,float(cfg.get("relevance_threshold",0.62)))
+                result=preview_cleanup(db_path,state_dir,float(cfg.get("relevance_threshold",0.70)))
             else:
                 result=apply_cleanup_preview(db_path,state_dir,args.report)
             print(json.dumps(result,ensure_ascii=False,indent=2))
@@ -209,6 +273,18 @@ def main(argv: list[str] | None = None) -> int:
                 result = create_profile_draft(args.db,args.file.read_text(encoding="utf-8"),args.summary)
             elif args.command == "confirm":
                 result = confirm_profile(args.db,args.id,args.profile_file)
+            elif args.command == "review":
+                result = pending_profile_review(args.db)
+            elif args.command == "suggest":
+                payload = json.loads(args.file.read_text(encoding="utf-8"))
+                result = create_feedback_profile_suggestion(
+                    args.db, str(payload.get("fingerprint", "")), str(payload.get("content", "")),
+                    str(payload.get("change_summary", "")),
+                )
+            elif args.command == "no-change":
+                result = record_profile_review_no_change(args.db,args.fingerprint,args.reason)
+            elif args.command == "dismiss":
+                result = dismiss_profile_suggestion(args.db,args.id)
             else:
                 result = list_profiles(args.db)
         elif args.command == "status":

@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% from "_paper_card.html" import paper_card with context %}
-{% block title %}今日雷达 · 个人学术雷达{% endblock %}
+{% block title %}今日推荐 · 个人学术助手{% endblock %}
 {% block content %}
 <header class="page-head hero-head">
   <div><p class="kicker">DAILY SIGNAL · 今日信号</p><h1>今天值得你看的研究</h1><p>基于已确认画像与真实反馈，由 Codex 完成语义判断。</p></div>
@@ -14,8 +14,8 @@
   <div><strong>{{ totals.excluded or 0 }}</strong><span>已排除非论文</span></div>
 </section>
 <section class="section-head"><div><p class="kicker">CURATED TODAY</p><h2>今日推荐</h2></div><a href="/library">查看完整文献库 →</a></section>
-<div class="paper-list">
+<div class="paper-list" data-today-list>
   {% for paper in papers %}{{ paper_card(paper, '/') }}
-  {% else %}<div class="empty"><strong>今天还没有新的入选论文</strong><p>这不一定是异常。可以到“运行状态”确认采集是否正常，或浏览历史文献库。</p><a class="button" href="/status">检查运行状态</a></div>{% endfor %}
+  {% else %}<div class="empty"><strong>今天还没有新的入选论文</strong><p>这不一定是异常。可以到“更新与检查”确认当前情况，或浏览历史文献库。</p><a class="button" href="/status">查看更新与检查</a></div>{% endfor %}
 </div>
 {% endblock %}

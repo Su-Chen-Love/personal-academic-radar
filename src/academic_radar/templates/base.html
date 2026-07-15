@@ -5,23 +5,23 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light">
   <meta name="csrf-token" content="{{ csrf_token }}">
-  <title>{% block title %}个人学术雷达{% endblock %}</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=0.8.0">
-  <script src="{{ url_for('static', path='/app.js') }}?v=0.8.0" defer></script>
+  <title>{% block title %}个人学术助手{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=0.8.2">
+  <script src="{{ url_for('static', path='/app.js') }}?v=0.8.2" defer></script>
 </head>
 <body>
   <aside class="sidebar">
     <a class="brand" href="/">
-      <span class="brand-mark">R</span>
-      <span><strong>个人学术雷达</strong><small>Personal Academic Radar</small></span>
+      <span class="brand-mark">A</span>
+      <span><strong>个人学术助手</strong><small>Personal Academic Assistant</small></span>
     </a>
     <nav aria-label="主导航">
-      <a class="{{ 'active' if page == 'today' }}" href="/"><span>01</span>今日雷达</a>
-      <a class="{{ 'active' if page == 'library' }}" href="/library"><span>02</span>文献库</a>
-      <a class="{{ 'active' if page == 'sources' }}" href="/sources"><span>03</span>来源配置</a>
-      <a class="{{ 'active' if page == 'profile' }}" href="/profile"><span>04</span>研究画像</a>
-      <a class="{{ 'active' if page == 'feedback' }}" href="/feedback"><span>05</span>反馈管理</a>
-      <a class="{{ 'active' if page == 'status' }}" href="/status"><span>06</span>运行状态</a>
+      <a class="{{ 'active' if page == 'today' }}" href="/"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 1.7 6.3L20 10l-6.3 1.7L12 18l-1.7-6.3L4 10l6.3-1.7L12 2Z"/></svg><span class="nav-label">今日推荐</span></a>
+      <a class="{{ 'active' if page == 'library' }}" href="/library"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4.8A2.8 2.8 0 0 1 6.8 2H20v17.5H6.8A2.8 2.8 0 0 0 4 22V4.8Zm2.8-.8a.8.8 0 0 0 0 1.6H18V4H6.8ZM6.8 18H18V7.6H6.8a2.8 2.8 0 0 0 0 5.6H18"/></svg><span class="nav-label">我的文献</span></a>
+      <a class="{{ 'active' if page == 'sources' }}" href="/sources"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v2H4V6Zm0 5h10v2H4v-2Zm0 5h16v2H4v-2Zm12-6 4 2-4 2v-4Z"/></svg><span class="nav-label">监测来源</span></a>
+      <a class="{{ 'active' if page == 'profile' }}" href="/profile"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9Zm-8 9c0-4.1 3.6-7 8-7s8 2.9 8 7H4Z"/></svg><span class="nav-label">研究兴趣</span></a>
+      <a class="{{ 'active' if page == 'feedback' }}" href="/feedback"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3h16v13H8l-4 4V3Zm4 5h8v2H8V8Zm0 4h5v2H8v-2Z"/></svg><span class="nav-label">偏好反馈</span></a>
+      <a class="{{ 'active' if page == 'status' }}" href="/status"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18.5 8.5A7 7 0 1 0 19 15h-2.2A5 5 0 1 1 16.8 10H13V8h8v8h-2V8.5h-.5Z"/></svg><span class="nav-label">更新与检查</span></a>
     </nav>
     <div class="sidebar-foot">
       <span class="pulse"></span> 本地私有数据

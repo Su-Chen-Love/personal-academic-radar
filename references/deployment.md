@@ -65,15 +65,16 @@ web --config %LOCALAPPDATA%\PersonalAcademicRadar\config.toml
 
 每天 08:00（`Asia/Shanghai`）只保留一个任务，按顺序执行：
 
-1. 采集新论文；
-2. 从可追溯渠道补全摘要；
-3. 排除非研究出版类型，隔离证据不足项；
-4. 导出全部待判断/待重判队列；
-5. 用完整已激活画像和反馈样例判断每一项；
-6. 原子导入严格 JSON；
-7. 运行 verify 并输出新增、入选、排除、摘要和失败摘要。
+1. 用 `collect-only` 对全部已配置来源执行 14 天 API 采集，并保留这次的 `run_id`；
+2. 用 `official plan` 读取每种期刊已验证的出版商卷期目录，只选择截至计划日期已经出版的最近两期；未来卷期不能占用名额；随后运行 `official collect-supported`，自动处理 Springer Nature、Taylor & Francis、IEEE Xplore、ACM Digital Library 与 SAGE。摘要按官网原文、出版商提交的 Crossref、DOI 精确匹配的 OpenAlex 顺序回退并保留 provenance，零错误后原子导入；
+3. 对其余尚未成功核验的卷期逐篇打开官网论文页，复制标题、DOI、作者、日期和明确标注的完整原始摘要；按 DOI 去重，先预览、后 `official import --apply` 原子导入。已成功核验的 `issue_key` 跳过；官网受阻时用 `official fail` 写入卷期、URL 和具体原因，并以 `official status` 检查待重试项。失败时保留 API 结果，不伪造摘要；
+4. 从其他可追溯渠道补全仍缺失的摘要，排除非研究出版类型并隔离证据不足项；
+5. 运行 `profile review`。仅在存在尚未审阅的新反馈时判断画像是否需要调整：需要时保存一份待用户确认的完整画像建议，不需要时记录 `no-change`；不得静默替换已激活画像；
+6. 用 `agent-export --no-collect --batch-run <run_id>` 将本轮 API 和官网新增论文合并为一次冻结队列；
+7. 用完整已激活画像和反馈样例判断每一项，再原子导入严格 JSON；界面只推荐分数大于或等于 0.70 的论文；
+8. 运行 `official status` 与 `verify`，输出 API 采集、官网成功/失败卷期与论文、摘要补全、判断、入选、排除和来源失败。
 
-新导出会将未完成旧队列标为已放弃；导入拒绝部分、重复、画像不匹配或元数据不匹配的结果。自动任务不得上传状态或调用独立模型 API。
+新导出会将未完成旧队列标为已放弃；导入拒绝部分、重复、画像不匹配或元数据不匹配的结果。新增期刊若有已验证官网映射会自动进入最近两期流程；否则先用 14 天 API 过渡，并在任务报告中提醒后续适配。自动任务不得上传状态或调用独立模型 API。
 
 ## 摘要服务约束
 

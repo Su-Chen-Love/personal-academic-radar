@@ -22,10 +22,10 @@ class StorageTests(unittest.TestCase):
             db_path = Path(td) / "papers.sqlite3"
             first = upgrade_database(db_path)
             second = upgrade_database(db_path)
-            self.assertEqual(first["applied"], [1, 2, 3, 4, 5, 6])
+            self.assertEqual(first["applied"], [1, 2, 3, 4, 5, 6, 7, 8])
             self.assertEqual(second["applied"], [])
             status = database_status(db_path)
-            self.assertEqual(status["schema_version"], 6)
+            self.assertEqual(status["schema_version"], 8)
             self.assertEqual(status["integrity"], "ok")
             self.assertIn("paper_feedback", status["counts"])
             self.assertIn("fulltext_files", status["counts"])
@@ -45,7 +45,7 @@ class StorageTests(unittest.TestCase):
             db.commit()
             db.close()
             result = upgrade_database(db_path)
-            self.assertEqual(result["applied"], [1, 2, 3, 4, 5, 6])
+            self.assertEqual(result["applied"], [1, 2, 3, 4, 5, 6, 7, 8])
             self.assertEqual(database_status(db_path)["counts"]["papers"], 1)
 
     def test_partially_upgraded_legacy_database_is_reconciled(self):
@@ -73,7 +73,7 @@ class StorageTests(unittest.TestCase):
 
             result = upgrade_database(db_path)
 
-            self.assertEqual(result["applied"], [1, 2, 3, 4, 5, 6])
+            self.assertEqual(result["applied"], [1, 2, 3, 4, 5, 6, 7, 8])
             db = sqlite3.connect(db_path)
             paper_columns = {row[1] for row in db.execute("PRAGMA table_info(papers)")}
             job_columns = {row[1] for row in db.execute("PRAGMA table_info(agent_jobs)")}

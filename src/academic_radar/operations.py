@@ -20,6 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 from .governance import governance_stats
+from .official import resolve_official_source
 from .product import DEFAULT_STATE_DIR, initialize_installation, overall_quality
 from .storage import connect, database_status, latest_schema_version, migrate_state, upgrade_database
 
@@ -163,7 +164,7 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
             not missing_sources,
             "全部来源已有运行记录" if not missing_sources else "尚无运行记录：" + "、".join(missing_sources),
             "warning",
-            "运行一次 agent-export 以建立来源健康记录",
+            "运行一次 collect-only 以建立来源健康记录",
         )
         failed_sources = [item["source"] for item in source_rows if item["status"] == "failed"]
         degraded_sources = [item["source"] for item in source_rows if item["status"] == "degraded"]
@@ -182,6 +183,48 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
                 "稍后重试并检查 Crossref/OpenAlex 网络状态",
             )
 
+        official_sources = [
+            source["name"] for source in config.get("sources", [])
+            if resolve_official_source(source)
+        ]
+        official_success = {
+            row["source_name"]: int(row["count"])
+            for row in database.execute(
+                """SELECT source_name,COUNT(*) count FROM official_issue_checks
+                WHERE status='succeeded' GROUP BY source_name"""
+            )
+        }
+        incomplete_official = [
+            f"{name}（{official_success.get(name, 0)}/2 期）"
+            for name in official_sources if official_success.get(name, 0) < 2
+        ]
+        check(
+            "official_issue_coverage",
+            not incomplete_official,
+            "全部官网来源至少完成最近两期核验" if not incomplete_official
+            else "官网两期核验尚未完成：" + "、".join(incomplete_official),
+            "warning",
+            "运行 official plan/collect-supported，并继续核验未完成的官网卷期",
+        )
+        latest_official_failures = [dict(row) for row in database.execute(
+            """SELECT source_name,issue_key,detail FROM (
+              SELECT source_name,issue_key,status,detail,checked_at,
+              ROW_NUMBER() OVER(PARTITION BY source_name ORDER BY checked_at DESC) rank
+              FROM official_issue_checks
+            ) WHERE rank=1 AND status='failed'"""
+        )]
+        check(
+            "official_issue_failures",
+            not latest_official_failures,
+            "最近官网核验无失败卷期" if not latest_official_failures else
+            "官网待重试：" + "；".join(
+                f"{item['source_name']} {item['issue_key']}（{item['detail']}）"
+                for item in latest_official_failures
+            ),
+            "warning",
+            "查看 official status，并重试失败卷期；失败不影响已保存的 API 数据",
+        )
+
         latest_job = database.execute(
             "SELECT * FROM agent_jobs ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
@@ -190,7 +233,7 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
             bool(latest_job) and latest_job["status"] == "imported",
             f"最近任务={latest_job['run_id'] if latest_job else '无'}；状态={latest_job['status'] if latest_job else '尚未运行'}",
             "warning",
-            "运行 agent-export，让 Codex 判断完整队列后再运行 agent-import",
+            "先运行 collect-only 与官网卷期核验，再导出完整队列并运行 agent-import",
         )
 
         eligible_count = int(database.execute(
@@ -210,9 +253,9 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
             semantic_ok,
             f"可筛选论文={eligible_count}；已判断={screened_count}",
             "warning",
-            "运行 agent-export/agent-import 补齐未判断论文",
+            "运行 agent-export --no-collect/agent-import 补齐未判断论文",
         )
-        quality = governance_stats(db_path, float(config.get("relevance_threshold", 0.62)))
+        quality = governance_stats(db_path, float(config.get("relevance_threshold", 0.70)))
         abstract_ok = quality["abstract_percent"] >= 70 or quality["visible"] == 0
         check(
             "abstract_coverage",
@@ -246,7 +289,7 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
         "quality": overall_quality(db_path),
         "database": status,
         "service": service,
-        "governance": governance_stats(db_path, float(config.get("relevance_threshold", 0.62))),
+        "governance": governance_stats(db_path, float(config.get("relevance_threshold", 0.70))),
     }
 
 

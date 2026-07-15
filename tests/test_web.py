@@ -61,10 +61,28 @@ class WebTests(unittest.TestCase):
                 for path in ("/", "/library", "/sources", "/profile", "/feedback", "/status"):
                     response = client.get(path)
                     self.assertEqual(response.status_code, 200, path)
-                    self.assertIn("个人学术雷达", response.text)
+                    self.assertIn("个人学术助手", response.text)
                     self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
-                    if path == "/": self.assertIn("app.js?v=0.8.0", response.text)
+                    if path == "/":
+                        self.assertIn("app.js?v=0.8.2", response.text)
+                        self.assertEqual(response.text.count('class="nav-icon"'), 6)
                 self.assertTrue(client.get("/healthz").json()["ok"])
+
+    def test_sources_show_completed_official_issue_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            db = connect(db_path)
+            with db:
+                db.execute(
+                    """INSERT INTO official_issue_checks(
+                    source_name,issue_key,issue_url,status,article_count,imported_count,detail,checked_at
+                    ) VALUES('Test Venue','volume-12','https://example.test/12','succeeded',5,5,'ok','now')"""
+                )
+            db.close()
+            with TestClient(app) as client:
+                page = client.get("/sources")
+            self.assertIn("官网已核验", page.text)
+            self.assertIn("1 期 · 5 篇", page.text)
 
     def test_empty_legacy_state_is_repaired_and_all_pages_render(self):
         with tempfile.TemporaryDirectory() as td:
@@ -150,6 +168,32 @@ class WebTests(unittest.TestCase):
                 page=client.get("/profile")
             self.assertEqual(response.status_code,404)
             self.assertNotIn("备用 API",page.text)
+            self.assertNotIn("本地论文解析 Prompt",page.text)
+
+    def test_profile_page_can_switch_back_to_a_historical_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, profile_file = self.make_app(Path(td))
+            with TestClient(app) as client:
+                client.post(
+                    "/profile/draft",
+                    data={"csrf_token": app.state.csrf_token, "content": "second profile",
+                          "summary": "Second version"},
+                )
+                db = connect(db_path)
+                original_id = db.execute("SELECT id FROM profile_versions WHERE status='active'").fetchone()[0]
+                second_id = db.execute("SELECT id FROM profile_versions WHERE status='draft'").fetchone()[0]
+                db.close()
+                client.post("/profile/confirm", data={"csrf_token": app.state.csrf_token,
+                                                       "version_id": str(second_id)})
+                page = client.get("/profile")
+                self.assertIn(f"切换回 v{original_id}", page.text)
+                response = client.post(
+                    "/profile/confirm",
+                    data={"csrf_token": app.state.csrf_token, "version_id": str(original_id)},
+                    follow_redirects=False,
+                )
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(profile_file.read_text(), "confirmed profile")
 
     def test_source_addition_requires_preview_and_preserves_config_backup(self):
         with tempfile.TemporaryDirectory() as td:
@@ -228,12 +272,28 @@ class WebTests(unittest.TestCase):
             with TestClient(app) as client:
                 client.post("/api/favorite",json={"identity":"doi:10.1/test","favorite":True},
                             headers={"X-CSRF-Token":app.state.csrf_token})
-                response = client.get("/library?sort=score_asc&favorite=yes&q=useful&page_no=1")
+                response = client.get("/library?sort=score_asc&favorite=yes&q=useful&interest=&page_no=1")
             self.assertEqual(response.status_code, 200)
             self.assertIn("匹配度：低到高", response.text)
-            self.assertIn("导入全文 PDF", response.text)
+            self.assertIn("对应论文卡片中直接导入 PDF", response.text)
             self.assertEqual(response.text.count('action="/fulltext"'), 1)
-            self.assertIn("data-abstract-toggle", response.text)
+            self.assertNotIn('id="pdf-dialog"', response.text)
+            self.assertIn("data-inline-pdf-form", response.text)
+            self.assertNotIn("data-abstract-toggle", response.text)
+
+    def test_library_defaults_to_interested_papers(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, _, _ = self.make_app(Path(td))
+            with TestClient(app) as client:
+                before = client.get("/library")
+                client.post("/feedback", data={"csrf_token": app.state.csrf_token, "identity": "doi:10.1/test",
+                                                 "interest": "interested", "reason": "Fits the project",
+                                                 "reading_status": "unread"})
+                after = client.get("/library")
+                all_interest = client.get("/library?interest=")
+            self.assertNotIn("A useful paper", before.text)
+            self.assertIn("A useful paper", after.text)
+            self.assertIn("A useful paper", all_interest.text)
 
     def test_favorite_api_is_independent_and_immediate(self):
         with tempfile.TemporaryDirectory() as td:
@@ -261,7 +321,47 @@ class WebTests(unittest.TestCase):
             self.assertIn("A useful paper",response.text)
             self.assertIn("展开详情",response.text)
             self.assertNotIn('action="/fulltext"',response.text)
+            self.assertNotIn("打开原文", response.text)
+            self.assertNotIn("展开摘要", response.text)
+            self.assertIn('class="paper-title-link"', response.text)
+            self.assertIn("标记与反馈", response.text)
+            self.assertNotIn("feedback-drawer", response.text)
             self.assertIn("AI",response.text)
+
+    def test_feedback_api_returns_completion_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/feedback",
+                    json={"identity": "doi:10.1/test", "interest": "not_interested",
+                          "reason": "Outside the current scope", "favorite": False, "reading_status": "unread"},
+                    headers={"X-CSRF-Token": app.state.csrf_token},
+                )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["status_label"], "已完成 · 不感兴趣")
+            db = connect(db_path)
+            self.assertEqual(db.execute("SELECT interest FROM paper_feedback").fetchone()[0], "not_interested")
+            db.close()
+
+    def test_dismissed_system_suggestion_is_not_a_profile_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            from academic_radar.engagement import create_feedback_profile_suggestion, pending_profile_review
+
+            with TestClient(app) as client:
+                client.post("/feedback", data={"csrf_token": app.state.csrf_token, "identity": "doi:10.1/test",
+                                                 "interest": "interested", "reason": "Useful", "reading_status": "unread"})
+                review = pending_profile_review(db_path)
+                suggestion = create_feedback_profile_suggestion(
+                    db_path, review["fingerprint"], "suggested profile", "System suggestion"
+                )
+                response = client.post("/profile/dismiss", data={"csrf_token": app.state.csrf_token,
+                                                                     "version_id": suggestion["version"]["id"]})
+                page = client.get("/profile")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("1 个已采用版本", page.text)
+            self.assertNotIn("System suggestion", page.text)
 
     def test_feedback_page_is_interactive_without_change_history(self):
         with tempfile.TemporaryDirectory() as td:
@@ -330,8 +430,14 @@ class WebTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             app, _, _=self.make_app(Path(td))
             with TestClient(app) as client: response=client.get("/status")
-            for label in ("立即补全摘要","立即更新文献 / 建立 Codex 队列","重新检查状态"):
+            for label in ("更新数据库", "当前：", "由 Codex 完整执行", "自动检查", "最近任务"):
                 self.assertIn(label,response.text)
+            for label in ("agent-export", "agent-import", "默认收起；点击查看任务记录"):
+                self.assertIn(label,response.text)
+            self.assertNotIn('<details class="panel full recent-tasks-panel" open>', response.text)
+            self.assertNotIn("网页运行方式", response.text)
+            self.assertNotIn("交给 Codex 判断相关性", response.text)
+            self.assertNotIn("数据库结构版本", response.text)
             self.assertNotIn("API Key",response.text)
             self.assertNotIn("DeepSeek",response.text)
 

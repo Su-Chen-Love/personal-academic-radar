@@ -98,14 +98,18 @@ def confirm_profile(db_path: Path, version_id: int, profile_file: Path) -> dict[
         candidate = db.execute("SELECT * FROM profile_versions WHERE id=?", (version_id,)).fetchone()
         if not candidate:
             raise ValueError(f"Unknown profile version: {version_id}")
-        if candidate["status"] != "draft":
-            raise ValueError("Only a draft profile can be confirmed")
+        if candidate["status"] == "active":
+            return dict(candidate)
+        if candidate["status"] not in {"draft", "superseded"}:
+            raise ValueError("Only a draft or historical profile can be activated")
         _atomic_write(profile_file, candidate["content"])
         try:
             with db:
                 db.execute("UPDATE profile_versions SET status='superseded' WHERE status='active'")
+                db.execute("UPDATE profile_versions SET status='active',confirmed_at=? WHERE id=?", (utc_now(), version_id))
                 db.execute(
-                    "UPDATE profile_versions SET status='active',confirmed_at=? WHERE id=? AND status='draft'",
+                    """UPDATE profile_review_runs SET status='accepted',updated_at=?
+                    WHERE profile_version_id=? AND status='suggested'""",
                     (utc_now(), version_id),
                 )
         except Exception:
@@ -126,6 +130,110 @@ def list_profiles(db_path: Path) -> list[dict[str, Any]]:
         return [dict(row) for row in db.execute(
             "SELECT * FROM profile_versions ORDER BY created_at DESC,id DESC"
         )]
+    finally:
+        db.close()
+
+
+def pending_profile_review(db_path: Path) -> dict[str, Any]:
+    """Return preference changes not yet reviewed by the host model."""
+
+    upgrade_database(db_path)
+    db = connect(db_path)
+    try:
+        last = db.execute("SELECT created_at FROM profile_review_runs ORDER BY created_at DESC LIMIT 1").fetchone()
+        active = db.execute("SELECT confirmed_at FROM profile_versions WHERE status='active'").fetchone()
+        boundary = max(
+            str(last["created_at"] or "") if last else "",
+            str(active["confirmed_at"] or "") if active else "",
+        )
+        events = [dict(row) for row in db.execute(
+            """WITH ranked AS (
+              SELECT e.rowid event_id,e.identity,e.interest,e.reason,e.created_at,
+              ROW_NUMBER() OVER(PARTITION BY e.identity ORDER BY e.created_at DESC,e.rowid DESC) rn
+              FROM feedback_events e
+              WHERE e.interest IN ('interested','not_interested') AND e.created_at>?
+            )
+            SELECT e.event_id,e.identity,e.interest,e.reason,e.created_at,
+            p.title,p.abstract,p.venue
+            FROM ranked e JOIN papers p ON p.identity=e.identity
+            WHERE e.rn=1 ORDER BY e.created_at,e.event_id""",
+            (boundary,),
+        )]
+        serialized = json.dumps(events, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        fingerprint = hashlib.sha256(serialized.encode()).hexdigest() if events else ""
+        pending_suggestion = db.execute(
+            """SELECT r.*,v.content,v.change_summary,v.id version_id FROM profile_review_runs r
+            JOIN profile_versions v ON v.id=r.profile_version_id
+            WHERE r.status='suggested' AND v.status='draft' ORDER BY r.updated_at DESC LIMIT 1"""
+        ).fetchone()
+        return {
+            "needed": bool(events),
+            "fingerprint": fingerprint,
+            "feedback_count": len(events),
+            "events": events,
+            "pending_suggestion": dict(pending_suggestion) if pending_suggestion else None,
+        }
+    finally:
+        db.close()
+
+
+def create_feedback_profile_suggestion(
+    db_path: Path, fingerprint: str, content: str, change_summary: str,
+) -> dict[str, Any]:
+    review = pending_profile_review(db_path)
+    if not review["needed"] or review["fingerprint"] != fingerprint:
+        raise ValueError("反馈集合已经变化，请重新生成画像建议")
+    version = create_profile_draft(db_path, content, change_summary, "feedback-ai")
+    now = utc_now()
+    db = connect(db_path)
+    try:
+        with db:
+            db.execute(
+                """INSERT INTO profile_review_runs(
+                fingerprint,status,feedback_count,details_json,profile_version_id,created_at,updated_at
+                ) VALUES(?,'suggested',?,?,?,?,?)""",
+                (fingerprint, review["feedback_count"], json.dumps({"events": review["events"]}, ensure_ascii=False),
+                 version["id"], now, now),
+            )
+        return {"status": "suggested", "feedback_count": review["feedback_count"], "version": version}
+    finally:
+        db.close()
+
+
+def record_profile_review_no_change(db_path: Path, fingerprint: str, reason: str) -> dict[str, Any]:
+    review = pending_profile_review(db_path)
+    if not review["needed"] or review["fingerprint"] != fingerprint:
+        raise ValueError("反馈集合已经变化，请重新检查")
+    now = utc_now()
+    db = connect(db_path)
+    try:
+        with db:
+            db.execute(
+                """INSERT INTO profile_review_runs(
+                fingerprint,status,feedback_count,details_json,profile_version_id,created_at,updated_at
+                ) VALUES(?,'no_change',?,?,NULL,?,?)""",
+                (fingerprint, review["feedback_count"], json.dumps({"reason": reason.strip()}, ensure_ascii=False), now, now),
+            )
+        return {"status": "no_change", "feedback_count": review["feedback_count"], "reason": reason.strip()}
+    finally:
+        db.close()
+
+
+def dismiss_profile_suggestion(db_path: Path, version_id: int) -> dict[str, Any]:
+    upgrade_database(db_path)
+    db = connect(db_path)
+    try:
+        version = db.execute("SELECT * FROM profile_versions WHERE id=?", (version_id,)).fetchone()
+        if not version or version["status"] != "draft" or version["source"] != "feedback-ai":
+            raise ValueError("只能忽略尚未处理的反馈画像建议")
+        now = utc_now()
+        with db:
+            db.execute("UPDATE profile_versions SET status='superseded' WHERE id=?", (version_id,))
+            db.execute(
+                "UPDATE profile_review_runs SET status='dismissed',updated_at=? WHERE profile_version_id=?",
+                (now, version_id),
+            )
+        return {"status": "dismissed", "version_id": version_id}
     finally:
         db.close()
 

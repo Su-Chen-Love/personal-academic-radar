@@ -24,28 +24,50 @@
     const summary = details.querySelector(":scope > summary");
     details.addEventListener("toggle", () => {
       if (summary) summary.textContent = details.open ? "收起详情" : "展开详情";
-      if (details.open) requestAnimationFrame(setupAbstracts);
     });
   });
-  function setupAbstracts() {
-    document.querySelectorAll("[data-abstract-wrap]").forEach((wrap) => {
-      const text = wrap.querySelector("[data-abstract]");
-      const button = wrap.querySelector("[data-abstract-toggle]");
-      if (!text || !button || wrap.dataset.ready) return;
-      wrap.dataset.ready = "1";
-      text.classList.add("is-collapsed");
-      const overflowed = text.scrollHeight > text.clientHeight + 2;
-      button.hidden = !overflowed;
-      if (!overflowed) text.classList.remove("is-collapsed");
-      button.addEventListener("click", () => {
-        const expanded = button.getAttribute("aria-expanded") === "true";
-        button.setAttribute("aria-expanded", String(!expanded));
-        button.textContent = expanded ? "展开摘要" : "收起摘要";
-        text.classList.toggle("is-collapsed", expanded);
-      });
-    });
-  }
-  setupAbstracts();
+
+  const orderTodayCards = () => {
+    const list = document.querySelector("[data-today-list]");
+    if (!list) return;
+    const cards = [...list.querySelectorAll(":scope > .paper-card")];
+    const pending = cards.filter((card) => !card.dataset.interest);
+    const interested = cards.filter((card) => card.dataset.interest === "interested");
+    const notInterested = cards.filter((card) => card.dataset.interest === "not_interested");
+    [...pending, ...interested, ...notInterested].forEach((card) => list.append(card));
+  };
+
+  document.querySelectorAll("[data-feedback-form]").forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = form.querySelector('button[type="submit"]');
+    const values = new FormData(form);
+    const payload = {
+      identity: values.get("identity"),
+      interest: values.get("interest"),
+      reason: values.get("reason"),
+      reading_status: values.get("reading_status"),
+      favorite: values.get("favorite") === "on",
+    };
+    submit.disabled = true;
+    try {
+      const result = await api("/api/feedback", {method: "POST", body: JSON.stringify(payload)});
+      const card = form.closest(".paper-card");
+      const status = card?.querySelector("[data-feedback-status]");
+      if (card) card.dataset.interest = result.interest || "";
+      if (status) {
+        status.textContent = result.status_label;
+        status.hidden = !result.status_label;
+        status.className = `completion-status ${result.interest || "neutral"}`;
+      }
+      if (card && document.querySelector("[data-today-list]")) {
+        card.classList.add("is-completing");
+        orderTodayCards();
+        setTimeout(() => card.classList.remove("is-completing"), 780);
+      }
+      announce(result.message);
+    } catch (error) { announce(error.message, true); }
+    finally { submit.disabled = false; }
+  }));
 
   document.addEventListener("click", async (event) => {
     const favorite = event.target.closest("[data-favorite]");
@@ -65,30 +87,20 @@
     }
   });
 
-  const pdfDialog = document.getElementById("pdf-dialog");
-  const openPdf = (identity = "") => {
-    if (!pdfDialog) {
-      location.href = "/library?pdf=" + encodeURIComponent(identity);
-      return;
-    }
-    const select = pdfDialog.querySelector("[data-paper-select]");
-    if (identity && select) select.value = identity;
-    pdfDialog.showModal();
-  };
-  document.querySelectorAll("[data-open-pdf]").forEach((button) => button.addEventListener("click", () => openPdf(button.dataset.identity || "")));
-  const requestedPdf = new URLSearchParams(location.search).get("pdf");
-  if (requestedPdf && pdfDialog) openPdf(requestedPdf);
-  document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => button.closest("dialog")?.close()));
-  document.querySelector("[data-paper-search]")?.addEventListener("input", (event) => {
-    const query = event.target.value.trim().toLocaleLowerCase();
-    document.querySelectorAll("[data-paper-select] option").forEach((option) => {
-      option.hidden = Boolean(option.value && query && !option.textContent.toLocaleLowerCase().includes(query));
+  document.querySelectorAll("[data-inline-pdf-form]").forEach((form) => {
+    const trigger = form.querySelector("[data-inline-pdf-trigger]");
+    const input = form.querySelector("[data-inline-pdf-file]");
+    const name = form.querySelector("[data-inline-pdf-name]");
+    const submit = form.querySelector("[data-inline-pdf-submit]");
+    trigger?.addEventListener("click", () => input?.click());
+    input?.addEventListener("change", () => {
+      const file = input.files?.[0];
+      if (!file || !name || !submit) return;
+      name.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} MB`;
+      name.hidden = false;
+      submit.hidden = false;
+      trigger.textContent = "重新选择 PDF";
     });
-  });
-  document.querySelector("[data-pdf-file]")?.addEventListener("change", (event) => {
-    const file = event.target.files?.[0];
-    const summary = document.querySelector("[data-file-summary]");
-    if (summary) summary.textContent = file ? `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} MB` : "尚未选择文件";
   });
 
   const sourceRoot = document.querySelector("[data-source-search]");
@@ -118,7 +130,10 @@
         previewToken = result.token;
         const dialog = document.getElementById("source-preview-dialog");
         dialog.querySelector("[data-preview-title]").textContent = `确认添加“${result.source.name}”`;
-        dialog.querySelector("[data-preview-summary]").textContent = `从 ${result.since} 起找到 ${result.total_results} 个结果。添加前请核对样例。`;
+        const official = result.source.official_status === "verified"
+          ? `官网卷期将由 ${result.source.official_provider} 核验最近两期。`
+          : "目前先使用 14 天 API 采集；系统会提示后续补充官网适配。";
+        dialog.querySelector("[data-preview-summary]").textContent = `从 ${result.since} 起找到 ${result.total_results} 个结果。${official}`;
         const samples = dialog.querySelector("[data-preview-list]");
         samples.replaceChildren(...(result.samples.length ? result.samples : [{title: "当前时间窗没有样例", venue: "可稍后重试"}]).map((item) => {
           const li = document.createElement("li");
@@ -138,7 +153,8 @@
         button.setAttribute("aria-disabled", String(Boolean(item.added))); button.disabled = Boolean(item.added);
         const title = document.createElement("strong"); title.textContent = item.name + (item.added ? "（已添加）" : "");
         const meta = document.createElement("span");
-        meta.textContent = [item.source_type, item.publisher, item.issn && `ISSN ${item.issn}`, item.openalex_id && `OpenAlex ${item.openalex_id}`, item.match_basis].filter(Boolean).join(" · ");
+        const official = item.official_status === "verified" ? `官网：${item.official_provider}` : "官网适配：待补充";
+        meta.textContent = [item.source_type, item.publisher, item.issn && `ISSN ${item.issn}`, item.openalex_id && `OpenAlex ${item.openalex_id}`, official, item.match_basis].filter(Boolean).join(" · ");
         button.append(title, meta); button.addEventListener("click", () => preview(item.candidate_id)); list.append(button);
       });
       list.hidden = items.length === 0; input.setAttribute("aria-expanded", String(items.length > 0));
@@ -189,50 +205,9 @@
     }));
   }
 
-  const taskProgress = document.querySelector("[data-task-progress]");
-  const pollTask = async (taskId) => {
-    taskProgress.hidden = false;
-    try {
-      const task = await api(`/api/tasks/${encodeURIComponent(taskId)}`, {headers: {"Content-Type": "application/json"}});
-      const total = task.total_count || task.details?.checked || 1;
-      const completed = task.completed_count || 0;
-      taskProgress.querySelector("[data-task-progressbar]").max = total;
-      taskProgress.querySelector("[data-task-progressbar]").value = completed;
-      taskProgress.querySelector("[data-task-message]").textContent = `${task.message || "处理中"}${total > 1 ? `（${completed}/${total}）` : ""}`;
-      if (task.status === "running") return setTimeout(() => pollTask(taskId), 1000);
-      const failed = task.status === "failed" || task.status === "partial";
-      taskProgress.querySelector("[data-task-retry]").hidden = !failed;
-      announce(task.message || "任务完成", task.status === "failed");
-      if (!failed) setTimeout(() => location.reload(), 800);
-    } catch (error) { announce(error.message, true); }
-  };
-  document.querySelectorAll("[data-task-action]").forEach((button) => button.addEventListener("click", async () => {
-    const action = button.dataset.taskAction;
-    if (["enrich", "export"].includes(action) && !confirm(action === "enrich" ? "现在开始从官方元数据渠道补全摘要吗？已有更长摘要不会被覆盖。" : "现在采集新论文并建立 Codex 判断队列吗？")) return;
-    button.disabled = true;
-    try {
-      if (action === "recheck") {
-        const result = await api("/api/tasks/recheck", {method: "POST", body: "{}"});
-        announce(result.ok ? "状态检查完成" : "检查发现需要处理的项目"); setTimeout(() => location.reload(), 500);
-      } else if (action === "package") {
-        const result = await api("/api/tasks/missing-package", {method: "POST", body: "{}"});
-        announce(`已导出 ${result.count} 项：${result.output}`);
-      } else {
-        const result = await api(`/api/tasks/${action}`, {method: "POST", body: JSON.stringify({})});
-        await pollTask(result.task_id);
-      }
-    } catch (error) { announce(error.message, true); }
-    finally { button.disabled = false; }
-  }));
-  document.querySelector("[data-task-retry]")?.addEventListener("click", async () => {
-    try {
-      const result = await api("/api/tasks/enrich", {method: "POST", body: JSON.stringify({retry: true})});
-      await pollTask(result.task_id);
-    } catch (error) { announce(error.message, true); }
-  });
-  document.querySelector("[data-copy]")?.addEventListener("click", async () => {
+  document.querySelector("[data-copy-update]")?.addEventListener("click", async () => {
     const text = document.querySelector("[data-copy-target]")?.value || "";
-    try { await navigator.clipboard.writeText(text); announce("任务提示词已复制"); }
+    try { await navigator.clipboard.writeText(text); announce("更新任务已复制，发送给 Codex 即可执行"); }
     catch (_) { announce("无法访问剪贴板，请手动复制", true); }
   });
 })();

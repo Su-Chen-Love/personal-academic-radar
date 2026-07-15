@@ -1,7 +1,21 @@
 {% extends "base.html" %}
-{% block title %}研究画像 · 个人学术雷达{% endblock %}
+{% block title %}研究兴趣 · 个人学术助手{% endblock %}
 {% block content %}
-<header class="page-head"><div><p class="kicker">RESEARCH PROFILE · VERSIONED</p><h1>研究画像</h1><p>推荐以已确认版本为准。任何修改先成为草稿，确认后才影响后续筛选。</p></div>{% if active %}<span class="version-pill">当前 v{{ active.id }}</span>{% endif %}</header>
+<header class="page-head"><div><p class="kicker">RESEARCH INTERESTS · VERSIONED</p><h1>研究兴趣</h1><p>系统会根据你的兴趣反馈定期检查画像是否需要调整；只有你确认采用的版本才会影响后续推荐。</p></div>{% if active %}<span class="version-pill">当前 v{{ active.id }}</span>{% endif %}</header>
+<section class="panel profile-recommendation">
+  <div class="panel-head"><h2>推荐</h2><span>基于偏好反馈</span></div>
+  {% set suggestion = profile_review.pending_suggestion %}
+  {% if suggestion %}
+    <div class="recommendation-callout"><div><span class="status draft">待你确认</span><h3>{{ suggestion.change_summary }}</h3><p>系统参考了 {{ suggestion.feedback_count }} 条新反馈，形成了一个画像建议。采用前可以先查看完整内容。</p></div>
+      <details><summary>查看建议画像</summary><pre class="profile-preview">{{ suggestion.content }}</pre></details>
+      <div class="recommendation-actions"><form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ suggestion.version_id }}"><button>采用这个建议</button></form><form method="post" action="/profile/dismiss"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ suggestion.version_id }}"><button class="secondary">暂不采用</button></form></div>
+    </div>
+  {% elif profile_review.needed %}
+    <p class="muted">发现 {{ profile_review.feedback_count }} 条尚未分析的新反馈。下一次每日任务会判断是否需要更新画像。</p>
+  {% else %}
+    <p class="muted">目前没有新的画像调整建议。你的兴趣反馈会在下一次每日任务中自动检查。</p>
+  {% endif %}
+</section>
 <div class="profile-layout">
   <section class="panel profile-editor"><div class="panel-head"><h2>当前画像</h2><span>已确认</span></div>
     <form method="post" action="/profile/draft">
@@ -11,16 +25,12 @@
       <button type="submit">保存为草稿</button>
     </form>
   </section>
-  <aside class="panel version-list"><div class="panel-head"><h2>版本记录</h2><span>{{ versions|length }} 个版本</span></div>
+  <aside class="panel version-list"><div class="panel-head"><h2>版本记录</h2><span>{{ versions|length }} 个已采用版本</span></div>
     {% for version in versions %}<article>
       <div><strong>v{{ version.id }}</strong><span class="status {{ version.status }}">{{ version.status|status_label }}</span></div>
       <p>{{ version.change_summary or '无修改说明' }}</p><small>{{ version.created_at|human_time }}</small>
-      {% if version.status == 'draft' %}<form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ version.id }}"><button class="secondary">确认并激活 v{{ version.id }}</button></form>{% endif %}
+      {% if version.status != 'active' %}<form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ version.id }}"><button class="secondary">{% if version.status == 'draft' %}确认并启用{% else %}切换回{% endif %} v{{ version.id }}</button></form>{% endif %}
     </article>{% endfor %}
   </aside>
 </div>
-<section class="panel full profile-prompt"><div class="panel-head"><h2>本地论文解析 Prompt</h2><span>复制到你的 AI，再把草稿贴回上方</span></div>
-  <p class="muted">把提示词交给本机 Codex，并附上代表论文或研究笔记；将生成的画像草稿贴回上方，检查后再明确激活。</p>
-  <textarea rows="16" readonly>{{ profile_prompt }}</textarea>
-</section>
 {% endblock %}

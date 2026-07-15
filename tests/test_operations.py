@@ -121,6 +121,35 @@ class OperationsTests(unittest.TestCase):
             self.assertEqual(checks["latest_semantic_job"]["level"], "warning")
             self.assertTrue(result["recommendations"])
 
+    def test_verify_surfaces_official_issue_coverage_and_latest_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); config=root/"config.toml"; profile=root/"research-profile.md"
+            profile.write_text("profile",encoding="utf-8")
+            config.write_text(
+                'state_dir = "."\nprofile_file = "research-profile.md"\n'
+                '[[sources]]\nname = "International Journal of Human-Computer Studies"\n'
+                'type = "crossref"\nissn = "1071-5819"\n', encoding="utf-8"
+            )
+            db_path=root/"papers.sqlite3"; upgrade_database(db_path); seed_active_profile(db_path,"profile")
+            db=connect(db_path)
+            with db:
+                db.execute(
+                    """INSERT INTO official_issue_checks(
+                    source_name,issue_key,issue_url,status,article_count,imported_count,detail,checked_at
+                    ) VALUES(?,?,?,?,?,?,?,?)""",
+                    ("International Journal of Human-Computer Studies","volume-212",
+                     "https://www.sciencedirect.com/issue","failed",0,0,"blocked","now"),
+                )
+            db.close()
+
+            result=verify_installation(config)
+            checks={item["name"]:item for item in result["checks"]}
+
+            self.assertFalse(checks["official_issue_coverage"]["ok"])
+            self.assertIn("0/2",checks["official_issue_coverage"]["detail"])
+            self.assertFalse(checks["official_issue_failures"]["ok"])
+            self.assertIn("volume-212",checks["official_issue_failures"]["detail"])
+
     def test_verify_blocks_when_legacy_state_has_no_confirmed_profile(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

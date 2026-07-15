@@ -2,7 +2,7 @@ state_dir = "~/.local/share/personal-academic-radar"
 profile_file = "research-profile.md"
 bootstrap_mode = "baseline"
 lookback_days = 14
-relevance_threshold = 0.62
+relevance_threshold = 0.70
 feedback_examples_per_class = 20
 user_agent = "PersonalAcademicRadar/0.8 (mailto:you@example.com)"
 
@@ -29,38 +29,62 @@ name = "International Journal of Human-Computer Interaction"
 type = "crossref"
 issn = "1044-7318"
 openalex_id = "S165559636"
+official_status = "verified"
+official_provider = "Taylor & Francis"
+official_issues_url = "https://www.tandfonline.com/loi/hihc20"
+official_feed_url = "https://www.tandfonline.com/action/showFeed?type=etoc&feed=rss&jc=hihc20"
 
 [[sources]]
 name = "International Journal of Human-Computer Studies"
 type = "crossref"
 issn = "1071-5819"
 openalex_id = "S4210190811"
+official_status = "verified"
+official_provider = "Elsevier ScienceDirect"
+official_issues_url = "https://www.sciencedirect.com/journal/international-journal-of-human-computer-studies/issues"
+official_feed_url = "https://rss.sciencedirect.com/publication/science/10715819"
 
 [[sources]]
 name = "IEEE Transactions on Human-Machine Systems"
 type = "crossref"
 issn = "2168-2291"
 openalex_id = "S2476799526"
+official_status = "verified"
+official_provider = "IEEE Xplore"
+official_issues_url = "https://ieeexplore.ieee.org/xpl/RecentIssue.jsp?punumber=6221037"
 
 [[sources]]
 name = "International Journal of Industrial Ergonomics"
 type = "crossref"
 issn = "0169-8141"
 openalex_id = "S92539022"
+official_status = "verified"
+official_provider = "Elsevier ScienceDirect"
+official_issues_url = "https://www.sciencedirect.com/journal/international-journal-of-industrial-ergonomics/issues"
+official_feed_url = "https://rss.sciencedirect.com/publication/science/01698141"
 
 [[sources]]
 name = "Computers in Human Behavior"
 type = "crossref"
 issn = "0747-5632"
 openalex_id = "S204030396"
+official_status = "verified"
+official_provider = "Elsevier ScienceDirect"
+official_issues_url = "https://www.sciencedirect.com/journal/computers-in-human-behavior/issues"
+official_feed_url = "https://rss.sciencedirect.com/publication/science/07475632"
 
 [[sources]]
 name = "Nature Human Behaviour"
 type = "crossref"
 issn = "2397-3374"
 openalex_id = "S2764866340"
+official_status = "verified"
+official_provider = "Springer Nature"
+official_issues_url = "https://www.nature.com/nathumbehav/browse-issues"
+official_feed_url = "https://www.nature.com/nathumbehav.rss"
 
 [[sources]]
 name = "ACM CHI Conference on Human Factors in Computing Systems"
 type = "crossref-query"
 query_container = "CHI Conference on Human Factors in Computing Systems"
+official_status = "api_fallback"

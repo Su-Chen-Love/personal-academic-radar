@@ -9,8 +9,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from academic_radar.engagement import (
     active_profile,
     confirm_profile,
+    create_feedback_profile_suggestion,
     create_profile_draft,
+    dismiss_profile_suggestion,
     feedback_examples,
+    pending_profile_review,
+    record_profile_review_no_change,
     seed_active_profile,
     set_feedback,
 )
@@ -59,6 +63,62 @@ class EngagementTests(unittest.TestCase):
             self.assertEqual(confirmed["status"], "active")
             self.assertEqual(active_profile(db_path)["id"], draft["id"])
             self.assertEqual(profile_file.read_text(), "revised")
+
+            rolled_back = confirm_profile(db_path, original["id"], profile_file)
+            self.assertEqual(rolled_back["status"], "active")
+            self.assertEqual(active_profile(db_path)["id"], original["id"])
+            self.assertEqual(profile_file.read_text(), "original")
+
+    def test_feedback_review_can_suggest_accept_or_dismiss_profile_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "papers.sqlite3"
+            profile_file = root / "research-profile.md"
+            profile_file.write_text("original", encoding="utf-8")
+            seed_active_profile(db_path, "original")
+            self.add_paper(db_path)
+
+            set_feedback(db_path, "doi:10.1/example", "interested", "Directly useful", False, "read")
+            review = pending_profile_review(db_path)
+            self.assertTrue(review["needed"])
+            self.assertEqual(review["feedback_count"], 1)
+            suggestion = create_feedback_profile_suggestion(
+                db_path, review["fingerprint"], "revised", "Add this method family"
+            )
+            self.assertEqual(suggestion["status"], "suggested")
+            pending = pending_profile_review(db_path)
+            self.assertFalse(pending["needed"])
+            self.assertEqual(pending["pending_suggestion"]["version_id"], suggestion["version"]["id"])
+
+            dismiss_profile_suggestion(db_path, suggestion["version"]["id"])
+            self.assertIsNone(pending_profile_review(db_path)["pending_suggestion"])
+            db = connect(db_path)
+            self.assertEqual(db.execute("SELECT status FROM profile_versions WHERE id=?", (suggestion["version"]["id"],)).fetchone()[0], "superseded")
+            db.close()
+
+    def test_feedback_review_can_record_no_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "papers.sqlite3"
+            seed_active_profile(db_path, "original")
+            self.add_paper(db_path)
+            set_feedback(db_path, "doi:10.1/example", "not_interested", "Out of scope", False, "unread")
+            review = pending_profile_review(db_path)
+            result = record_profile_review_no_change(db_path, review["fingerprint"], "Already excluded")
+            self.assertEqual(result["status"], "no_change")
+            self.assertFalse(pending_profile_review(db_path)["needed"])
+
+    def test_profile_review_uses_only_latest_feedback_per_paper(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "papers.sqlite3"
+            seed_active_profile(db_path, "original")
+            self.add_paper(db_path)
+            set_feedback(db_path, "doi:10.1/example", "interested", "First reason", False, "unread")
+            set_feedback(db_path, "doi:10.1/example", "interested", "Latest reason", False, "read")
+            review = pending_profile_review(db_path)
+            self.assertEqual(review["feedback_count"], 1)
+            self.assertEqual(review["events"][0]["reason"], "Latest reason")
 
 
 if __name__ == "__main__":

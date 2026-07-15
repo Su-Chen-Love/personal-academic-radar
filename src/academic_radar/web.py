@@ -1,4 +1,4 @@
-"""Local-first web application for the Personal Academic Radar."""
+"""Local-first web application for the Personal Academic Assistant."""
 
 from __future__ import annotations
 
@@ -9,10 +9,8 @@ import json
 import os
 import re
 import secrets
-import subprocess
 import sqlite3
 import sys
-import threading
 import urllib.parse
 import urllib.request
 import tempfile
@@ -29,16 +27,23 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .engagement import clear_feedback, confirm_profile, create_profile_draft, set_favorite, set_feedback
-from .enrichment import enrich_abstracts, export_missing_task_package
+from .engagement import (
+    clear_feedback,
+    confirm_profile,
+    create_profile_draft,
+    dismiss_profile_suggestion,
+    pending_profile_review,
+    set_favorite,
+    set_feedback,
+)
 from .governance import governance_stats, latest_scores_sql
+from .official import configure_official_source, resolve_official_source
 from .operations import verify_installation
 from .product import (
     MAX_PDF_BYTES,
     human_time,
     import_fulltext,
     initialize_installation,
-    profile_assistant_prompt,
     source_candidates,
     source_coverage,
 )
@@ -197,7 +202,10 @@ def _toml_text(value: Any) -> str:
 def write_sources(config_path: Path, sources: list[dict[str, Any]]) -> Path:
     original=config_path.read_text(encoding="utf-8")
     blocks=[]
-    order=("name","type","required","issn","openalex_id","query_container","container_title_contains","exclude_container_contains")
+    order=(
+        "name","type","required","issn","openalex_id","query_container","container_title_contains",
+        "exclude_container_contains","official_status","official_provider","official_issues_url","official_feed_url",
+    )
     for source in sources:
         lines=["[[sources]]"]+[f"{key} = {_toml_text(source[key])}" for key in order if key in source]
         blocks.append("\n".join(lines))
@@ -250,7 +258,7 @@ def create_app(config_path: Path) -> FastAPI:
     initialize_installation(state, config_path)
     config = load_config(config_path)
 
-    app = FastAPI(title="Personal Academic Radar", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Personal Academic Assistant", docs_url=None, redoc_url=None)
     app.state.config_path = config_path
     app.state.config = config
     app.state.state = state
@@ -258,7 +266,6 @@ def create_app(config_path: Path) -> FastAPI:
     app.state.csrf_token = secrets.token_urlsafe(32)
     app.state.pending_sources = {}
     app.state.source_candidates = {}
-    app.state.task_threads = {}
     templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
     templates.env.filters["human_time"] = human_time
     def authors_label(value: str) -> str:
@@ -277,13 +284,12 @@ def create_app(config_path: Path) -> FastAPI:
     }.get(str(value), str(value) if value else "尚无记录")
     templates.env.filters["check_label"] = lambda value: {
         "database_integrity": "数据库完整性",
-        "schema_version": "数据库结构版本",
         "confirmed_profile": "已确认研究画像",
         "source_coverage": "来源运行覆盖",
         "source_runs": "最近来源运行",
         "source_degradation": "来源降级",
-        "latest_semantic_job": "最近语义任务",
-        "semantic_coverage": "语义判断覆盖",
+        "latest_semantic_job": "最近一次 Codex 判断",
+        "semantic_coverage": "相关性判断覆盖",
         "abstract_coverage": "摘要覆盖",
         "web_service": "后台网页服务",
     }.get(str(value), str(value))
@@ -347,47 +353,6 @@ def create_app(config_path: Path) -> FastAPI:
         if not secrets.compare_digest(request.headers.get("x-csrf-token", ""), app.state.csrf_token):
             raise HTTPException(403, "Invalid request token")
 
-    def launch_task(task_type: str, worker: Any) -> str:
-        task_id=dt.datetime.now().strftime("%Y%m%d-%H%M%S")+"-"+secrets.token_hex(4)
-        database=connect(db_path)
-        try:
-            running=database.execute(
-                "SELECT task_id FROM task_runs WHERE status='running' AND task_type IN (?,?)",
-                (task_type,task_type.replace("ui_","")),
-            ).fetchone()
-            if running:
-                raise ValueError("同类任务已经在运行，请等待完成")
-            now=utc_now()
-            with database:
-                database.execute("""INSERT INTO task_runs(
-                  task_id,task_type,status,created_at,started_at,message
-                ) VALUES(?,?,'running',?,?,?)""",(task_id,task_type,now,now,"正在启动"))
-        finally:
-            database.close()
-
-        def run_worker() -> None:
-            status="succeeded"; details: dict[str,Any]={}
-            try:
-                details=worker()
-                status=str(details.get("status","succeeded"))
-                if status not in {"succeeded","partial","failed"}: status="succeeded"
-            except Exception as exc:
-                status="failed"; details={"error":f"{type(exc).__name__}: {str(exc)[:500]}"}
-            database=connect(db_path)
-            try:
-                with database:
-                    database.execute("""UPDATE task_runs SET status=?,completed_count=?,success_count=?,
-                      failure_count=?,message=?,details_json=?,finished_at=? WHERE task_id=?""",
-                      (status,int(details.get("checked",details.get("candidates",0))),int(details.get("updated",0)),
-                       int(details.get("unresolved",0)),
-                       "已完成" if status=="succeeded" else ("部分完成" if status=="partial" else "失败，可重试"),
-                       json.dumps(details,ensure_ascii=False),utc_now(),task_id))
-            finally: database.close()
-
-        thread=threading.Thread(target=run_worker,name=f"radar-{task_type}-{task_id}",daemon=True)
-        app.state.task_threads[task_id]=thread; thread.start()
-        return task_id
-
     @app.get("/healthz")
     def health() -> dict[str, Any]:
         status = database_status(db_path)
@@ -401,7 +366,7 @@ def create_app(config_path: Path) -> FastAPI:
             profile_hash = active["profile_hash"] if active else ""
             latest_job = row(db,"SELECT * FROM agent_jobs WHERE status='imported' ORDER BY imported_at DESC LIMIT 1")
             run_id = latest_job["run_id"] if latest_job else ""
-            threshold=float(config.get("relevance_threshold",0.62))
+            threshold=float(config.get("relevance_threshold",0.70))
             papers = rows(db, """SELECT p.*,s.score,s.reasons,s.confidence,s.screened_at,s.themes_json,
               f.interest,f.reason AS feedback_reason,COALESCE(f.favorite,0) favorite,
               COALESCE(f.reading_status,'unread') reading_status,
@@ -411,7 +376,9 @@ def create_app(config_path: Path) -> FastAPI:
               LEFT JOIN paper_feedback f ON f.identity=p.identity
               WHERE rp.run_id=? AND rp.role='selected_new' AND s.profile_hash=?
                 AND s.score>=? AND p.eligibility_status='eligible'
-              ORDER BY s.score DESC,p.published DESC""", (run_id,profile_hash,threshold))
+              ORDER BY CASE WHEN f.interest IS NULL THEN 0 ELSE 1 END,
+                CASE f.interest WHEN 'interested' THEN 0 WHEN 'not_interested' THEN 1 ELSE 0 END,
+                s.score DESC,p.published DESC""", (run_id,profile_hash,threshold))
             latest_run = row(db, "SELECT * FROM pipeline_runs WHERE run_id=?",(run_id,)) if run_id else None
             totals = row(db, """SELECT COUNT(*) papers,
               (SELECT COUNT(*) FROM paper_feedback WHERE favorite=1) favorites,
@@ -424,10 +391,10 @@ def create_app(config_path: Path) -> FastAPI:
             db.close()
 
     @app.get("/library", response_class=HTMLResponse)
-    def library(request: Request, q: str = "", interest: str = "", reading: str = "", favorite: str = "",
+    def library(request: Request, q: str = "", interest: str = "interested", reading: str = "", favorite: str = "",
                 sort: str = "score_desc", page_no: int = 1) -> HTMLResponse:
         page_no=max(1,page_no); limit=24; offset=(page_no-1)*limit
-        clauses=["p.eligibility_status='eligible'","s.score>=?"]; parameters: list[Any]=[float(config.get("relevance_threshold",0.62))]
+        clauses=["p.eligibility_status='eligible'","s.score>=?"]; parameters: list[Any]=[float(config.get("relevance_threshold",0.70))]
         if q:
             clauses.append("(p.title LIKE ? OR p.abstract LIKE ? OR p.venue LIKE ?)")
             value=f"%{q}%"; parameters.extend([value,value,value])
@@ -458,9 +425,6 @@ def create_app(config_path: Path) -> FastAPI:
               LEFT JOIN paper_feedback f ON f.identity=p.identity WHERE {where}
               ORDER BY {order_by} LIMIT ? OFFSET ?"""
             paper_rows=rows(db,query,tuple([active["profile_hash"]]+parameters+[limit,offset]))
-            pdf_papers=rows(db,f"""SELECT p.identity,p.title FROM papers p JOIN ({latest}) s ON s.identity=p.identity
-              WHERE p.eligibility_status='eligible' AND s.score>=? ORDER BY p.title COLLATE NOCASE""",
-              (active["profile_hash"],float(config.get("relevance_threshold",0.62))))
             count=row(db,f"""SELECT COUNT(*) count FROM papers p JOIN ({latest}) s ON s.identity=p.identity
               LEFT JOIN paper_feedback f ON f.identity=p.identity WHERE {where}""",
               tuple([active["profile_hash"]]+parameters))["count"]
@@ -469,7 +433,7 @@ def create_app(config_path: Path) -> FastAPI:
             next_query=urllib.parse.urlencode({**base_params,"page_no":page_no+1})
             return templates.TemplateResponse(request,"library.html",context(request,"library",papers=paper_rows,
                 q=q,interest=interest,reading=reading,favorite=favorite,sort=sort,page_no=page_no,total=count,
-                has_next=offset+limit<count,previous_query=previous_query,next_query=next_query,pdf_papers=pdf_papers))
+                has_next=offset+limit<count,previous_query=previous_query,next_query=next_query))
         finally: db.close()
 
     def render_sources(
@@ -482,10 +446,22 @@ def create_app(config_path: Path) -> FastAPI:
             ) x ON x.source=sr.source AND x.finished_at=sr.finished_at""")}
             items=[]
             coverage=source_coverage(db_path,config.get("sources",[]))
+            official_counts={item["source_name"]:dict(item) for item in rows(db,"""SELECT source_name,
+              COUNT(*) issue_count,MAX(checked_at) last_checked_at,
+              SUM(article_count) article_count
+              FROM official_issue_checks WHERE status='succeeded' GROUP BY source_name""")}
+            official_latest={item["source_name"]:dict(item) for item in rows(db,"""SELECT * FROM (
+              SELECT source_name,issue_key,status,detail,checked_at,
+              ROW_NUMBER() OVER(PARTITION BY source_name ORDER BY checked_at DESC) rank
+              FROM official_issue_checks
+            ) WHERE rank=1""")}
             for source in config.get("sources",[]):
-                items.append({**source,"latest":latest.get(source["name"]),"coverage":coverage.get(source["name"],{})})
+                items.append({**source,"latest":latest.get(source["name"]),
+                    "coverage":coverage.get(source["name"],{}),
+                    "official_check":official_counts.get(source["name"]),
+                    "official_latest":official_latest.get(source["name"])})
             return templates.TemplateResponse(request,"sources.html",context(request,"sources",sources=items,
-                quality=governance_stats(db_path,float(config.get("relevance_threshold",0.62)))))
+                quality=governance_stats(db_path,float(config.get("relevance_threshold",0.70)))))
         finally: db.close()
 
     @app.get("/sources", response_class=HTMLResponse)
@@ -503,6 +479,13 @@ def create_app(config_path: Path) -> FastAPI:
             return JSONResponse({"error":str(exc),"retryable":True},status_code=503)
         configured=config.get("sources",[])
         for candidate in candidates:
+            probe={
+                "name":candidate.get("name",""), "type":candidate.get("config_type",""),
+                "issn":candidate.get("issn",""), "openalex_id":candidate.get("openalex_id",""),
+            }
+            official=resolve_official_source(probe)
+            candidate["official_status"]="verified" if official else "api_fallback"
+            candidate["official_provider"]=official.get("provider","") if official else ""
             candidate["added"]=any(
                 item.get("name","").casefold()==candidate.get("name","").casefold()
                 or (candidate.get("issn") and item.get("issn")==candidate.get("issn"))
@@ -520,7 +503,7 @@ def create_app(config_path: Path) -> FastAPI:
             return JSONResponse({"error":"候选已过期，请重新搜索"},status_code=409)
         source_data={"name":candidate.get("name",""),"type":candidate.get("config_type",""),
                      "issn":candidate.get("issn",""),"openalex_id":candidate.get("openalex_id","")}
-        source=normalize_source(source_data)
+        source=configure_official_source(normalize_source(source_data))
         if any(
             item.get("name","").casefold()==source["name"].casefold()
             or (source.get("issn") and item.get("issn")==source.get("issn"))
@@ -569,10 +552,12 @@ def create_app(config_path: Path) -> FastAPI:
     def profile(request: Request) -> HTMLResponse:
         db=connect(db_path)
         try:
-            versions=rows(db,"SELECT * FROM profile_versions ORDER BY created_at DESC,id DESC")
+            versions=rows(db,"""SELECT * FROM profile_versions
+              WHERE NOT (source='feedback-ai' AND status='superseded')
+              ORDER BY created_at DESC,id DESC""")
             active=next((item for item in versions if item["status"]=="active"),None)
             return templates.TemplateResponse(request,"profile.html",context(request,"profile",versions=versions,
-                active=active,profile_prompt=profile_assistant_prompt()))
+                active=active,profile_review=pending_profile_review(db_path)))
         finally: db.close()
 
     @app.post("/profile/draft")
@@ -585,6 +570,12 @@ def create_app(config_path: Path) -> FastAPI:
     async def profile_confirm(request: Request) -> RedirectResponse:
         data=await form_data(request); validate_csrf(data)
         confirm_profile(db_path,int(data["version_id"]),state/config["profile_file"])
+        return RedirectResponse("/profile",303)
+
+    @app.post("/profile/dismiss")
+    async def profile_dismiss(request: Request) -> RedirectResponse:
+        data=await form_data(request); validate_csrf(data)
+        dismiss_profile_suggestion(db_path,int(data["version_id"]))
         return RedirectResponse("/profile",303)
 
     @app.get("/feedback", response_class=HTMLResponse)
@@ -616,6 +607,24 @@ def create_app(config_path: Path) -> FastAPI:
                      data.get("reading_status","unread"))
         return RedirectResponse(safe_return(data.get("return_to"),"/library"),303)
 
+    @app.post("/api/feedback")
+    async def feedback_api(request: Request) -> JSONResponse:
+        validate_json_csrf(request); data=await json_data(request)
+        interest=data.get("interest") or None
+        result=set_feedback(
+            db_path,
+            str(data.get("identity", "")),
+            interest,
+            str(data.get("reason", "")),
+            bool(data.get("favorite")),
+            str(data.get("reading_status", "unread")),
+        )
+        labels={"interested":"已完成 · 感兴趣", "not_interested":"已完成 · 不感兴趣"}
+        return JSONResponse({"ok":True,"interest":result["interest"],"favorite":bool(result["favorite"]),
+                             "reading_status":result["reading_status"],
+                             "status_label":labels.get(result["interest"], ""),
+                             "message":labels.get(result["interest"], "反馈已保存")})
+
     @app.post("/feedback/clear")
     async def remove_feedback(request: Request) -> RedirectResponse:
         data=await form_data(request); validate_csrf(data)
@@ -638,83 +647,62 @@ def create_app(config_path: Path) -> FastAPI:
         import_fulltext(db_path,state,data["identity"],filename,content)
         return RedirectResponse(safe_return(data.get("return_to"),"/library"),303)
 
-    @app.post("/api/tasks/enrich")
-    async def task_enrich(request: Request) -> JSONResponse:
-        validate_json_csrf(request); data=await json_data(request)
-        retry=bool(data.get("retry"))
-        task_id=launch_task("ui_abstract_enrichment",lambda: enrich_abstracts(
-            db_path,config,limit=500,retry=retry,include_type_unknown=True
-        ))
-        return JSONResponse({"task_id":task_id,"status":"running","message":"摘要补全已在后台开始"},status_code=202)
-
-    @app.post("/api/tasks/export")
-    async def task_export(request: Request) -> JSONResponse:
-        validate_json_csrf(request); await json_data(request)
-        def worker() -> dict[str,Any]:
-            runner=monitor_runner_path(state)
-            completed=subprocess.run(
-                [sys.executable,str(runner),"agent-export","--config",str(config_path)],
-                capture_output=True,text=True,timeout=1800,
-            )
-            if completed.returncode not in {0,1}:
-                raise RuntimeError((completed.stderr or completed.stdout or "建立队列失败")[-800:])
-            payload=json.loads(completed.stdout)
-            payload["status"]="partial" if completed.returncode==1 else "succeeded"
-            payload["next_step"]="复制下方 Codex 任务提示词，完成整份队列判断后原子导入"
-            return payload
-        task_id=launch_task("ui_agent_export",worker)
-        return JSONResponse({"task_id":task_id,"status":"running","message":"正在采集并建立 Codex 队列"},status_code=202)
-
-    @app.post("/api/tasks/recheck")
-    async def task_recheck(request: Request) -> JSONResponse:
-        validate_json_csrf(request); await json_data(request)
-        verification=verify_installation(config_path)
-        return JSONResponse({"ok":verification["ok"],"checks":verification["checks"],
-                             "quality":verification["governance"]})
-
-    @app.get("/api/tasks/{task_id}")
-    def task_status_api(task_id: str) -> JSONResponse:
-        database=connect(db_path)
-        try:
-            item=row(database,"SELECT * FROM task_runs WHERE task_id=?",(task_id,))
-            if item and item["status"]=="running" and item["task_type"]=="ui_abstract_enrichment":
-                child=row(database,"""SELECT * FROM task_runs WHERE task_type='abstract_enrichment'
-                  AND status='running' ORDER BY created_at DESC LIMIT 1""")
-                if child:
-                    item["total_count"]=child["total_count"]
-                    item["completed_count"]=child["completed_count"]
-                    item["success_count"]=child["success_count"]
-                    item["failure_count"]=child["failure_count"]
-                    item["message"]=child["message"]
-        finally: database.close()
-        if not item: return JSONResponse({"error":"任务不存在"},status_code=404)
-        try: item["details"]=json.loads(item.get("details_json") or "{}")
-        except json.JSONDecodeError: item["details"]={}
-        return JSONResponse(item)
-
-    @app.post("/api/tasks/missing-package")
-    async def missing_package(request: Request) -> JSONResponse:
-        validate_json_csrf(request); await json_data(request)
-        output=state/"manual-abstracts"/f"missing-abstracts-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-        return JSONResponse(export_missing_task_package(db_path,output))
-
     @app.get("/status", response_class=HTMLResponse)
     def status(request: Request) -> HTMLResponse:
         db=connect(db_path)
         try:
-            runs=rows(db,"SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT 30")
-            jobs=rows(db,"SELECT * FROM agent_jobs ORDER BY created_at DESC LIMIT 30")
-            source_runs=rows(db,"SELECT * FROM source_runs ORDER BY finished_at DESC LIMIT 50")
             tasks=rows(db,"SELECT * FROM task_runs ORDER BY created_at DESC LIMIT 10")
             db_state=database_status(db_path)
             verification=verify_installation(config_path)
-            return templates.TemplateResponse(request,"status.html",context(request,"status",runs=runs,jobs=jobs,
-                source_runs=source_runs,tasks=tasks,db_state=db_state,quality=verification["governance"],
-                checks=verification["checks"],recommendations=verification["recommendations"],
-                service=verification["service"],codex_prompt=(
-                    "在此项目中读取 SKILL.md、完整研究画像和最新 agent_queue JSON；逐项按画像和反馈判断，"
-                    "输出相同 run_id/profile_hash 的严格 results JSON，并运行 agent-import 原子导入。"
-                )))
+            check_order={"error":0,"warning":1}
+            checks=sorted(
+                (check for check in verification["checks"] if check["name"] != "schema_version"),
+                key=lambda check: (check["ok"], check_order.get(check["level"], 2), check["name"]),
+            )
+            source_checks=[check for check in checks if check["name"] in {
+                "source_coverage","source_runs","source_degradation",
+                "official_issue_coverage","official_issue_failures",
+            }]
+            missing_abstracts=int(verification["governance"]["missing_abstracts"])
+            pending_semantic=next((check for check in checks if check["name"] == "semantic_coverage"), None)
+            situations=[]
+            if missing_abstracts:
+                situations.append(f"正式文献库仍缺 {missing_abstracts} 篇摘要")
+            if any(not check["ok"] for check in source_checks):
+                situations.append("部分监测来源尚未成功更新")
+            else:
+                situations.append("所有已配置来源都有运行记录")
+            if pending_semantic and not pending_semantic["ok"]:
+                situations.append("有论文尚未完成相关性判断")
+            else:
+                situations.append("现有可筛选论文均已完成相关性判断")
+            update_summary="当前："+"；".join(situations)+"。点击“更新数据库”复制针对这些情况生成的 Codex 任务。"
+            prompt_steps=[
+                "请更新“个人学术助手”的本地数据库，并在完成后报告结果。不要使用独立模型 API。",
+                "1. 阅读此项目的 SKILL.md 与 references/profile-guidance.md，遵守完整队列、原子导入和私有数据边界。",
+                f"2. 阅读研究兴趣：{state / str(config.get('profile_file', 'research-profile.md'))}。",
+                "3. 当前诊断："+"；".join(situations)+"。",
+            ]
+            if missing_abstracts:
+                prompt_steps.append(
+                    f"4. 先运行：academic-radar abstracts enrich --config {config_path} --retry。只保存可追溯的原始摘要，不生成或改写摘要。"
+                )
+            else:
+                prompt_steps.append("4. 当前没有已识别的缺失摘要；跳过摘要补全，继续更新来源。")
+            prompt_steps.extend([
+                f"5. 运行：python3 {monitor_runner_path(state)} collect-only --config {config_path}。记录返回的 run_id；这一步只执行所有来源的 14 天 API 采集。",
+                f"6. 运行：academic-radar official plan --config {config_path} --output {state / 'official' / 'plan-latest.json'}。按计划逐个打开出版商官网，只核验截至计划日期已经出版的最近两期；未来卷期不能占用两期名额。逐篇复制官网明确标注的完整原始摘要，按 DOI 去重，再用 official import 先预览、后 --apply 原子导入。已成功核验的相同卷期可以跳过；官网无法访问或尚无适配时保留 14 天 API 结果并报告来源。",
+                f"7. 再运行摘要补全，并执行 academic-radar profile review --db {db_path}。只有发现未审阅的新反馈时才提出完整画像建议并保存；没有必要修改时用 profile no-change 记录结论，不能静默改动已激活画像。",
+                f"8. 运行：python3 {monitor_runner_path(state)} agent-export --config {config_path} --no-collect --batch-run <第 5 步 run_id>。它会把本轮 API 与官网新增论文合并为同一份待判断清单。",
+                f"9. 阅读 {state / 'agent_queue'} 中最新的 JSON 队列。逐篇按已激活研究兴趣和反馈判断；每篇必须恰好有一条结果。",
+                "10. 将严格 results JSON 保存到 agent-results 目录，保留队列的 run_id、profile_hash、source_failures，"
+                "并为每篇提供 identity、relevant、score、reasons、matched_themes、confidence。即使队列为空，也写入覆盖完整队列的空 results 数组。",
+                f"11. 运行：python3 {monitor_runner_path(state)} agent-import --config {config_path} --results <结果 JSON 路径>。",
+                f"12. 最后运行：academic-radar verify --config {config_path}，报告 API 采集数、官网卷期与论文数、补全摘要数、判断数、达到 70 分的入选论文、来源失败和仍需处理的项目。",
+            ])
+            return templates.TemplateResponse(request,"status.html",context(request,"status",tasks=tasks,
+                db_state=db_state,quality=verification["governance"],
+                checks=checks,update_summary=update_summary,update_prompt="\n\n".join(prompt_steps)))
         finally: db.close()
 
     return app

@@ -1,12 +1,12 @@
 {% extends "base.html" %}
-{% block title %}来源配置 · 个人学术雷达{% endblock %}
+{% block title %}监测来源 · 个人学术助手{% endblock %}
 {% block content %}
-<header class="page-head"><div><p class="kicker">SOURCES · {{ sources|length }} WATCHED</p><h1>来源配置</h1><p>搜索经过元数据服务验证的期刊或会议；移除只停止未来监测，不动历史数据。</p></div><span class="run-badge"><span></span>正式库摘要 {{ quality.abstract_percent }}%</span></header>
+<header class="page-head"><div><p class="kicker">SOURCES · {{ sources|length }} WATCHED</p><h1>监测来源</h1><p>在这里添加想持续关注的期刊或会议。系统会保留历史论文；停止监测不会删除已有数据。</p></div><span class="run-badge"><span></span>推荐论文摘要 {{ quality.abstract_percent }}%</span></header>
 <section class="panel source-search" data-source-search>
   <div class="panel-head"><h2>查找并添加来源</h2><span>输入至少 2 个字符后自动搜索</span></div>
   <label for="source-query">期刊或会议名称</label>
-  <div class="combobox-wrap"><input id="source-query" type="search" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="source-results" placeholder="例如：ACM CHI 或 Management Science"><span class="spinner" data-source-spinner hidden>搜索中…</span></div>
-  <p class="form-status" data-source-status aria-live="polite">候选会显示类型、出版方、ISSN、OpenAlex ID 与匹配依据。</p>
+  <div class="combobox-wrap"><input id="source-query" type="search" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="source-results" placeholder="Management Science 或 International Journal of Human-Computer Interaction"><span class="spinner" data-source-spinner hidden>搜索中…</span></div>
+  <p class="form-status" data-source-status aria-live="polite">输入完整名称后，系统会核对期刊标识和官网采集方式。</p>
   <div id="source-results" class="candidate-list" role="listbox" hidden></div>
 </section>
 <div class="source-grid compact-sources">
@@ -15,12 +15,15 @@
     <div class="source-top"><span>{{ '会议' if source.type in ('crossref-query','openalex') and not source.issn else '期刊' }}</span><span>{{ source.latest.finished_at|human_time if source.latest else '尚未运行' }}</span></div>
     <h2>{{ source.name }}</h2>
     <dl>
-      <div><dt>最近新增</dt><dd>{{ source.latest.count if source.latest else 0 }} 篇</dd></div>
+      <div><dt>上次 API 收到</dt><dd>{{ source.latest.count if source.latest else 0 }} 篇</dd></div>
       <div><dt>摘要覆盖</dt><dd>{{ source.coverage.abstract_percent or 0 }}%</dd></div>
       <div><dt>已记录</dt><dd>{{ source.coverage.paper_count or 0 }} 篇</dd></div>
+      <div><dt>官网已核验</dt><dd>{% if source.official_check %}{{ source.official_check.issue_count }} 期 · {{ source.official_check.article_count }} 篇{% elif source.official_status == 'verified' or source.official_issues_url %}等待首次核验{% else %}暂不适用{% endif %}</dd></div>
       <div><dt>标识</dt><dd>{{ source.issn or source.openalex_id or source.query_container or '—' }}</dd></div>
+      <div><dt>官网采集</dt><dd>{% if source.official_status == 'verified' or source.official_issues_url %}{{ source.official_provider or '已验证' }}{% else %}API 过渡，待适配{% endif %}</dd></div>
     </dl>
     {% if source.latest and source.latest.error %}<details class="minor-details"><summary>查看最近异常</summary><p class="warning">{{ source.latest.error }}</p></details>{% endif %}
+    {% if source.official_latest and source.official_latest.status == 'failed' %}<details class="minor-details"><summary>官网核验待重试</summary><p class="warning">{{ source.official_latest.issue_key }}：{{ source.official_latest.detail }}</p></details>{% endif %}
     <button type="button" class="danger-link" data-remove-source data-name="{{ source.name }}">移除来源</button>
   </article>
 {% endfor %}

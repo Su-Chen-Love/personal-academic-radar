@@ -1,8 +1,8 @@
-# Personal Academic Radar
+# Personal Academic Assistant
 
 [![Tests](https://github.com/Su-Chen-Love/personal-academic-radar/actions/workflows/test.yml/badge.svg)](https://github.com/Su-Chen-Love/personal-academic-radar/actions/workflows/test.yml)
 
-Personal Academic Radar 是面向单个研究者的本地优先文献雷达。代码可以公开；配置、研究画像、SQLite、反馈、队列、摘要结果、日志和 PDF 始终保存在私有状态目录，默认是 `~/.local/share/personal-academic-radar`。
+Personal Academic Assistant 是面向单个研究者的本地优先文献助手。代码可以公开；配置、研究兴趣、SQLite、反馈、队列、摘要结果、日志和 PDF 始终保存在私有状态目录，默认是 `~/.local/share/personal-academic-radar`。
 
 语义判断只使用 Codex 宿主的“导出队列 → 判断 → 原子导入”流程，不需要也不支持独立模型 API。摘要只从可追溯元数据或官方论文页获取，绝不生成或改写后冒充原始摘要。
 
@@ -25,29 +25,51 @@ Linux 和 Windows 会完成初始化与验证，但 v0.8.0 不自动安装后台
 
 ## 六个页面
 
-- 今日雷达：最近一次成功导入中新入选的论文，默认只显示紧凑推荐信息。
-- 文献库：只显示出版类型合格且达到当前阈值的论文，支持排序、筛选、收藏和统一 PDF 导入。
-- 来源：实时搜索并预览可验证的期刊/会议来源，支持安全添加和移除。
-- 研究画像：画像草稿、明确激活、版本回滚和 Codex 本地辅助提示词。
-- 反馈：编辑兴趣、理由、收藏和阅读状态；历史审计不作为用户模块展示。
-- 运行状态：直接启动摘要补全、采集/建队列、状态复查和失败任务重试。
+- 今日推荐：最近一次成功导入中新入选的论文，默认只显示紧凑推荐信息。
+- 我的文献：只显示出版类型合格且达到当前阈值的论文，支持排序、筛选、收藏和在对应论文卡片中导入 PDF。
+- 监测来源：实时搜索并预览可验证的期刊/会议来源，支持安全添加和移除。
+- 研究兴趣：当前画像、反馈触发的更新建议和版本回退/切换；系统不会替用户生成固定提示词。
+- 偏好反馈：编辑兴趣、理由、收藏和阅读状态；历史审计不作为用户模块展示。
+- 更新与检查：根据当前缺口生成一份可交给 Codex 的完整更新任务。
 
 所有用户可见筛选都排除 Editorial、Corrigendum、Extended Abstract 等非正式研究内容，以及低于相关性阈值的记录。被排除记录只在内部保留最小身份和审计证据，避免反复抓取。
 
 ## 每日 Codex 流程
 
-每天一次的本地 Codex 自动任务应依次：采集论文、补全真实摘要、治理出版类型、导出待判断队列、使用完整画像与反馈判断全部队列、原子导入并报告结果。核心命令为：
+每天一次的本地 Codex 自动任务先以 14 天窗口调用元数据 API，再按已验证映射核验每种期刊截至当天已经出版的最近两期。确定性流程覆盖 Springer Nature、Taylor & Francis、IEEE Xplore、ACM Digital Library 与 SAGE；摘要按官网原文、出版商提交的 Crossref 完整摘要、DOI 精确匹配的 OpenAlex 完整摘要顺序回退并保留 provenance。ScienceDirect 与 INFORMS 使用官网卷期页批量展开摘要并逐篇补漏。所有结果先严格预览、去重并原子导入；搜索片段、Highlights 或生成式改写不会被当作摘要。之后才按需检查画像反馈、建立一次冻结队列、逐篇判断并原子导入结果。核心命令为：
 
 ```bash
-python scripts/paper_monitor.py agent-export \
+python scripts/paper_monitor.py collect-only \
   --config ~/.local/share/personal-academic-radar/config.toml
+
+academic-radar official plan \
+  --config ~/.local/share/personal-academic-radar/config.toml \
+  --output ~/.local/share/personal-academic-radar/official/plan-latest.json
+
+academic-radar official collect-supported \
+  --config ~/.local/share/personal-academic-radar/config.toml \
+  --output ~/.local/share/personal-academic-radar/official/supported-latest.json
+
+# 按计划完成官网核验并生成严格 JSON 后：
+academic-radar official import \
+  --config ~/.local/share/personal-academic-radar/config.toml \
+  --file /path/to/official-results.json
+academic-radar official import \
+  --config ~/.local/share/personal-academic-radar/config.toml \
+  --file /path/to/official-results.json --apply
+
+python scripts/paper_monitor.py agent-export \
+  --config ~/.local/share/personal-academic-radar/config.toml \
+  --no-collect --batch-run <collect-only 返回的 run_id>
 
 python scripts/paper_monitor.py agent-import \
   --config ~/.local/share/personal-academic-radar/config.toml \
   --results ~/.local/share/personal-academic-radar/agent-results/<results.json>
 ```
 
-队列与结果必须覆盖相同的全部 identity；画像哈希、反馈快照、运行编号或来源失败信息不一致时，导入会整体拒绝。
+官网卷期导入要求同一期中的研究论文具有完整官网摘要，Editorial 等非研究内容可无摘要并由治理规则排除。队列与结果必须覆盖相同的全部 identity；画像哈希、反馈快照、运行编号或来源失败信息不一致时，导入会整体拒绝。我的文献只显示相关性分数大于或等于 0.70 的论文，低分记录留在内部用于去重和审计。
+
+确定性官网适配器会直接读取出版商的卷期目录与论文结构化元数据；尚需浏览器的出版商继续逐篇核验。受阻卷期使用 `academic-radar official fail` 留下可恢复的失败证据，并可用 `academic-radar official status` 查看，不会把不完整卷期伪装成成功。
 
 ## 摘要补全与人工证据
 
@@ -60,7 +82,7 @@ academic-radar abstracts export-missing \
   --output missing-abstracts.json
 ```
 
-自动流程依次复用同 DOI 本地记录，并访问 Crossref、OpenAlex、Semantic Scholar、Europe PMC、PubMed 和出版商结构化元数据。每次尝试都记录来源、URL、时间和失败原因；失败项可从运行状态页重试。人工导入接受严格 JSON/CSV 证据包，并校验 identity、URL、重复项和明显截断内容。
+自动流程依次复用同 DOI 本地记录，并访问 Crossref、OpenAlex、Semantic Scholar、Europe PMC、PubMed 和出版商结构化元数据。每次尝试都记录来源、URL、时间和失败原因；缺失项会反映在“更新与检查”的 Codex 任务中。人工导入接受严格 JSON/CSV 证据包，并校验 identity、URL、重复项和明显截断内容。
 
 ## 清洗、备份与恢复
 

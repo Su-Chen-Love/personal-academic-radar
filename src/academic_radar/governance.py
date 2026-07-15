@@ -146,7 +146,7 @@ def source_kind_from_evidence(value: str) -> str:
     return ""
 
 
-def governance_stats(db_path: Path, threshold: float = 0.62) -> dict[str, Any]:
+def governance_stats(db_path: Path, threshold: float = 0.70) -> dict[str, Any]:
     db = connect(db_path)
     try:
         total = int(db.execute("SELECT COUNT(*) FROM papers").fetchone()[0])

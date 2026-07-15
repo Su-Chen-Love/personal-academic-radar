@@ -12,7 +12,6 @@ from academic_radar.product import (
     import_fulltext,
     initialize_installation,
     migrate_legacy_model_config,
-    profile_assistant_prompt,
     source_candidates,
     source_coverage,
 )
@@ -195,6 +194,7 @@ class ProductTests(unittest.TestCase):
                 )
                 db.execute("INSERT INTO observations VALUES('doi:10.1/x','Journal','now')")
                 db.execute("INSERT INTO observations VALUES('doi:10.1/x','Journal / OpenAlex','now')")
+                db.execute("INSERT INTO observations VALUES('doi:10.1/x','Journal / Official volume 12','now')")
             db.close()
 
             coverage = source_coverage(db_path, [{"name": "Journal"}])["Journal"]
@@ -203,11 +203,28 @@ class ProductTests(unittest.TestCase):
             self.assertEqual(coverage["abstract_count"], 1)
             self.assertEqual(coverage["abstract_percent"], 100.0)
 
-    def test_profile_prompt_documents_local_ai_boundary(self):
-        prompt = profile_assistant_prompt()
-        self.assertIn("不要堆关键词", prompt)
-        self.assertIn("Relevance boundaries", prompt)
+    def test_source_coverage_counts_official_issue_observations(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "papers.sqlite3"
+            upgrade_database(db_path)
+            db = connect(db_path)
+            with db:
+                for suffix in ("x", "y"):
+                    db.execute(
+                        """INSERT INTO papers(
+                        identity,doi,title,abstract,venue,published,url,authors_json,first_seen,updated_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (f"doi:10.1/{suffix}", f"10.1/{suffix}", suffix, "Abstract", "Journal",
+                         "2026-01-01", "", "[]", "now", "now"),
+                    )
+                db.execute("INSERT INTO observations VALUES('doi:10.1/x','Journal / Official volume 12','now')")
+                db.execute("INSERT INTO observations VALUES('doi:10.1/y','Journal / OpenAlex','now')")
+            db.close()
 
+            coverage = source_coverage(db_path, [{"name": "Journal"}])["Journal"]
+
+            self.assertEqual(coverage["paper_count"], 2)
+            self.assertEqual(coverage["abstract_count"], 2)
 
 if __name__ == "__main__":
     unittest.main()
