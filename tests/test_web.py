@@ -264,6 +264,7 @@ class WebTests(unittest.TestCase):
             saved = db.execute("SELECT stored_path,original_name FROM fulltext_files").fetchone()
             self.assertEqual(saved["original_name"], "paper.pdf")
             self.assertTrue(Path(saved["stored_path"]).exists())
+            self.assertTrue(Path(saved["stored_path"]).name.startswith("作者未知_2026_A useful paper"))
             db.close()
 
     def test_library_sort_filters_pagination_and_pdf_entry_render_together(self):
@@ -279,6 +280,9 @@ class WebTests(unittest.TestCase):
             self.assertEqual(response.text.count('action="/fulltext"'), 1)
             self.assertNotIn('id="pdf-dialog"', response.text)
             self.assertIn("data-inline-pdf-form", response.text)
+            self.assertIn('data-has-fulltext="false"', response.text)
+            self.assertIn('data-inline-pdf-submit hidden', response.text)
+            self.assertNotIn("查看 PDF", response.text)
             self.assertNotIn("data-abstract-toggle", response.text)
 
     def test_library_defaults_to_interested_papers(self):
@@ -294,6 +298,28 @@ class WebTests(unittest.TestCase):
             self.assertNotIn("A useful paper", before.text)
             self.assertIn("A useful paper", after.text)
             self.assertIn("A useful paper", all_interest.text)
+
+    def test_fulltext_opens_directly_in_the_browser(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            app, _, _ = self.make_app(root)
+            boundary = "----radar"
+            body = (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"csrf_token\"\r\n\r\n{app.state.csrf_token}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"identity\"\r\n\r\ndoi:10.1/test\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"pdf\"; filename=\"paper.pdf\"\r\n"
+                "Content-Type: application/pdf\r\n\r\n%PDF-1.4 test\r\n"
+                f"--{boundary}--\r\n"
+            ).encode("utf-8")
+            with TestClient(app) as client:
+                client.post("/fulltext", content=body, headers={"content-type": f"multipart/form-data; boundary={boundary}"})
+                page = client.get("/library?reading=&interest=")
+                file_response = client.get("/fulltext/file?identity=doi:10.1/test")
+            self.assertIn("查看 PDF", page.text)
+            self.assertIn("/fulltext/file?identity=doi%3A10.1/test", page.text)
+            self.assertIn('data-has-fulltext="true"', page.text)
+            self.assertEqual(file_response.headers["content-type"], "application/pdf")
+            self.assertIn("inline", file_response.headers["content-disposition"])
 
     def test_favorite_api_is_independent_and_immediate(self):
         with tempfile.TemporaryDirectory() as td:

@@ -99,6 +99,7 @@
       name.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} MB`;
       name.hidden = false;
       submit.hidden = false;
+      submit.textContent = form.dataset.hasFulltext === "true" ? "更新上传" : "确认上传";
       trigger.textContent = "重新选择 PDF";
     });
   });

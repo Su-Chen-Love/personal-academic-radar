@@ -302,6 +302,29 @@ def safe_slug(value: str, fallback: str = "paper") -> str:
     return (slug[:80] or fallback).strip("-")
 
 
+def _filename_component(value: str, fallback: str, limit: int) -> str:
+    """Keep readable Unicode names while removing filesystem-reserved characters."""
+
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", value or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return (cleaned[:limit].strip(" .") or fallback)
+
+
+def fulltext_filename(paper: Any) -> str:
+    """Build the stable, human-readable local name: author + year + title."""
+
+    try:
+        authors = json.loads(paper["authors_json"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        authors = []
+    author_names = [_filename_component(str(name), "", 42) for name in authors if str(name).strip()]
+    author_label = "、".join(author_names[:3]) + ("等" if len(author_names) > 3 else "")
+    year_match = re.search(r"\b(\d{4})\b", str(paper["published"] or ""))
+    year = year_match.group(1) if year_match else "年份未知"
+    title = _filename_component(str(paper["title"] or ""), "未命名文献", 150)
+    return f"{_filename_component(author_label, '作者未知', 90)}_{year}_{title}.pdf"
+
+
 def import_fulltext(db_path: Path, state_dir: Path, identity: str, original_name: str, content: bytes) -> dict[str, Any]:
     if not content.startswith(b"%PDF"):
         raise ValueError("文件不是有效的 PDF，请重新选择")
@@ -313,31 +336,12 @@ def import_fulltext(db_path: Path, state_dir: Path, identity: str, original_name
         if not paper:
             raise ValueError(f"Unknown paper identity: {identity}")
         digest = hashlib.sha256(content).hexdigest()
-        existing = db.execute(
-            "SELECT * FROM fulltext_files WHERE identity=? AND sha256=?", (identity, digest)
-        ).fetchone()
+        existing = db.execute("""SELECT * FROM fulltext_files WHERE identity=? AND sha256=?
+          ORDER BY imported_at DESC,id DESC LIMIT 1""", (identity, digest)).fetchone()
         if existing:
-            return dict(existing) | {"deduplicated": True}
-        shared = db.execute(
-            "SELECT * FROM fulltext_files WHERE sha256=? ORDER BY imported_at LIMIT 1", (digest,)
-        ).fetchone()
-        if shared:
-            now = utc_now()
-            with db:
-                db.execute(
-                    """INSERT INTO fulltext_files(
-                    identity,stored_path,original_name,sha256,size_bytes,imported_at
-                    ) VALUES(?,?,?,?,?,?)""",
-                    (identity, shared["stored_path"], original_name or "paper.pdf", digest, len(content), now),
-                )
-            linked = db.execute(
-                "SELECT * FROM fulltext_files WHERE identity=? AND sha256=?", (identity, digest)
-            ).fetchone()
-            return dict(linked) | {"deduplicated": True, "reused_file": True}
-        year = (paper["published"] or "unknown")[:4] if paper["published"] else "unknown"
-        title = safe_slug(paper["title"])
-        short_hash = digest[:12]
-        filename = f"{year}-{title}-{short_hash}.pdf"
+            return dict(existing) | {"deduplicated": True, "updated": False}
+        prior = db.execute("SELECT * FROM fulltext_files WHERE identity=?", (identity,)).fetchall()
+        filename = fulltext_filename(paper)
         directory = state_dir.expanduser().resolve() / "fulltexts"
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / filename
@@ -352,13 +356,23 @@ def import_fulltext(db_path: Path, state_dir: Path, identity: str, original_name
             Path(temp_name).unlink(missing_ok=True)
         now = utc_now()
         with db:
+            db.execute("DELETE FROM fulltext_files WHERE identity=?", (identity,))
             db.execute(
                 """INSERT INTO fulltext_files(identity,stored_path,original_name,sha256,size_bytes,imported_at)
                 VALUES(?,?,?,?,?,?)""",
                 (identity, str(target), original_name or "paper.pdf", digest, len(content), now),
             )
-        row = db.execute("SELECT * FROM fulltext_files WHERE sha256=?", (digest,)).fetchone()
-        return dict(row) | {"deduplicated": False}
+        for item in prior:
+            old_path = Path(item["stored_path"])
+            if old_path == target:
+                continue
+            still_referenced = db.execute(
+                "SELECT 1 FROM fulltext_files WHERE stored_path=? LIMIT 1", (str(old_path),)
+            ).fetchone()
+            if not still_referenced:
+                old_path.unlink(missing_ok=True)
+        row = db.execute("SELECT * FROM fulltext_files WHERE identity=?", (identity,)).fetchone()
+        return dict(row) | {"deduplicated": False, "updated": bool(prior)}
     finally:
         db.close()
 

@@ -23,7 +23,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.9/3.10
     import tomli as tomllib  # type: ignore
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -370,7 +370,9 @@ def create_app(config_path: Path) -> FastAPI:
             papers = rows(db, """SELECT p.*,s.score,s.reasons,s.confidence,s.screened_at,s.themes_json,
               f.interest,f.reason AS feedback_reason,COALESCE(f.favorite,0) favorite,
               COALESCE(f.reading_status,'unread') reading_status,
-              (SELECT COUNT(*) FROM fulltext_files ft WHERE ft.identity=p.identity) fulltext_count
+              EXISTS(SELECT 1 FROM fulltext_files ft WHERE ft.identity=p.identity) fulltext_count,
+              (SELECT ft.id FROM fulltext_files ft WHERE ft.identity=p.identity
+                ORDER BY ft.imported_at DESC,ft.id DESC LIMIT 1) fulltext_id
               FROM run_papers rp JOIN papers p ON p.identity=rp.identity
               JOIN screenings s ON s.identity=p.identity AND s.run_id=rp.run_id AND s.provider='codex-agent'
               LEFT JOIN paper_feedback f ON f.identity=p.identity
@@ -420,7 +422,9 @@ def create_app(config_path: Path) -> FastAPI:
               FROM screenings s WHERE s.profile_hash=?) WHERE rn=1"""
             query=f"""SELECT p.*,s.score,s.relevant,s.reasons,f.interest,f.reason AS feedback_reason,
               COALESCE(f.favorite,0) favorite,COALESCE(f.reading_status,'unread') reading_status,
-              (SELECT COUNT(*) FROM fulltext_files ft WHERE ft.identity=p.identity) fulltext_count
+              EXISTS(SELECT 1 FROM fulltext_files ft WHERE ft.identity=p.identity) fulltext_count,
+              (SELECT ft.id FROM fulltext_files ft WHERE ft.identity=p.identity
+                ORDER BY ft.imported_at DESC,ft.id DESC LIMIT 1) fulltext_id
               FROM papers p JOIN ({latest}) s ON s.identity=p.identity
               LEFT JOIN paper_feedback f ON f.identity=p.identity WHERE {where}
               ORDER BY {order_by} LIMIT ? OFFSET ?"""
@@ -646,6 +650,29 @@ def create_app(config_path: Path) -> FastAPI:
             raise ValueError("请选择 PDF 文件")
         import_fulltext(db_path,state,data["identity"],filename,content)
         return RedirectResponse(safe_return(data.get("return_to"),"/library"),303)
+
+    def current_fulltext(identity: str) -> dict[str, Any]:
+        database = connect(db_path)
+        try:
+            file = row(database, """SELECT * FROM fulltext_files WHERE identity=?
+              ORDER BY imported_at DESC,id DESC LIMIT 1""", (identity,))
+        finally:
+            database.close()
+        if not file:
+            raise HTTPException(404, "尚未导入这篇文献的全文 PDF")
+        path = Path(file["stored_path"]).resolve()
+        fulltext_root = (state / "fulltexts").resolve()
+        if fulltext_root not in path.parents or not path.is_file():
+            raise HTTPException(404, "已记录的全文文件不可用")
+        return file
+
+    @app.get("/fulltext/file")
+    def fulltext_file(identity: str) -> FileResponse:
+        file = current_fulltext(identity)
+        return FileResponse(
+            file["stored_path"], media_type="application/pdf", filename=Path(file["stored_path"]).name,
+            content_disposition_type="inline",
+        )
 
     @app.get("/status", response_class=HTMLResponse)
     def status(request: Request) -> HTMLResponse:

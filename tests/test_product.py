@@ -137,7 +137,7 @@ class ProductTests(unittest.TestCase):
             self.assertTrue(second["deduplicated"])
             self.assertTrue(Path(first["stored_path"]).exists())
 
-    def test_import_fulltext_reuses_file_and_binds_each_paper(self):
+    def test_import_fulltext_keeps_a_readable_name_for_each_paper(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             db_path = root / "papers.sqlite3"
@@ -157,10 +157,34 @@ class ProductTests(unittest.TestCase):
             first = import_fulltext(db_path, root, "doi:10.1/a", "a.pdf", b"%PDF shared")
             second = import_fulltext(db_path, root, "doi:10.1/b", "b.pdf", b"%PDF shared")
 
-            self.assertTrue(second["deduplicated"])
-            self.assertEqual(first["stored_path"], second["stored_path"])
+            self.assertFalse(second["deduplicated"])
+            self.assertNotEqual(first["stored_path"], second["stored_path"])
+            self.assertTrue(Path(second["stored_path"]).name.startswith("作者未知_2026_Paper b"))
             db = connect(db_path)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM fulltext_files").fetchone()[0], 2)
+            db.close()
+
+    def test_import_fulltext_updates_the_current_file_and_keeps_one_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "papers.sqlite3"
+            upgrade_database(db_path)
+            db = connect(db_path)
+            with db:
+                db.execute(
+                    """INSERT INTO papers(identity,doi,title,abstract,venue,published,url,authors_json,first_seen,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    ("doi:10.1/update", "10.1/update", "A / Precise: Paper", "", "V", "2026-01-01", "u",
+                     '["Doe, Jane", "Smith, John"]', "now", "now"),
+                )
+            db.close()
+            first = import_fulltext(db_path, root, "doi:10.1/update", "first.pdf", b"%PDF first")
+            updated = import_fulltext(db_path, root, "doi:10.1/update", "second.pdf", b"%PDF second")
+            self.assertTrue(updated["updated"])
+            self.assertIn("Doe, Jane、Smith, John_2026_A Precise Paper.pdf", Path(updated["stored_path"]).name)
+            self.assertEqual(Path(updated["stored_path"]).read_bytes(), b"%PDF second")
+            db = connect(db_path)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM fulltext_files WHERE identity='doi:10.1/update'").fetchone()[0], 1)
             db.close()
 
     def test_source_candidates_merges_crossref_and_openalex(self):
