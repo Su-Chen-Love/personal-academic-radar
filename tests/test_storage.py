@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from academic_radar.storage import (
+    LEGACY_MIGRATION_CHECKSUMS,
     backup_database,
     database_status,
     latest_schema_version,
@@ -101,6 +102,22 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], before)
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
             db.close()
+
+    def test_known_legacy_migration_checksum_is_accepted(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "legacy-checksum.sqlite3"
+            upgrade_database(db_path)
+            db = sqlite3.connect(db_path)
+            db.execute(
+                "UPDATE schema_migrations SET checksum=? WHERE version=10",
+                (next(iter(LEGACY_MIGRATION_CHECKSUMS[10])),),
+            )
+            db.commit()
+            db.close()
+
+            result = upgrade_database(db_path)
+
+            self.assertEqual(result["applied"], [])
 
     def test_backup_restore_and_pre_restore_preservation(self):
         with tempfile.TemporaryDirectory() as td:

@@ -16,6 +16,14 @@ from pathlib import Path
 
 MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 
+# Migration 010 briefly shipped before its companion removal migration.  Some
+# private databases therefore contain its original checksum even though the
+# table no longer exists.  Keep accepting that immutable historical checksum
+# when checking already-applied migrations.
+LEGACY_MIGRATION_CHECKSUMS = {
+    10: frozenset({"49187075335ce3352a091b373f3a68f0ded96d6cc94cc08ea8e06a94679f6e57"}),
+}
+
 
 @dataclass(frozen=True)
 class Migration:
@@ -123,7 +131,8 @@ def upgrade_database(path: Path) -> dict[str, object]:
             raise RuntimeError(f"Database has unknown future migrations: {unknown}")
         for version, row in applied.items():
             migration = known[version]
-            if row["checksum"] != migration.checksum:
+            accepted_checksums = {migration.checksum, *LEGACY_MIGRATION_CHECKSUMS.get(version, ())}
+            if row["checksum"] not in accepted_checksums:
                 raise RuntimeError(f"Migration {version:03d} checksum has changed")
 
         newly_applied: list[int] = []
