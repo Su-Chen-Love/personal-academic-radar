@@ -63,9 +63,13 @@ class WebTests(unittest.TestCase):
                     self.assertEqual(response.status_code, 200, path)
                     self.assertIn("个人学术助手", response.text)
                     self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
+                    self.assertIn('rel="icon" type="image/png"', response.text)
                     if path == "/":
-                        self.assertIn("app.js?v=0.8.2", response.text)
+                        self.assertIn("app.js?v=0.8.3", response.text)
                         self.assertEqual(response.text.count('class="nav-icon"'), 6)
+                favicon = client.get("/static/images/academic-radar-logo.png")
+                self.assertEqual(favicon.status_code, 200)
+                self.assertEqual(favicon.headers["content-type"], "image/png")
                 self.assertTrue(client.get("/healthz").json()["ok"])
 
     def test_sources_show_completed_official_issue_count(self):
