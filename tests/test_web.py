@@ -285,19 +285,20 @@ class WebTests(unittest.TestCase):
             self.assertNotIn("查看 PDF", response.text)
             self.assertNotIn("data-abstract-toggle", response.text)
 
-    def test_library_defaults_to_interested_papers(self):
+    def test_library_defaults_to_all_interests_and_reading_statuses(self):
         with tempfile.TemporaryDirectory() as td:
             app, _, _ = self.make_app(Path(td))
             with TestClient(app) as client:
                 before = client.get("/library")
                 client.post("/feedback", data={"csrf_token": app.state.csrf_token, "identity": "doi:10.1/test",
-                                                 "interest": "interested", "reason": "Fits the project",
-                                                 "reading_status": "unread"})
+                                                 "reading_status": "read_later"})
                 after = client.get("/library")
-                all_interest = client.get("/library?interest=")
-            self.assertNotIn("A useful paper", before.text)
+                all_reading = client.get("/library?reading=")
+            self.assertIn('value="" selected>全部兴趣', before.text)
+            self.assertIn('value="" selected>全部阅读状态', before.text)
+            self.assertIn("A useful paper", before.text)
             self.assertIn("A useful paper", after.text)
-            self.assertIn("A useful paper", all_interest.text)
+            self.assertIn("A useful paper", all_reading.text)
 
     def test_fulltext_opens_directly_in_the_browser(self):
         with tempfile.TemporaryDirectory() as td:
@@ -431,6 +432,7 @@ class WebTests(unittest.TestCase):
                 response=client.get("/feedback?interest=interested")
             self.assertIn("查看与编辑",response.text)
             self.assertIn("清除当前反馈",response.text)
+            self.assertNotIn("打开原文",response.text)
             self.assertNotIn("变更历史",response.text)
 
     def test_source_search_assets_support_debounce_keyboard_and_no_page_post(self):

@@ -393,7 +393,7 @@ def create_app(config_path: Path) -> FastAPI:
             db.close()
 
     @app.get("/library", response_class=HTMLResponse)
-    def library(request: Request, q: str = "", interest: str = "interested", reading: str = "", favorite: str = "",
+    def library(request: Request, q: str = "", interest: str = "", reading: str = "", favorite: str = "",
                 sort: str = "score_desc", page_no: int = 1) -> HTMLResponse:
         page_no=max(1,page_no); limit=24; offset=(page_no-1)*limit
         clauses=["p.eligibility_status='eligible'","s.score>=?"]; parameters: list[Any]=[float(config.get("relevance_threshold",0.70))]
