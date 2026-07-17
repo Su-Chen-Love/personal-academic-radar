@@ -138,6 +138,26 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(db.execute("select abstract_source from papers").fetchone()[0],"metadata")
             self.assertEqual(db.execute("select count(*) from observations").fetchone()[0],2)
 
+    def test_provider_upsert_reuses_title_only_manual_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=pm.db_open(Path(td)/"x.sqlite3")
+            manual_identity=pm.identity("","Preference-aware route planning")
+            db.execute("""INSERT INTO papers(
+              identity,title,abstract,venue,authors_json,first_seen,updated_at,manual_citation,
+              eligibility_status,needs_rescreen
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+              (manual_identity,"Preference-aware route planning","User abstract","Transportation Science",
+               "[]","t0","t0","Smith (2026). Preference-aware route planning. Transportation Science.",
+               "eligible",1))
+            db.commit()
+            incoming=pm.Paper("doi:10.1287/trsc.2026.9999","10.1287/trsc.2026.9999",
+              "Preference-aware route planning","Publisher abstract","Transportation Science","2026","u",[],"provider",
+              publication_type_raw="journal-article",publication_type_source="crossref")
+            self.assertFalse(pm.upsert(db,incoming,"t1")); db.commit()
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM papers").fetchone()[0],1)
+            saved=db.execute("SELECT identity,doi FROM papers").fetchone()
+            self.assertEqual(tuple(saved),(manual_identity,"10.1287/trsc.2026.9999"))
+
     def test_agent_export_skips_low_priority_papers_by_default(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); (root/"research-profile.md").write_text("profile",encoding="utf-8")
@@ -303,5 +323,42 @@ class MonitorTests(unittest.TestCase):
             profile.write_text("unconfirmed edit",encoding="utf-8")
             with self.assertRaisesRegex(ValueError,"confirmed active version"):
                 pm.agent_export(config,no_collect=True)
+
+    def test_confirmed_profile_hashes_exact_crlf_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); profile=root/"research-profile.md"
+            raw=b"# Profile\r\n\r\nHuman-AI collaboration\r\n"
+            profile.write_bytes(raw)
+            db=pm.db_open(root/"papers.sqlite3")
+            active=pm.confirmed_profile(db,profile)
+            self.assertEqual(active["profile_hash"],__import__("hashlib").sha256(raw).hexdigest())
+            self.assertEqual(active["content"].encode("utf-8"),raw)
+            db.close()
+
+    def test_retried_collection_keeps_papers_new_since_previous_import(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/"research-profile.md").write_text("profile",encoding="utf-8")
+            config=root/"config.toml"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "A"\ntype = "crossref"\nissn = "1234"\n',encoding="utf-8")
+            db=pm.db_open(root/"papers.sqlite3")
+            active=pm.confirmed_profile(db,root/"research-profile.md")
+            db.execute("""INSERT INTO agent_jobs(run_id,profile_hash,status,exported_count,imported_count,
+              created_at,imported_at,profile_version_id,feedback_snapshot_json)
+              VALUES('prior',?,'imported',0,0,'2026-07-16T00:00:00+00:00','2026-07-16T00:10:00+00:00',?,'[]')""",
+              (active["profile_hash"],active["id"]))
+            paper=pm.Paper("doi:10.1/new","10.1/new","New paper","Abstract","A","2026-07-17","u",[],"A",
+                           publication_type_raw="journal-article",publication_type_source="crossref")
+            pm.upsert(db,paper,"2026-07-17T00:02:00+00:00")
+            db.execute("""INSERT INTO pipeline_runs(run_id,kind,status,started_at,collected_count,candidate_count,
+              relevant_count,details_json) VALUES('retry','collection','succeeded','2026-07-17T00:03:00+00:00',1,0,0,'{}')""")
+            db.commit(); db.close()
+            with patch("builtins.print") as output:
+                pm.agent_export(config,no_collect=True,batch_run="retry")
+            summary=json.loads(output.call_args.args[0])
+            db=pm.db_open(root/"papers.sqlite3")
+            roles={row[0] for row in db.execute("SELECT role FROM run_papers WHERE run_id=? AND identity=?",
+                                                (summary["run_id"],paper.identity))}
+            db.close()
+            self.assertIn("new",roles)
 
 if __name__ == "__main__": unittest.main()

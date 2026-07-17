@@ -12,10 +12,10 @@ PROJECT_SRC=Path(__file__).resolve().parents[1]/"src"
 if PROJECT_SRC.exists() and str(PROJECT_SRC) not in sys.path: sys.path.insert(0,str(PROJECT_SRC))
 from academic_radar.enrichment import enrich_abstracts as run_enrichment
 from academic_radar.governance import publication_decision
-from academic_radar.product import abstract_source_for, classify_low_priority
+from academic_radar.product import abstract_source_for, classify_low_priority, manual_identity_for_title
 from academic_radar.storage import latest_schema_version, upgrade_database
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 try:
     import tomllib
@@ -301,6 +301,13 @@ def extract_json(text: str) -> dict[str,Any]:
 
 def upsert(db: sqlite3.Connection, p: Paper, now: str) -> bool:
     exists=db.execute("SELECT 1 FROM papers WHERE identity=?",(p.identity,)).fetchone() is not None
+    if not exists and p.doi:
+        # A Google Scholar APA citation does not always include a DOI.  Keep
+        # the title-hash identity stable when a later provider resolves that
+        # same manually added paper, instead of creating a second row.
+        manual_identity=manual_identity_for_title(db,p.title)
+        if manual_identity:
+            p.identity=manual_identity; exists=True
     if not p.low_priority:
         p.low_priority,p.low_priority_reason=classify_low_priority(p.title,p.venue)
     p.abstract_source=abstract_source_for(p.abstract,p.abstract_source)
@@ -378,7 +385,10 @@ def row_to_paper(row: sqlite3.Row) -> Paper:
       row["publication_type"] if "publication_type" in row.keys() else "")
 
 def confirmed_profile(db: sqlite3.Connection, profile_path: Path) -> sqlite3.Row:
-    content=profile_path.read_text(encoding="utf-8"); digest=hashlib.sha256(content.encode()).hexdigest()
+    # Hash the exact bytes written at profile confirmation. ``read_text``
+    # performs universal-newline conversion and would otherwise make a valid
+    # CRLF profile appear different on the next scheduled run.
+    raw=profile_path.read_bytes(); content=raw.decode("utf-8"); digest=hashlib.sha256(raw).hexdigest()
     active=db.execute("SELECT * FROM profile_versions WHERE status='active'").fetchone()
     if not active:
         now=dt.datetime.now(dt.timezone.utc).isoformat()
@@ -527,7 +537,17 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
                 raise ValueError(f"Unknown collection batch: {batch_run}")
             details=json.loads(batch["details_json"] or "{}")
             failures=list(details.get("source_failures") or [])
-            fresh=db.execute("SELECT * FROM papers WHERE first_seen>=? ORDER BY first_seen",(batch["started_at"],)).fetchall()
+            previous=db.execute(
+                """SELECT imported_at FROM agent_jobs WHERE status='imported' AND imported_at<?
+                ORDER BY imported_at DESC LIMIT 1""", (batch["started_at"],)
+            ).fetchone()
+            # Use the previous completed judgment as the daily boundary.  This
+            # keeps genuinely new papers visible even if collection is retried
+            # before the one authoritative export is frozen.
+            if previous and previous["imported_at"]:
+                fresh=db.execute("SELECT * FROM papers WHERE first_seen>? ORDER BY first_seen",(previous["imported_at"],)).fetchall()
+            else:
+                fresh=db.execute("SELECT * FROM papers WHERE first_seen>=? ORDER BY first_seen",(batch["started_at"],)).fetchall()
             collected=[row_to_paper(row) for row in fresh]
             new=list(collected)
     else:

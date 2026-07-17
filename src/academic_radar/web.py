@@ -41,6 +41,7 @@ from .official import configure_official_source, resolve_official_source
 from .operations import verify_installation
 from .product import (
     MAX_PDF_BYTES,
+    add_manual_paper,
     human_time,
     import_fulltext,
     initialize_installation,
@@ -556,7 +557,9 @@ def create_app(config_path: Path) -> FastAPI:
     def profile(request: Request) -> HTMLResponse:
         db=connect(db_path)
         try:
-            versions=rows(db,"""SELECT * FROM profile_versions
+            versions=rows(db,"""SELECT profile_versions.*,
+              ROW_NUMBER() OVER (ORDER BY created_at,id) AS version_number
+              FROM profile_versions
               WHERE NOT (source='feedback-ai' AND status='superseded')
               ORDER BY created_at DESC,id DESC""")
             active=next((item for item in versions if item["status"]=="active"),None)
@@ -641,6 +644,24 @@ def create_app(config_path: Path) -> FastAPI:
         result=set_favorite(db_path,str(data.get("identity","")),bool(data.get("favorite")))
         return JSONResponse({"ok":True,"favorite":bool(result["favorite"]),
                              "message":"已收藏到本地文献库" if result["favorite"] else "已取消收藏"})
+
+    @app.post("/api/papers/manual")
+    async def manual_paper_api(request: Request) -> JSONResponse:
+        validate_json_csrf(request); data=await json_data(request)
+        try:
+            result=add_manual_paper(db_path,str(data.get("apa_citation","")),str(data.get("abstract","")))
+        except ValueError as exc:
+            return JSONResponse({"error":str(exc)},status_code=400)
+        if result["created"]:
+            message=f"已添加《{result['title']}》，将在下次更新中自动评分"
+            status_code=201
+        elif result["abstract_updated"]:
+            message=f"文献已存在；已补充摘要并安排重新评分：《{result['title']}》"
+            status_code=200
+        else:
+            message=f"文献已存在，未创建重复条目：《{result['title']}》"
+            status_code=200
+        return JSONResponse({"ok":True,"message":message,**result},status_code=status_code)
 
     @app.post("/fulltext")
     async def upload_fulltext(request: Request) -> RedirectResponse:

@@ -35,6 +35,7 @@ PROVIDER_LABELS = {
 MANUAL_EVIDENCE_TYPES = {
     "crossref_metadata", "openalex_metadata", "semantic_scholar_record",
     "europe_pmc_record", "pubmed_record", "publisher_metadata", "official_page",
+    "author_manuscript",
 }
 
 

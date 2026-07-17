@@ -46,6 +46,7 @@ class GovernanceEnrichmentTests(unittest.TestCase):
     def test_negative_title_evidence_overrules_generic_article_type(self):
         for title in (
             "Editorial Board",
+            "Prelim p. 2; First issue - Editorial Board",
             "Extended Abstract: Study",
             "Corrigendum to Study",
             "A Commentary on a Research Article",
@@ -62,6 +63,8 @@ class GovernanceEnrichmentTests(unittest.TestCase):
     def test_specific_publisher_type_overrules_generic_crossref_article(self):
         result=publication_decision("A title","Journal","Correspondence","publisher-official","journal")
         self.assertEqual((result["publication_type"],result["eligibility_status"]),("Letter","excluded"))
+        result=publication_decision("A research highlight","Journal","News & Views","publisher-official","journal")
+        self.assertEqual((result["publication_type"],result["eligibility_status"]),("News","excluded"))
 
     def test_publisher_description_is_not_misrepresented_as_abstract(self):
         class Client:

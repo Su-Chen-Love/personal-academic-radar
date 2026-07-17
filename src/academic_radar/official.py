@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .governance import publication_decision
+from .product import manual_identity_for_title
 from .storage import connect, upgrade_database, utc_now
 
 
@@ -71,6 +72,16 @@ OFFICIAL_SOURCE_REGISTRY: dict[str, dict[str, str]] = {
         "provider": "Taylor & Francis",
         "issues_url": "https://www.tandfonline.com/loi/hhci20",
         "feed_url": "https://www.tandfonline.com/action/showFeed?type=etoc&feed=rss&jc=hhci20",
+    },
+    "0377-2217": {
+        "provider": "Elsevier ScienceDirect",
+        "issues_url": "https://www.sciencedirect.com/journal/european-journal-of-operational-research/issues",
+        "feed_url": "https://rss.sciencedirect.com/publication/science/03772217",
+    },
+    "0041-1655": {
+        "provider": "INFORMS PubsOnline",
+        "issues_url": "https://pubsonline.informs.org/loi/trsc",
+        "feed_url": "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=trsc",
     },
 }
 
@@ -263,6 +274,11 @@ def _metadata_issue_url(spec: dict[str, Any], volume: str, issue: str) -> str:
     if provider == "IEEE Xplore":
         separator = "&" if "?" in spec["issues_url"] else "?"
         return f'{spec["issues_url"]}{separator}volume={urllib.parse.quote(volume)}&issue={urllib.parse.quote(issue)}'
+    if provider == "Elsevier ScienceDirect":
+        return spec["issues_url"].removesuffix("/issues") + f"/vol/{urllib.parse.quote(volume)}/issue/{urllib.parse.quote(issue)}"
+    if provider == "INFORMS PubsOnline":
+        code = urllib.parse.urlparse(spec["issues_url"]).path.rstrip("/").split("/")[-1]
+        return f"https://pubsonline.informs.org/toc/{code}/{urllib.parse.quote(volume)}/{urllib.parse.quote(issue)}"
     raise ValueError(f"{provider} 尚未配置元数据卷期 URL 规则")
 
 
@@ -277,6 +293,13 @@ def _metadata_article_url(spec: dict[str, Any], doi: str) -> str:
     if provider == "IEEE Xplore":
         number = doi.rsplit(".", 1)[-1]
         return f"https://ieeexplore.ieee.org/document/{number}"
+    if provider == "Elsevier ScienceDirect":
+        # ScienceDirect article URLs are PII-based. The metadata collector
+        # replaces this resolver fallback when Elsevier exposes a PII; the
+        # official import validator deliberately never accepts the fallback.
+        return f"https://doi.org/{doi}"
+    if provider == "INFORMS PubsOnline":
+        return f"https://pubsonline.informs.org/doi/{doi}"
     raise ValueError(f"{provider} 尚未配置论文 URL 规则")
 
 
@@ -315,7 +338,7 @@ def _collect_print_metadata_source(
             "type:journal-article"
         ),
         "rows": "1000",
-        "select": "DOI,title,abstract,published-print,volume,issue,author,URL,type,publisher,resource",
+        "select": "DOI,title,abstract,published-print,volume,issue,author,URL,type,publisher,resource,link",
     })
     crossref_url = f"https://api.crossref.org/journals/{issn}/works?{query}"
     response = _fetch_json(crossref_url).get("message")
@@ -367,6 +390,13 @@ def _collect_print_metadata_source(
                 if name:
                     authors.append(name)
         article_url = _metadata_article_url(spec, doi)
+        if spec["provider"] == "Elsevier ScienceDirect":
+            for link in record.get("link") or []:
+                candidate = str(link.get("URL") or "") if isinstance(link, dict) else ""
+                match = re.search(r"/PII:([^?/#]+)", candidate, flags=re.IGNORECASE)
+                if match:
+                    article_url = f"https://www.sciencedirect.com/science/article/pii/{match.group(1)}"
+                    break
         resource = record.get("resource")
         if isinstance(resource, dict) and isinstance(resource.get("primary"), dict):
             candidate_url = str(resource["primary"].get("URL") or "").strip()
@@ -385,6 +415,13 @@ def _collect_print_metadata_source(
                 "abstract_evidence_url": evidence_url,
                 "abstract_evidence_type": evidence_type,
             } if abstract else {}),
+            **({
+                "abstract_unavailable_traceable": True,
+                "abstract_failure_reason": (
+                    "Crossref publisher metadata and the exact-DOI OpenAlex record "
+                    "did not expose a complete abstract at collection time"
+                ),
+            } if not abstract else {}),
         }
 
     output_issues: list[dict[str, Any]] = []
@@ -549,7 +586,8 @@ def collect_supported_official(
         source = configured[item["source_name"]]
         if item["provider"] not in {
             "Springer Nature", "Taylor & Francis", "IEEE Xplore",
-            "ACM Digital Library", "SAGE Journals",
+            "ACM Digital Library", "SAGE Journals", "Elsevier ScienceDirect",
+            "INFORMS PubsOnline",
         }:
             unsupported.append({
                 "source_name": item["source_name"],
@@ -858,9 +896,17 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
             for issue in preview["accepted"]:
                 imported = 0
                 for paper in issue["papers"]:
+                    paper_identity = paper["identity"]
                     existing = db.execute(
-                        "SELECT abstract FROM papers WHERE identity=?", (paper["identity"],)
+                        "SELECT abstract FROM papers WHERE identity=?", (paper_identity,)
                     ).fetchone()
+                    if not existing and paper.get("doi"):
+                        manual_identity = manual_identity_for_title(db, paper["title"])
+                        if manual_identity:
+                            paper_identity = manual_identity
+                            existing = db.execute(
+                                "SELECT abstract FROM papers WHERE identity=?", (paper_identity,)
+                            ).fetchone()
                     prior_abstract = (existing["abstract"] or "") if existing else ""
                     decision = paper["decision"]
                     publisher_metadata = (
@@ -901,7 +947,7 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                         eligibility_status=excluded.eligibility_status,exclusion_reason=excluded.exclusion_reason,
                         needs_rescreen=CASE WHEN length(excluded.abstract)>length(COALESCE(papers.abstract,'')) THEN 1 ELSE papers.needs_rescreen END""",
                         (
-                            paper["identity"], paper["doi"], paper["title"], paper["abstract"],
+                            paper_identity, paper["doi"], paper["title"], paper["abstract"],
                             issue["source_name"], paper["published"], paper["url"],
                             json.dumps(paper["authors"], ensure_ascii=False), now, now,
                             abstract_source, 0, None,
@@ -918,7 +964,7 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                     observation = issue["source_name"] + " / Official issue " + issue["issue_key"]
                     db.execute(
                         "INSERT OR IGNORE INTO observations(identity,source,observed_at) VALUES(?,?,?)",
-                        (paper["identity"], observation, now),
+                        (paper_identity, observation, now),
                     )
                     if paper["abstract"]:
                         attempt_provider = (
@@ -935,7 +981,7 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                             task_id,identity,provider,status,source_url,evidence_type,detail,attempted_at
                             ) VALUES('official-issue-import',?,?, 'found',?,?,?,?)""",
                             (
-                                paper["identity"], attempt_provider, abstract_source_url,
+                                paper_identity, attempt_provider, abstract_source_url,
                                 paper.get("abstract_evidence_type") or "official_page",
                                 issue["issue_key"], now,
                             ),
@@ -946,7 +992,7 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                             task_id,identity,provider,status,source_url,evidence_type,detail,attempted_at
                             ) VALUES('official-issue-import',?,'official','not_found',?,'official_page',?,?)""",
                             (
-                                paper["identity"], paper["url"],
+                                paper_identity, paper["url"],
                                 paper.get("abstract_failure_reason") or "官网明确未提供摘要", now,
                             ),
                         )
@@ -956,7 +1002,7 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                             task_id,identity,provider,status,source_url,evidence_type,detail,attempted_at
                             ) VALUES('official-issue-import',?,'official','not_found',?,'verified_metadata_gap',?,?)""",
                             (
-                                paper["identity"], paper["url"],
+                                paper_identity, paper["url"],
                                 paper.get("abstract_failure_reason") or "摘要暂不可得", now,
                             ),
                         )
