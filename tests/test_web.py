@@ -14,7 +14,7 @@ try:
 except ModuleNotFoundError:  # Allows core tests without optional web dependencies.
     TestClient = None
 
-from academic_radar.engagement import seed_active_profile
+from academic_radar.engagement import create_profile_draft, seed_active_profile
 from academic_radar.storage import connect, upgrade_database
 
 
@@ -65,7 +65,7 @@ class WebTests(unittest.TestCase):
                     self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
                     self.assertIn('rel="icon" type="image/png"', response.text)
                     if path == "/":
-                        self.assertIn("app.js?v=0.8.3", response.text)
+                        self.assertIn("app.js?v=0.9.0", response.text)
                         self.assertEqual(response.text.count('class="nav-icon"'), 6)
                 favicon = client.get("/static/images/academic-radar-logo.png")
                 self.assertEqual(favicon.status_code, 200)
@@ -156,8 +156,26 @@ class WebTests(unittest.TestCase):
                     data={"csrf_token": app.state.csrf_token, "version_id": str(draft_id)},
                     follow_redirects=False,
                 )
-                self.assertEqual(response.status_code, 303)
-                self.assertEqual(profile_file.read_text(), "revised profile")
+            self.assertEqual(response.status_code, 303)
+            self.assertEqual(profile_file.read_text(), "revised profile")
+
+    def test_profile_version_labels_stay_contiguous_when_a_record_was_deleted(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            create_profile_draft(db_path, "temporary profile", "Temporary change", "feedback-ai")
+            db = connect(db_path)
+            with db:
+                db.execute("DELETE FROM profile_versions WHERE profile_hash=?", (hashlib.sha256(b"temporary profile").hexdigest(),))
+            db.close()
+            second = create_profile_draft(db_path, "second profile", "Second change")
+            self.assertEqual(second["id"], 3)
+
+            with TestClient(app) as client:
+                page = client.get("/profile")
+
+            self.assertIn("当前 v1", page.text)
+            self.assertIn("<strong>v2</strong>", page.text)
+            self.assertNotIn("<strong>v3</strong>", page.text)
 
     def test_direct_profile_assistant_is_removed(self):
         with tempfile.TemporaryDirectory() as td:
@@ -190,7 +208,7 @@ class WebTests(unittest.TestCase):
                 client.post("/profile/confirm", data={"csrf_token": app.state.csrf_token,
                                                        "version_id": str(second_id)})
                 page = client.get("/profile")
-                self.assertIn(f"切换回 v{original_id}", page.text)
+                self.assertIn("切换回 v1", page.text)
                 response = client.post(
                     "/profile/confirm",
                     data={"csrf_token": app.state.csrf_token, "version_id": str(original_id)},
@@ -303,6 +321,82 @@ class WebTests(unittest.TestCase):
             self.assertIn("A useful paper", before.text)
             self.assertIn("A useful paper", after.text)
             self.assertIn("A useful paper", all_reading.text)
+
+    def test_manual_paper_addition_is_simple_deduplicated_and_queued(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            citation = (
+                "Smith, J. A., & Doe, B. (2026). Human-guided optimization for vehicle routing. "
+                "Transportation Science, 60(3), 1–15. https://doi.org/10.1287/trsc.2026.1234"
+            )
+            abstract = (
+                "We study an interactive vehicle-routing system in which decision makers express "
+                "contextual preferences and revise candidate routes while an optimization algorithm searches."
+            )
+            with TestClient(app) as client:
+                library = client.get("/library")
+                self.assertIn("添加文献", library.text)
+                self.assertIn('id="manual-paper-dialog"', library.text)
+                denied = client.post("/api/papers/manual", json={"apa_citation": citation, "abstract": abstract})
+                self.assertEqual(denied.status_code, 403)
+                headers = {"X-CSRF-Token": app.state.csrf_token}
+                created = client.post(
+                    "/api/papers/manual", json={"apa_citation": citation, "abstract": abstract}, headers=headers,
+                )
+                repeated = client.post(
+                    "/api/papers/manual", json={"apa_citation": citation, "abstract": abstract}, headers=headers,
+                )
+            self.assertEqual(created.status_code, 201)
+            self.assertTrue(created.json()["created"])
+            self.assertEqual(repeated.status_code, 200)
+            self.assertFalse(repeated.json()["created"])
+            db = connect(db_path)
+            paper = db.execute("""SELECT doi,title,venue,abstract_source,eligibility_status,
+              needs_rescreen,manual_citation FROM papers WHERE doi='10.1287/trsc.2026.1234'""").fetchone()
+            count = db.execute("SELECT COUNT(*) FROM papers WHERE doi='10.1287/trsc.2026.1234'").fetchone()[0]
+            observation = db.execute(
+                "SELECT COUNT(*) FROM observations WHERE identity='doi:10.1287/trsc.2026.1234' AND source='manual-apa'"
+            ).fetchone()[0]
+            db.close()
+            self.assertEqual(count, 1)
+            self.assertEqual(observation, 1)
+            self.assertEqual(paper["title"], "Human-guided optimization for vehicle routing")
+            self.assertEqual(paper["venue"], "Transportation Science")
+            self.assertEqual(paper["abstract_source"], "user-provided")
+            self.assertEqual((paper["eligibility_status"], paper["needs_rescreen"]), ("eligible", 1))
+            self.assertEqual(paper["manual_citation"], citation)
+
+    def test_manual_paper_validation_returns_a_plain_json_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, _, _ = self.make_app(Path(td))
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/papers/manual", json={"apa_citation": "too short", "abstract": "also short"},
+                    headers={"X-CSRF-Token": app.state.csrf_token},
+                )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("APA 引用过短", response.json()["error"])
+
+    def test_title_only_manual_paper_absorbs_a_later_doi_without_duplication(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            without_doi = "Smith, J. A. (2026). Preference-aware route planning. Transportation Science, 60(4), 1–12."
+            with_doi = without_doi + " https://doi.org/10.1287/trsc.2026.9999"
+            abstract = (
+                "This study lets dispatchers express contextual route preferences and revise candidate "
+                "solutions while an optimization system searches for feasible vehicle routes."
+            )
+            headers = {"X-CSRF-Token": app.state.csrf_token}
+            with TestClient(app) as client:
+                first = client.post("/api/papers/manual", json={"apa_citation": without_doi, "abstract": abstract}, headers=headers)
+                second = client.post("/api/papers/manual", json={"apa_citation": with_doi, "abstract": abstract}, headers=headers)
+            self.assertEqual((first.status_code, second.status_code), (201, 200))
+            db = connect(db_path)
+            rows = db.execute("SELECT identity,doi FROM papers WHERE title='Preference-aware route planning'").fetchall()
+            db.close()
+            self.assertEqual(len(rows), 1)
+            self.assertTrue(rows[0]["identity"].startswith("title:"))
+            self.assertEqual(rows[0]["doi"], "10.1287/trsc.2026.9999")
 
     def test_fulltext_opens_directly_in_the_browser(self):
         with tempfile.TemporaryDirectory() as td:

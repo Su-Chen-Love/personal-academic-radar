@@ -88,3 +88,25 @@ name = "ACM CHI Conference on Human Factors in Computing Systems"
 type = "crossref-query"
 query_container = "CHI Conference on Human Factors in Computing Systems"
 official_status = "api_fallback"
+
+[[sources]]
+name = "European Journal of Operational Research"
+type = "crossref"
+required = true
+issn = "0377-2217"
+openalex_id = "S103321696"
+official_status = "verified"
+official_provider = "Elsevier ScienceDirect"
+official_issues_url = "https://www.sciencedirect.com/journal/european-journal-of-operational-research/issues"
+official_feed_url = "https://rss.sciencedirect.com/publication/science/03772217"
+
+[[sources]]
+name = "Transportation Science"
+type = "crossref"
+required = true
+issn = "0041-1655"
+openalex_id = "S130252234"
+official_status = "verified"
+official_provider = "INFORMS PubsOnline"
+official_issues_url = "https://pubsonline.informs.org/loi/trsc"
+official_feed_url = "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=trsc"

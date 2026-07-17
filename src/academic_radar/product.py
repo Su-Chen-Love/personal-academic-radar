@@ -20,6 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 from .engagement import seed_active_profile
+from .governance import publication_decision
 from .storage import backup_database, connect, database_status, latest_schema_version, upgrade_database, utc_now
 
 
@@ -243,6 +244,153 @@ def abstract_source_for(abstract: str, current: str = "") -> str:
     if abstract:
         return current if current and current not in {"missing", "unknown"} else "metadata"
     return "missing"
+
+
+APA_YEAR_RE = re.compile(r"\((?P<year>(?:19|20)\d{2}[a-z]?|n\.d\.)\)\.?", re.IGNORECASE)
+DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+
+
+def _normalize_doi(value: str) -> str:
+    value = urllib.parse.unquote((value or "").strip().lower())
+    value = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", value)
+    return value.rstrip(".,;)]} ")
+
+
+def _normalized_paper_title(value: str) -> str:
+    return re.sub(r"[\W_]+", "", (value or "").casefold(), flags=re.UNICODE)
+
+
+def manual_identity_for_title(db: Any, title: str) -> str | None:
+    """Return the stable identity of an exact title-only manual record."""
+
+    normalized = _normalized_paper_title(title)
+    if not normalized:
+        return None
+    for candidate in db.execute(
+        """SELECT identity,title FROM papers
+        WHERE manual_citation IS NOT NULL AND identity LIKE 'title:%'"""
+    ):
+        if _normalized_paper_title(candidate["title"]) == normalized:
+            return str(candidate["identity"])
+    return None
+
+
+def parse_apa_citation(value: str) -> dict[str, Any]:
+    """Extract stable paper metadata from a Google Scholar-style APA citation."""
+
+    citation = re.sub(r"\s+", " ", value or "").strip()
+    if len(citation) < 20:
+        raise ValueError("APA 引用过短，请粘贴 Google Scholar 提供的完整引用")
+    if len(citation) > 5000:
+        raise ValueError("APA 引用超过 5000 个字符，请检查是否误粘贴了正文")
+    year_match = APA_YEAR_RE.search(citation)
+    if not year_match:
+        raise ValueError("无法识别 APA 引用中的年份，请保留类似“(2026).”的部分")
+    author_text = citation[:year_match.start()].strip().rstrip(". ")
+    remainder = citation[year_match.end():].strip()
+    separator = re.search(r"[.!?]\s+(?=\w)", remainder, flags=re.UNICODE)
+    if not separator:
+        raise ValueError("无法区分论文题名和期刊名，请粘贴完整 APA 引用")
+    title = remainder[:separator.end() - 1].strip().rstrip(".")
+    publication = remainder[separator.end():].strip()
+    venue = publication.split(",", 1)[0].strip().rstrip(".")
+    if len(title) < 5 or len(venue) < 2:
+        raise ValueError("APA 引用中的论文题名或期刊名无法可靠识别")
+    doi_match = DOI_RE.search(citation)
+    doi = _normalize_doi(doi_match.group(0)) if doi_match else ""
+    urls = re.findall(r"https?://[^\s]+", citation)
+    url = urls[-1].rstrip(".,;)]}") if urls else ("https://doi.org/" + doi if doi else "")
+    year = year_match.group("year")
+    published = year[:4] if year[:4].isdigit() else ""
+    conference = bool(re.search(r"\b(?:proceedings|conference|symposium|workshop)\b", venue, re.IGNORECASE))
+    return {
+        "citation": citation,
+        "title": title,
+        "authors": [author_text] if author_text else [],
+        "venue": venue,
+        "published": published,
+        "doi": doi,
+        "url": url,
+        "publication_type_raw": "proceedings-article" if conference else "journal-article",
+    }
+
+
+def add_manual_paper(db_path: Path, apa_citation: str, abstract: str) -> dict[str, Any]:
+    """Idempotently add a user-supplied paper and queue it for semantic screening."""
+
+    metadata = parse_apa_citation(apa_citation)
+    abstract_text = re.sub(r"\s+", " ", abstract or "").strip()
+    if len(abstract_text) < 80:
+        raise ValueError("摘要至少需要 80 个字符，请粘贴完整摘要而不是搜索片段")
+    if len(abstract_text) > 50_000:
+        raise ValueError("摘要超过 50000 个字符，请检查是否误粘贴了全文")
+    normalized_title = _normalized_paper_title(metadata["title"])
+    identity = "doi:" + metadata["doi"] if metadata["doi"] else "title:" + hashlib.sha256(normalized_title.encode()).hexdigest()
+    now = utc_now()
+    db = connect(db_path)
+    try:
+        existing = db.execute("SELECT * FROM papers WHERE identity=?", (identity,)).fetchone()
+        if not existing:
+            for candidate in db.execute("SELECT * FROM papers"):
+                if _normalized_paper_title(candidate["title"]) == normalized_title:
+                    existing = candidate
+                    identity = candidate["identity"]
+                    break
+        if existing:
+            abstract_changed = not (existing["abstract"] or "").strip()
+            with db:
+                db.execute(
+                    """UPDATE papers SET manual_citation=COALESCE(manual_citation,?),
+                    doi=CASE WHEN COALESCE(doi,'')='' AND ?<>'' THEN ? ELSE doi END,
+                    url=CASE WHEN COALESCE(url,'')='' AND ?<>'' THEN ? ELSE url END,
+                    abstract=CASE WHEN COALESCE(abstract,'')='' THEN ? ELSE abstract END,
+                    abstract_source=CASE WHEN COALESCE(abstract,'')='' THEN 'user-provided' ELSE abstract_source END,
+                    abstract_retrieved_at=CASE WHEN COALESCE(abstract,'')='' THEN ? ELSE abstract_retrieved_at END,
+                    abstract_failure_reason=CASE WHEN COALESCE(abstract,'')='' THEN NULL ELSE abstract_failure_reason END,
+                    needs_rescreen=1,
+                    updated_at=? WHERE identity=?""",
+                    (
+                        metadata["citation"], metadata["doi"], metadata["doi"],
+                        metadata["url"], metadata["url"], abstract_text, now, now, identity,
+                    ),
+                )
+                db.execute(
+                    "INSERT OR IGNORE INTO observations(identity,source,observed_at) VALUES(?,? ,?)",
+                    (identity, "manual-apa", now),
+                )
+            return {
+                "identity": identity, "title": existing["title"], "created": False,
+                "abstract_updated": abstract_changed, "queued_for_screening": True,
+            }
+        decision = publication_decision(
+            metadata["title"], metadata["venue"], metadata["publication_type_raw"], "manual-apa",
+            "conference" if metadata["publication_type_raw"] == "proceedings-article" else "journal",
+        )
+        low_priority, low_priority_reason = classify_low_priority(metadata["title"], metadata["venue"])
+        with db:
+            db.execute(
+                """INSERT INTO papers(
+                identity,doi,title,abstract,venue,published,url,authors_json,first_seen,updated_at,
+                abstract_source,low_priority,low_priority_reason,publication_type,publication_type_raw,
+                publication_type_source,publication_type_evidence_json,eligibility_status,exclusion_reason,
+                abstract_retrieved_at,needs_rescreen,manual_citation
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    identity, metadata["doi"] or None, metadata["title"], abstract_text, metadata["venue"],
+                    metadata["published"], metadata["url"], json.dumps(metadata["authors"], ensure_ascii=False),
+                    now, now, "user-provided", int(low_priority), low_priority_reason or None,
+                    decision["publication_type"], metadata["publication_type_raw"], "manual-apa",
+                    json.dumps(decision["evidence"], ensure_ascii=False), decision["eligibility_status"],
+                    decision.get("exclusion_reason"), now, 1, metadata["citation"],
+                ),
+            )
+            db.execute(
+                "INSERT INTO observations(identity,source,observed_at) VALUES(?,?,?)",
+                (identity, "manual-apa", now),
+            )
+        return {"identity": identity, "title": metadata["title"], "created": True, "abstract_updated": True, "queued_for_screening": True}
+    finally:
+        db.close()
 
 
 def source_coverage(db_path: Path, configured_sources: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

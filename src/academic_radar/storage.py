@@ -360,8 +360,9 @@ def migrate_state(source: Path, destination: Path, merge: bool = False) -> dict[
     profile_seeded = False
     profile_path = destination / "research-profile.md"
     if profile_path.exists():
-        content = profile_path.read_text(encoding="utf-8")
-        profile_hash = hashlib.sha256(content.encode()).hexdigest()
+        profile_bytes = profile_path.read_bytes()
+        content = profile_bytes.decode("utf-8")
+        profile_hash = hashlib.sha256(profile_bytes).hexdigest()
         db = connect(destination_db)
         try:
             if not db.execute("SELECT 1 FROM profile_versions WHERE status='active'").fetchone():

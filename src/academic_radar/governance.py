@@ -33,6 +33,7 @@ RAW_TYPE_MAP = {
     "comment": ("Comment", "excluded", "评论性内容"),
     "commentary": ("Comment", "excluded", "评论性内容"),
     "news-and-views": ("News", "excluded", "新闻或评论性内容"),
+    "news-views": ("News", "excluded", "新闻或评论性内容"),
     "research-briefing": ("Comment", "excluded", "研究简报或评论性内容"),
     "news": ("News", "excluded", "新闻或公告"),
     "book-review": ("Book Review", "excluded", "书评"),
@@ -44,7 +45,7 @@ RAW_TYPE_MAP = {
 }
 
 NEGATIVE_TITLE_RULES = [
-    (r"^\s*(editorial\s+board|editorial|editor['’]s?\s+note)\b", "Editorial", "编辑性内容"),
+    (r"(?:^|[;:\-–—]\s*)\s*(editorial\s+board|editorial|editor['’]s?\s+note)\b", "Editorial", "编辑性内容"),
     (r"\bextended\s+abstracts?\b", "Extended Abstract", "扩展摘要"),
     (r"^\s*(corrigendum|correction|erratum)\b", "Correction", "更正或勘误"),
     (r"^\s*(letter\s+to\s+the\s+editor|comment\s+on)\b", "Letter", "来信或评论"),

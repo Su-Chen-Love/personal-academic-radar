@@ -20,6 +20,27 @@
     return data;
   };
 
+  document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => {
+    button.closest("dialog")?.close();
+  }));
+
+  const manualDialog = document.getElementById("manual-paper-dialog");
+  document.querySelector("[data-open-manual-paper]")?.addEventListener("click", () => manualDialog?.showModal());
+  document.querySelector("[data-manual-paper-form]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const submit = form.querySelector('button[type="submit"]');
+    const values = new FormData(form);
+    submit.disabled = true;
+    try {
+      const result = await api("/api/papers/manual", {method: "POST", body: JSON.stringify({
+        apa_citation: values.get("apa_citation"), abstract: values.get("abstract"),
+      })});
+      form.reset(); manualDialog?.close(); announce(result.message);
+    } catch (error) { announce(error.message, true); }
+    finally { submit.disabled = false; }
+  });
+
   document.querySelectorAll(".paper-details").forEach((details) => {
     const summary = details.querySelector(":scope > summary");
     details.addEventListener("toggle", () => {

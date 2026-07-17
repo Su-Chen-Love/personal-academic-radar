@@ -2,6 +2,35 @@
 
 All notable changes to Personal Academic Radar are documented here.
 
+## 0.9.0 — 2026-07-17
+
+### Added
+
+- Simple manual paper entry in “My Library” using only a Google Scholar-style
+  APA citation and the full abstract, with DOI/title deduplication and automatic
+  inclusion in the next Codex screening queue.
+- Verified official-source support for European Journal of Operational Research
+  and Transportation Science, including deterministic ScienceDirect and
+  INFORMS issue metadata adapters.
+- Wider, traceable abstract recovery evidence, including strict Google Scholar
+  audit attempts and supported author-manuscript imports without treating
+  snippets as abstracts.
+
+### Changed
+
+- Full-profile rescreen exports can reuse one completed collection boundary so
+  all API and official-issue additions remain visible as genuinely new papers.
+- Research-profile hashing now uses exact file bytes across migration, web
+  confirmation, and the daily runner, including files with CRLF line endings.
+- Manual title-only records retain a stable identity when a later provider
+  resolves their DOI, preventing duplicate papers.
+
+### Fixed
+
+- Editorial-board and news/view content are consistently excluded by
+  publication governance.
+- Profile history labels remain contiguous after dismissed/deleted drafts.
+
 ## 0.8.0 — 2026-07-14
 
 ### Added

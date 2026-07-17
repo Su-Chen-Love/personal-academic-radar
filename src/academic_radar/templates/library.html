@@ -10,6 +10,7 @@
   <label><span class="sr-only">收藏筛选</span><select name="favorite"><option value="">全部论文</option><option value="yes" {{ 'selected' if favorite == 'yes' }}>只看收藏</option></select></label>
   <label><span class="sr-only">排序方式</span><select name="sort"><option value="score_desc" {{ 'selected' if sort == 'score_desc' }}>匹配度：高到低</option><option value="score_asc" {{ 'selected' if sort == 'score_asc' }}>匹配度：低到高</option><option value="date_desc" {{ 'selected' if sort == 'date_desc' }}>发布日期：最新</option><option value="date_asc" {{ 'selected' if sort == 'date_asc' }}>发布日期：最早</option><option value="title_asc" {{ 'selected' if sort == 'title_asc' }}>标题：A–Z</option></select></label>
   <button>应用</button>
+  <button type="button" class="secondary" data-open-manual-paper>添加文献</button>
 </form>
 <div class="paper-list compact">
   {% for paper in papers %}{{ paper_card(paper, request.url.path ~ ('?' ~ request.url.query if request.url.query else ''), true) }}
@@ -20,4 +21,11 @@
   <span>第 {{ page_no }} 页</span>
   {% if has_next %}<a href="?{{ next_query }}">下一页 →</a>{% endif %}
 </nav>
+<dialog id="manual-paper-dialog" class="modal"><form class="modal-form" data-manual-paper-form>
+  <div class="panel-head"><div><h2>添加文献</h2><span>粘贴两项即可，系统会自动解析并去重</span></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭">×</button></div>
+  <label>APA 引用<textarea name="apa_citation" rows="4" maxlength="5000" required placeholder="例如：Author, A. A. (2026). Paper title. Journal Name, 12(3), 1–10. https://doi.org/..."></textarea></label>
+  <label>摘要<textarea name="abstract" rows="8" maxlength="50000" required placeholder="粘贴论文的完整摘要"></textarea></label>
+  <p class="muted">添加后会进入待判断队列，并在下一次定时更新中按当前研究兴趣评分；已有条目不会重复创建。</p>
+  <div class="dialog-actions"><button type="button" class="secondary" data-close-dialog>取消</button><button type="submit">确认添加</button></div>
+</form></dialog>
 {% endblock %}

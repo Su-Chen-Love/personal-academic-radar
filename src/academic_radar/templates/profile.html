@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}研究兴趣 · 个人学术助手{% endblock %}
 {% block content %}
-<header class="page-head"><div><p class="kicker">RESEARCH INTERESTS · VERSIONED</p><h1>研究兴趣</h1><p>系统会根据你的兴趣反馈定期检查画像是否需要调整；只有你确认采用的版本才会影响后续推荐。</p></div>{% if active %}<span class="version-pill">当前 v{{ active.id }}</span>{% endif %}</header>
+<header class="page-head"><div><p class="kicker">RESEARCH INTERESTS · VERSIONED</p><h1>研究兴趣</h1><p>系统会根据你的兴趣反馈定期检查画像是否需要调整；只有你确认采用的版本才会影响后续推荐。</p></div>{% if active %}<span class="version-pill">当前 v{{ active.version_number }}</span>{% endif %}</header>
 <section class="panel profile-recommendation">
   <div class="panel-head"><h2>推荐</h2><span>基于偏好反馈</span></div>
   {% set suggestion = profile_review.pending_suggestion %}
@@ -27,9 +27,9 @@
   </section>
   <aside class="panel version-list"><div class="panel-head"><h2>版本记录</h2><span>{{ versions|length }} 个已采用版本</span></div>
     {% for version in versions %}<article>
-      <div><strong>v{{ version.id }}</strong><span class="status {{ version.status }}">{{ version.status|status_label }}</span></div>
+      <div><strong>v{{ version.version_number }}</strong><span class="status {{ version.status }}">{{ version.status|status_label }}</span></div>
       <p>{{ version.change_summary or '无修改说明' }}</p><small>{{ version.created_at|human_time }}</small>
-      {% if version.status != 'active' %}<form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ version.id }}"><button class="secondary">{% if version.status == 'draft' %}确认并启用{% else %}切换回{% endif %} v{{ version.id }}</button></form>{% endif %}
+      {% if version.status != 'active' %}<form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ version.id }}"><button class="secondary">{% if version.status == 'draft' %}确认并启用{% else %}切换回{% endif %} v{{ version.version_number }}</button></form>{% endif %}
     </article>{% endfor %}
   </aside>
 </div>

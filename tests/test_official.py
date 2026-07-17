@@ -17,6 +17,47 @@ from academic_radar.storage import connect, upgrade_database
 
 
 class OfficialIssueTests(unittest.TestCase):
+    def test_ejor_and_transportation_science_have_verified_official_mappings(self):
+        ejor = configure_official_source({"name": "EJOR", "type": "crossref", "issn": "0377-2217"})
+        trsc = configure_official_source({"name": "Transportation Science", "type": "crossref", "issn": "0041-1655"})
+        self.assertEqual(ejor["official_provider"], "Elsevier ScienceDirect")
+        self.assertIn("european-journal-of-operational-research", ejor["official_issues_url"])
+        self.assertEqual(trsc["official_provider"], "INFORMS PubsOnline")
+        self.assertTrue(trsc["official_issues_url"].endswith("/trsc"))
+
+    @patch("academic_radar.official._fetch_json")
+    def test_sciencedirect_print_metadata_adapter_uses_latest_two_published_issues(self, fetch):
+        fetch.side_effect = [
+            {"message": {"items": [
+                {"DOI":"10.1016/j.ejor.2026.1","title":["First"],"volume":"332","issue":"1",
+                 "published-print":{"date-parts":[[2026,7,1]]},"type":"journal-article","author":[],
+                 "link":[{"URL":"https://api.elsevier.com/content/article/PII:S037722172600001X?httpAccept=text/xml"}]},
+                {"DOI":"10.1016/j.ejor.2026.2","title":["Second"],"volume":"332","issue":"2",
+                 "published-print":{"date-parts":[[2026,7,16]]},"type":"journal-article","author":[],
+                 "link":[{"URL":"https://api.elsevier.com/content/article/PII:S037722172600002X?httpAccept=text/xml"}]},
+                {"DOI":"10.1016/j.ejor.2026.3","title":["Future"],"volume":"332","issue":"3",
+                 "published-print":{"date-parts":[[2026,8,1]]},"type":"journal-article","author":[]},
+            ]}},
+            {"doi":"https://doi.org/10.1016/j.ejor.2026.2","abstract_inverted_index":{}},
+            {"doi":"https://doi.org/10.1016/j.ejor.2026.1","abstract_inverted_index":{}},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "papers.sqlite3"
+            upgrade_database(db_path)
+            output = Path(td) / "official.json"
+            result = collect_supported_official(db_path, {"sources":[{
+                "name":"European Journal of Operational Research","type":"crossref","issn":"0377-2217"
+            }]}, output)
+            issues = json.loads(output.read_text())["sources"][0]["issues"]
+        self.assertEqual((result["sources"], result["issues"], result["papers"]), (1, 2, 2))
+        self.assertEqual([item["issue_key"] for item in issues], ["volume-332-issue-2", "volume-332-issue-1"])
+        self.assertEqual(
+            issues[0]["papers"][0]["source_url"],
+            "https://www.sciencedirect.com/science/article/pii/S037722172600002X",
+        )
+        self.assertTrue(issues[0]["papers"][0]["abstract_unavailable_traceable"])
+        self.assertIn("exact-DOI OpenAlex", issues[0]["papers"][0]["abstract_failure_reason"])
+
     def test_plan_routes_verified_journal_and_api_fallback(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "papers.sqlite3"
