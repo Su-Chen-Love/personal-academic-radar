@@ -47,6 +47,14 @@ class EngagementTests(unittest.TestCase):
             self.assertEqual(examples[0]["interest"], "not_interested")
             db = connect(db_path)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT needs_rescreen FROM papers").fetchone()[0], 1)
+            db.execute("UPDATE papers SET needs_rescreen=0")
+            db.commit()
+            db.close()
+            set_feedback(db_path, "doi:10.1/example", "not_interested", "Wrong empirical setting", True, "read")
+            db = connect(db_path)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT needs_rescreen FROM papers").fetchone()[0], 0)
             db.close()
 
     def test_profile_draft_requires_explicit_confirmation(self):
@@ -107,7 +115,10 @@ class EngagementTests(unittest.TestCase):
             review = pending_profile_review(db_path)
             result = record_profile_review_no_change(db_path, review["fingerprint"], "Already excluded")
             self.assertEqual(result["status"], "no_change")
-            self.assertFalse(pending_profile_review(db_path)["needed"])
+            reviewed = pending_profile_review(db_path)
+            self.assertFalse(reviewed["needed"])
+            self.assertEqual(reviewed["latest_review"]["reason"], "Already excluded")
+            self.assertEqual(reviewed["history_count"], 1)
 
     def test_profile_review_uses_only_latest_feedback_per_paper(self):
         with tempfile.TemporaryDirectory() as td:
@@ -120,6 +131,7 @@ class EngagementTests(unittest.TestCase):
             review = pending_profile_review(db_path)
             self.assertEqual(review["feedback_count"], 1)
             self.assertEqual(review["events"][0]["reason"], "Latest reason")
+            self.assertEqual(review["feedback_history"][0]["reason"], "Latest reason")
 
 
 if __name__ == "__main__":

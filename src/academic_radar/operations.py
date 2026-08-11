@@ -247,13 +247,16 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
                 ) AND identity IN (SELECT identity FROM papers WHERE eligibility_status='eligible')"""
             ).fetchone()[0]
         )
-        semantic_ok = eligible_count == screened_count or eligible_count == 0
+        rescreen_count = int(database.execute(
+            "SELECT COUNT(*) FROM papers WHERE eligibility_status='eligible' AND needs_rescreen=1"
+        ).fetchone()[0])
+        semantic_ok = (eligible_count == screened_count and rescreen_count == 0) or eligible_count == 0
         check(
             "semantic_coverage",
             semantic_ok,
-            f"可筛选论文={eligible_count}；已判断={screened_count}",
+            f"可筛选论文={eligible_count}；已判断={screened_count}；待重评={rescreen_count}",
             "warning",
-            "运行 agent-export --no-collect/agent-import 补齐未判断论文",
+            "运行 agent-export --no-collect/agent-import 补齐未判断或待重评论文",
         )
         quality = governance_stats(db_path, float(config.get("relevance_threshold", 0.70)))
         abstract_ok = quality["abstract_percent"] >= 70 or quality["visible"] == 0

@@ -16,6 +16,12 @@
 <section class="section-head"><div><p class="kicker">CURATED TODAY</p><h2>今日推荐</h2></div><a href="/library">查看完整文献库 →</a></section>
 <div class="paper-list" data-today-list>
   {% for paper in papers %}{{ paper_card(paper, '/') }}
-  {% else %}<div class="empty"><strong>今天还没有新的入选论文</strong><p>这不一定是异常。可以到“更新与检查”确认当前情况，或浏览历史文献库。</p><a class="button" href="/status">查看更新与检查</a></div>{% endfor %}
+  {% else %}<div class="empty"><strong>今天还没有新的入选论文</strong><p>最新任务没有论文达到 70% 推荐阈值。下面保留最近一次有效推荐，避免推荐结果看起来像消失。</p><a class="button" href="/status">查看更新与检查</a></div>{% endfor %}
 </div>
+{% if not papers and recent_papers %}
+<section class="section-head historical-recommendations"><div><p class="kicker">RECENT SIGNAL</p><h2>最近一次有效推荐</h2><p>推荐日期：{{ recent_job.imported_at[:10] }}</p></div><a href="/library">查看完整文献库 →</a></section>
+<div class="paper-list" data-recent-list>
+  {% for paper in recent_papers %}{{ paper_card(paper, '/') }}{% endfor %}
+</div>
+{% endif %}
 {% endblock %}

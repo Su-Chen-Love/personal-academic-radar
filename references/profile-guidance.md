@@ -30,7 +30,7 @@ Score from 0 to 1:
 - 0.30–0.54: weak connection or venue-only match.
 - 0.00–0.29: unrelated.
 
-Require a concise reason tied to the profile. Record uncertainty when the abstract is missing. Never infer relevance solely from author, prestige, or venue.
+Require four evidence-bearing parts: what the abstract actually studies or finds, the precise profile connection, the transferable value, and the main boundary or uncertainty. Score core relevance, mechanism alignment, method transfer, and evidence quality separately, then apply a boundary penalty. Never infer relevance solely from author, prestige, or venue. A missing abstract cannot produce a recommendation above the 0.70 threshold.
 
 ## Feedback-driven profile review
 

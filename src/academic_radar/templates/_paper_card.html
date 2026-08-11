@@ -12,6 +12,8 @@
     <div class="paper-tags">
       {% if paper.publication_type %}<span class="tag">{{ paper.publication_type }}</span>{% endif %}
       {% if paper.fulltext_count %}<span class="tag">全文 {{ paper.fulltext_count }} 个</span>{% endif %}
+      {% if paper.confidence is not none %}<span class="tag">判断置信度 {{ "%.0f"|format(paper.confidence * 100) }}%</span>{% endif %}
+      {% if paper.themes_json and paper.themes_json != '[]' %}<span class="tag">{{ paper.themes_json|list_label }}</span>{% endif %}
       <span class="completion-status {{ paper.interest or 'neutral' }}" data-feedback-status {{ 'hidden' if not paper.interest }}>
         {% if paper.interest == 'interested' %}已完成 · 感兴趣{% elif paper.interest == 'not_interested' %}已完成 · 不感兴趣{% endif %}
       </span>
@@ -20,7 +22,13 @@
     <details class="paper-details">
       <summary>展开详情</summary>
       <div class="paper-detail-content">
-      {% if not paper.abstract %}<p class="warning">公开渠道暂未找到原始摘要；系统不会生成或改写摘要冒充原文。</p>{% endif %}
+      {% if not paper.abstract %}<p class="warning">公开渠道暂未找到原始摘要；系统不会生成或改写摘要冒充原文。你可以在下方粘贴从论文页核验的完整摘要。</p>
+      <form class="manual-abstract-form" data-manual-abstract-form>
+        <input type="hidden" name="identity" value="{{ paper.identity }}">
+        <label>完整摘要<textarea name="abstract" rows="6" maxlength="50000" required placeholder="粘贴论文页面明确标注的完整 Abstract"></textarea></label>
+        <label>来源链接（建议填写）<input name="source_url" type="url" value="{{ paper.url or '' }}" placeholder="https://..."></label>
+        <button type="submit">保存摘要并重新评分</button>
+      </form>{% endif %}
       <div class="abstract-wrap"><p class="abstract">{{ paper.abstract or '公开渠道未找到原始摘要。' }}</p></div>
       <dl class="paper-meta"><div><dt>作者</dt><dd>{{ paper.authors_json|authors }}</dd></div><div><dt>摘要来源</dt><dd>{{ paper.abstract_source or '未找到' }}</dd></div><div><dt>DOI</dt><dd>{{ paper.doi or '无' }}</dd></div></dl>
       {% if show_pdf %}<div class="paper-actions"><form method="post" action="/fulltext" enctype="multipart/form-data" class="pdf-inline-form" data-inline-pdf-form data-has-fulltext="{{ 'true' if paper.fulltext_id else 'false' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}#{{ paper_anchor }}"><input type="hidden" name="identity" value="{{ paper.identity }}"><input type="file" name="pdf" accept="application/pdf,.pdf" required hidden data-inline-pdf-file><button type="button" class="button secondary" data-inline-pdf-trigger>导入全文 PDF</button><span class="pdf-file-name" data-inline-pdf-name hidden></span><button type="submit" class="button" data-inline-pdf-submit hidden>确认上传</button></form>{% if paper.fulltext_id %}<a class="button secondary" href="/fulltext/file?identity={{ paper.identity|urlencode }}" target="_blank" rel="noopener">查看 PDF</a>{% endif %}</div>{% endif %}

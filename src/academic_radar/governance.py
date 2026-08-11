@@ -205,6 +205,37 @@ def governance_stats(db_path: Path, threshold: float = 0.70) -> dict[str, Any]:
         db.close()
 
 
+def recommendation_feedback_metrics(db_path: Path, threshold: float = 0.70) -> dict[str, Any]:
+    """Compare the latest recommendation with explicit user judgments."""
+
+    db = connect(db_path)
+    try:
+        latest = latest_scores_sql()
+        row = db.execute(
+            f"""SELECT COUNT(*) rated,
+            SUM(CASE WHEN f.interest='interested' THEN 1 ELSE 0 END) positive,
+            SUM(CASE WHEN f.interest='not_interested' THEN 1 ELSE 0 END) negative,
+            SUM(CASE WHEN s.score>=? AND f.interest='interested' THEN 1 ELSE 0 END) true_positive,
+            SUM(CASE WHEN s.score>=? AND f.interest='not_interested' THEN 1 ELSE 0 END) false_positive,
+            SUM(CASE WHEN s.score<? AND f.interest='interested' THEN 1 ELSE 0 END) false_negative,
+            SUM(CASE WHEN (s.score>=? AND f.interest='interested') OR
+                           (s.score<? AND f.interest='not_interested') THEN 1 ELSE 0 END) agreed
+            FROM paper_feedback f JOIN ({latest}) s ON s.identity=f.identity
+            WHERE f.interest IN ('interested','not_interested')""",
+            (threshold, threshold, threshold, threshold, threshold),
+        ).fetchone()
+        values = {key: int(row[key] or 0) for key in row.keys()}
+        recommended_rated = values["true_positive"] + values["false_positive"]
+        return {
+            **values,
+            "agreement_percent": round(values["agreed"] / values["rated"] * 100, 1) if values["rated"] else None,
+            "precision_percent": round(values["true_positive"] / recommended_rated * 100, 1) if recommended_rated else None,
+            "recall_percent": round(values["true_positive"] / values["positive"] * 100, 1) if values["positive"] else None,
+        }
+    finally:
+        db.close()
+
+
 def preview_cleanup(
     db_path: Path,
     state_dir: Path,

@@ -22,6 +22,10 @@ MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 # when checking already-applied migrations.
 LEGACY_MIGRATION_CHECKSUMS = {
     10: frozenset({"49187075335ce3352a091b373f3a68f0ded96d6cc94cc08ea8e06a94679f6e57"}),
+    # The packaged build recorded migration 012 with an extra trailing
+    # newline.  It is the same immutable SQL and must remain accepted for
+    # private databases created by that build.
+    12: frozenset({"65d1d291f9e23480a183164fc9f9228c7f1de7b87e15e9ccf1577821f8155eb5"}),
 }
 
 

@@ -14,6 +14,7 @@
     <p class="muted">发现 {{ profile_review.feedback_count }} 条尚未分析的新反馈。下一次每日任务会判断是否需要更新画像。</p>
   {% else %}
     <p class="muted">目前没有新的画像调整建议。你的兴趣反馈会在下一次每日任务中自动检查。</p>
+    {% if profile_review.latest_review %}<div class="review-result"><strong>最近一次自动检查：{{ profile_review.latest_review.status|status_label }}</strong><span>{{ profile_review.latest_review.updated_at|human_time }} · 检查 {{ profile_review.latest_review.feedback_count }} 条新反馈，并结合 {{ profile_review.history_count }} 条累计反馈</span>{% if profile_review.latest_review.reason %}<p>{{ profile_review.latest_review.reason }}</p>{% endif %}</div>{% endif %}
   {% endif %}
 </section>
 <div class="profile-layout">

@@ -48,6 +48,21 @@
     });
   });
 
+  document.querySelectorAll("[data-manual-abstract-form]").forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = form.querySelector('button[type="submit"]');
+    const values = new FormData(form);
+    submit.disabled = true;
+    try {
+      const result = await api("/api/papers/abstract", {method: "POST", body: JSON.stringify({
+        identity: values.get("identity"), abstract: values.get("abstract"), source_url: values.get("source_url"),
+      })});
+      announce(result.message);
+      location.reload();
+    } catch (error) { announce(error.message, true); }
+    finally { submit.disabled = false; }
+  }));
+
   const orderTodayCards = () => {
     const list = document.querySelector("[data-today-list]");
     if (!list) return;

@@ -26,8 +26,8 @@ Use the bundled deterministic runner for collection, normalization, deduplicatio
 7. Check for new preference evidence with `academic-radar profile review --db <state>/papers.sqlite3`. If `needed` is false, skip profile analysis. If a pending suggestion already exists, leave it for the user. Otherwise compare every returned feedback event with the active profile. Save either a complete suggested profile with `profile suggest` or a reasoned `profile no-change`; never activate a suggestion without explicit user confirmation.
 8. For a Codex scheduled task, freeze the one authoritative queue after API, official, enrichment, and profile-review work:
    `python3 scripts/paper_monitor.py agent-export --config <state>/config.toml --no-collect --batch-run <collection-run-id>`
-   Read the returned queue JSON and complete every paper using the rubric in `references/profile-guidance.md`. Write a results JSON with the same `run_id` and `profile_hash`, a `model` label, and a `results` array. Each result must contain `identity`, `relevant`, `score`, `reasons`, `matched_themes`, and `confidence`.
-   Treat `feedback_examples` as confirmed positive/negative calibration evidence,
+   Read the returned queue JSON and complete every paper using its `evaluation_policy` and the rubric in `references/profile-guidance.md`. Write a results JSON with the same `run_id` and `profile_hash`, a `model` label, and a `results` array. Each result must contain `identity`, a four-part `reasoning` object, a five-part `score_dimensions` object, `matched_themes`, and `confidence`; the runner calculates the authoritative score.
+   Treat `feedback_examples` and the cumulative profile-review history as confirmed positive/negative calibration evidence,
    while keeping the confirmed profile as the primary decision rubric. Never
    change the profile from feedback without creating a draft for user approval.
 9. Import the judgments and generate the digest:
@@ -53,7 +53,7 @@ Use the bundled deterministic runner for collection, normalization, deduplicatio
 
 ## Research-interest judgment
 
-Read `references/profile-guidance.md` whenever building or materially revising a profile. Pass the complete profile, title, abstract, venue, and publication type to the model. Require strict JSON containing `relevant`, `score`, `reasons`, `matched_themes`, and `confidence`. The runner validates and bounds these fields.
+Read `references/profile-guidance.md` whenever building or materially revising a profile. Pass the complete profile, title, abstract, venue, and publication type to the model. Require strict JSON with evidence summary, profile connection, transferable value, limitations, score dimensions, matched themes, and confidence. The runner validates the depth fields and calculates the final score.
 
 Favor papers with a meaningful connection to the research questions, methods, or empirical paradigms. A venue match alone is not relevance. Broad HCI work without a link to decision support, preference elicitation/integration, interactive optimization, human-AI collaboration, natural-language grounding, mixed initiative, trust/calibration, or vehicle-routing operations should normally rank lower.
 

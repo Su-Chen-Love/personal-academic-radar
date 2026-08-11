@@ -13,6 +13,8 @@ timeout_seconds = 30
 max_retries = 3
 backoff_seconds = 2.0
 openalex_fallback = true
+# Optional official ScienceDirect metadata access when public pages are bot-protected.
+elsevier_api_key_env = "ELSEVIER_API_KEY"
 
 [delivery]
 enabled = false

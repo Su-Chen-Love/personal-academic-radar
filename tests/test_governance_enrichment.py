@@ -1,14 +1,17 @@
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
 from academic_radar.enrichment import (
     MetadataClient,
+    ProviderTemporarilyUnavailable,
     apply_manual_import,
     enrich_abstracts,
     export_missing_task_package,
+    lookup_elsevier,
     lookup_semantic_scholar,
     lookup_publisher,
     prime_semantic_scholar_batch,
@@ -24,6 +27,16 @@ from academic_radar.storage import connect, upgrade_database, utc_now
 
 
 class GovernanceEnrichmentTests(unittest.TestCase):
+    def test_rate_limited_provider_is_paused_for_the_rest_of_the_run(self):
+        client = MetadataClient({"collection": {"max_retries": 0}})
+        limited = urllib.error.HTTPError("https://example.test", 429, "limited", {}, None)
+        with patch("urllib.request.urlopen", side_effect=limited) as request:
+            with self.assertRaises(urllib.error.HTTPError):
+                client.request("openalex", "https://example.test")
+            with self.assertRaises(ProviderTemporarilyUnavailable):
+                client.request("openalex", "https://example.test/next")
+        self.assertEqual(request.call_count, 1)
+
     def add_paper(self, db_path: Path, identity: str = "doi:10.1/x", abstract: str = "") -> None:
         upgrade_database(db_path)
         db = connect(db_path)
@@ -76,6 +89,22 @@ class GovernanceEnrichmentTests(unittest.TestCase):
         result=lookup_publisher(None,{"title":"A research paper","url":"https://publisher.example/article"},Client())
         self.assertEqual(result["abstract"],"")
         self.assertEqual(result["publication_type_raw"],"Correspondence")
+
+    def test_elsevier_official_api_uses_exact_doi_and_title(self):
+        class Client:
+            elsevier_api_key = "configured"
+            def request(self,*args,**kwargs):
+                payload={"full-text-retrieval-response":{"coredata":{
+                    "prism:doi":"10.1016/j.ejor.2026.01.002",
+                    "dc:title":"Optimal insurance design",
+                    "dc:description":"We derive an optimal insurance contract under distortion risk measures and a variance constraint.",
+                }}}
+                return json.dumps(payload).encode(),"https://api.elsevier.com/content/article/doi/example","application/json"
+        result=lookup_elsevier(None,{
+            "doi":"10.1016/j.ejor.2026.01.002","title":"Optimal insurance design"
+        },Client())
+        self.assertIn("optimal insurance contract",result["abstract"])
+        self.assertEqual(result["evidence_type"],"elsevier_api_record")
 
     def test_cleanup_preview_has_verified_backup_and_is_recoverable(self):
         with tempfile.TemporaryDirectory() as td:

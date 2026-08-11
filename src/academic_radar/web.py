@@ -36,11 +36,12 @@ from .engagement import (
     set_favorite,
     set_feedback,
 )
-from .governance import governance_stats, latest_scores_sql
+from .governance import governance_stats, latest_scores_sql, recommendation_feedback_metrics
 from .official import configure_official_source, resolve_official_source
 from .operations import verify_installation
 from .product import (
     MAX_PDF_BYTES,
+    add_manual_abstract,
     add_manual_paper,
     human_time,
     import_fulltext,
@@ -274,6 +275,11 @@ def create_app(config_path: Path) -> FastAPI:
         except (json.JSONDecodeError,TypeError): names=[]
         return "、".join(str(item) for item in names if item) or "作者信息未提供"
     templates.env.filters["authors"] = authors_label
+    def list_label(value: str) -> str:
+        try: items=json.loads(value or "[]")
+        except (json.JSONDecodeError,TypeError): items=[]
+        return "、".join(str(item) for item in items if item)
+    templates.env.filters["list_label"] = list_label
     templates.env.filters["status_label"] = lambda value: {
         "active": "已启用", "draft": "草稿", "superseded": "已停用",
         "succeeded": "成功", "partial": "部分完成", "failed": "失败",
@@ -289,6 +295,8 @@ def create_app(config_path: Path) -> FastAPI:
         "source_coverage": "来源运行覆盖",
         "source_runs": "最近来源运行",
         "source_degradation": "来源降级",
+        "official_issue_coverage": "官网卷期覆盖",
+        "official_issue_failures": "官网核验失败",
         "latest_semantic_job": "最近一次 Codex 判断",
         "semantic_coverage": "相关性判断覆盖",
         "abstract_coverage": "摘要覆盖",
@@ -369,6 +377,7 @@ def create_app(config_path: Path) -> FastAPI:
             run_id = latest_job["run_id"] if latest_job else ""
             threshold=float(config.get("relevance_threshold",0.70))
             papers = rows(db, """SELECT p.*,s.score,s.reasons,s.confidence,s.screened_at,s.themes_json,
+              s.reasoning_json,s.score_dimensions_json,s.rubric_version,
               f.interest,f.reason AS feedback_reason,COALESCE(f.favorite,0) favorite,
               COALESCE(f.reading_status,'unread') reading_status,
               EXISTS(SELECT 1 FROM fulltext_files ft WHERE ft.identity=p.identity) fulltext_count,
@@ -377,11 +386,52 @@ def create_app(config_path: Path) -> FastAPI:
               FROM run_papers rp JOIN papers p ON p.identity=rp.identity
               JOIN screenings s ON s.identity=p.identity AND s.run_id=rp.run_id AND s.provider='codex-agent'
               LEFT JOIN paper_feedback f ON f.identity=p.identity
-              WHERE rp.run_id=? AND rp.role='selected_new' AND s.profile_hash=?
+              -- The latest agent run is the authoritative recommendation set.
+              -- A paper can be newly recommended after re-screening or a
+              -- feedback-triggered rescreen without being newly collected in
+              -- this API batch, so filtering only selected_new hid valid
+              -- recommendations from the Today page.
+              WHERE rp.run_id=? AND (
+                rp.role='selected' OR (
+                  rp.role='selected_new' AND NOT EXISTS(
+                    SELECT 1 FROM run_papers selected_rp
+                    WHERE selected_rp.run_id=rp.run_id
+                      AND selected_rp.identity=rp.identity
+                      AND selected_rp.role='selected'
+                  )
+                )
+              ) AND s.profile_hash=?
                 AND s.score>=? AND p.eligibility_status='eligible'
               ORDER BY CASE WHEN f.interest IS NULL THEN 0 ELSE 1 END,
                 CASE f.interest WHEN 'interested' THEN 0 WHEN 'not_interested' THEN 1 ELSE 0 END,
                 s.score DESC,p.published DESC""", (run_id,profile_hash,threshold))
+            # Keep the daily signal honest, but do not make a prior valid
+            # recommendation appear to have vanished when the newest run has
+            # no papers above the threshold.  The template labels this as a
+            # historical fallback rather than mixing it into today's count.
+            recent_job = None
+            recent_papers = []
+            if not papers:
+                recent_job = row(db, """SELECT aj.* FROM agent_jobs aj
+                  WHERE aj.status='imported' AND aj.profile_hash=?
+                    AND EXISTS(SELECT 1 FROM run_papers prior_rp
+                      WHERE prior_rp.run_id=aj.run_id AND prior_rp.role='selected')
+                  ORDER BY aj.imported_at DESC LIMIT 1""", (profile_hash,))
+                if recent_job and recent_job["run_id"] != run_id:
+                    recent_papers = rows(db, """SELECT p.*,s.score,s.reasons,s.confidence,s.screened_at,s.themes_json,
+                      s.reasoning_json,s.score_dimensions_json,s.rubric_version,
+                      f.interest,f.reason AS feedback_reason,COALESCE(f.favorite,0) favorite,
+                      COALESCE(f.reading_status,'unread') reading_status,
+                      EXISTS(SELECT 1 FROM fulltext_files ft WHERE ft.identity=p.identity) fulltext_count,
+                      (SELECT ft.id FROM fulltext_files ft WHERE ft.identity=p.identity
+                        ORDER BY ft.imported_at DESC,ft.id DESC LIMIT 1) fulltext_id
+                      FROM run_papers rp JOIN papers p ON p.identity=rp.identity
+                      JOIN screenings s ON s.identity=p.identity AND s.run_id=rp.run_id AND s.provider='codex-agent'
+                      LEFT JOIN paper_feedback f ON f.identity=p.identity
+                      WHERE rp.run_id=? AND rp.role='selected' AND s.profile_hash=?
+                        AND s.score>=? AND p.eligibility_status='eligible'
+                      ORDER BY s.score DESC,p.published DESC""",
+                        (recent_job["run_id"], profile_hash, threshold))
             latest_run = row(db, "SELECT * FROM pipeline_runs WHERE run_id=?",(run_id,)) if run_id else None
             totals = row(db, """SELECT COUNT(*) papers,
               (SELECT COUNT(*) FROM paper_feedback WHERE favorite=1) favorites,
@@ -389,7 +439,8 @@ def create_app(config_path: Path) -> FastAPI:
               (SELECT COUNT(*) FROM papers WHERE eligibility_status='excluded') excluded
               FROM papers WHERE eligibility_status='eligible'""")
             return templates.TemplateResponse(request,"today.html",context(request,"today",papers=papers,
-                latest_run=latest_run,latest_job=latest_job,totals=totals,active_profile=active))
+                recent_papers=recent_papers,recent_job=recent_job,latest_run=latest_run,
+                latest_job=latest_job,totals=totals,active_profile=active))
         finally:
             db.close()
 
@@ -421,7 +472,9 @@ def create_app(config_path: Path) -> FastAPI:
             active=row(db,"SELECT profile_hash FROM profile_versions WHERE status='active'") or {"profile_hash":""}
             latest="""SELECT * FROM (SELECT s.*,ROW_NUMBER() OVER(PARTITION BY s.identity ORDER BY s.screened_at DESC) rn
               FROM screenings s WHERE s.profile_hash=?) WHERE rn=1"""
-            query=f"""SELECT p.*,s.score,s.relevant,s.reasons,f.interest,f.reason AS feedback_reason,
+            query=f"""SELECT p.*,s.score,s.relevant,s.reasons,s.confidence,s.themes_json,
+              s.reasoning_json,s.score_dimensions_json,s.rubric_version,
+              f.interest,f.reason AS feedback_reason,
               COALESCE(f.favorite,0) favorite,COALESCE(f.reading_status,'unread') reading_status,
               EXISTS(SELECT 1 FROM fulltext_files ft WHERE ft.identity=p.identity) fulltext_count,
               (SELECT ft.id FROM fulltext_files ft WHERE ft.identity=p.identity
@@ -663,6 +716,20 @@ def create_app(config_path: Path) -> FastAPI:
             status_code=200
         return JSONResponse({"ok":True,"message":message,**result},status_code=status_code)
 
+    @app.post("/api/papers/abstract")
+    async def manual_abstract_api(request: Request) -> JSONResponse:
+        validate_json_csrf(request); data=await json_data(request)
+        try:
+            result=add_manual_abstract(
+                db_path,str(data.get("identity","")),str(data.get("abstract","")),
+                str(data.get("source_url","")),
+            )
+        except ValueError as exc:
+            return JSONResponse({"error":str(exc)},status_code=400)
+        return JSONResponse({
+            "ok":True,"message":f"已补充《{result['title']}》的摘要，并安排重新评分",**result,
+        })
+
     @app.post("/fulltext")
     async def upload_fulltext(request: Request) -> RedirectResponse:
         data,files=await multipart_data(request); validate_csrf(data)
@@ -699,20 +766,23 @@ def create_app(config_path: Path) -> FastAPI:
     def status(request: Request) -> HTMLResponse:
         db=connect(db_path)
         try:
-            tasks=rows(db,"SELECT * FROM task_runs ORDER BY created_at DESC LIMIT 10")
             db_state=database_status(db_path)
             verification=verify_installation(config_path)
             check_order={"error":0,"warning":1}
-            checks=sorted(
+            all_checks=sorted(
                 (check for check in verification["checks"] if check["name"] != "schema_version"),
                 key=lambda check: (check["ok"], check_order.get(check["level"], 2), check["name"]),
             )
-            source_checks=[check for check in checks if check["name"] in {
+            source_checks=[check for check in all_checks if check["name"] in {
                 "source_coverage","source_runs","source_degradation",
                 "official_issue_coverage","official_issue_failures",
             }]
+            checks=[check for check in all_checks if not check["ok"]]
             missing_abstracts=int(verification["governance"]["missing_abstracts"])
             pending_semantic=next((check for check in checks if check["name"] == "semantic_coverage"), None)
+            rescreen_count=int(db.execute(
+                "SELECT COUNT(*) FROM papers WHERE eligibility_status='eligible' AND needs_rescreen=1"
+            ).fetchone()[0])
             situations=[]
             if missing_abstracts:
                 situations.append(f"正式文献库仍缺 {missing_abstracts} 篇摘要")
@@ -720,7 +790,9 @@ def create_app(config_path: Path) -> FastAPI:
                 situations.append("部分监测来源尚未成功更新")
             else:
                 situations.append("所有已配置来源都有运行记录")
-            if pending_semantic and not pending_semantic["ok"]:
+            if rescreen_count:
+                situations.append(f"有 {rescreen_count} 篇论文待按新量表重新判断")
+            elif pending_semantic and not pending_semantic["ok"]:
                 situations.append("有论文尚未完成相关性判断")
             else:
                 situations.append("现有可筛选论文均已完成相关性判断")
@@ -743,14 +815,18 @@ def create_app(config_path: Path) -> FastAPI:
                 f"7. 再运行摘要补全，并执行 academic-radar profile review --db {db_path}。只有发现未审阅的新反馈时才提出完整画像建议并保存；没有必要修改时用 profile no-change 记录结论，不能静默改动已激活画像。",
                 f"8. 运行：python3 {monitor_runner_path(state)} agent-export --config {config_path} --no-collect --batch-run <第 5 步 run_id>。它会把本轮 API 与官网新增论文合并为同一份待判断清单。",
                 f"9. 阅读 {state / 'agent_queue'} 中最新的 JSON 队列。逐篇按已激活研究兴趣和反馈判断；每篇必须恰好有一条结果。",
-                "10. 将严格 results JSON 保存到 agent-results 目录，保留队列的 run_id、profile_hash、source_failures，"
-                "并为每篇提供 identity、relevant、score、reasons、matched_themes、confidence。即使队列为空，也写入覆盖完整队列的空 results 数组。",
+                "10. 将严格 results JSON 保存到 agent-results 目录，保留队列的 run_id、profile_hash、source_failures。"
+                "按 evaluation_policy 为每篇提供 identity、reasoning（论文证据、画像关联、可迁移价值、局限）、"
+                "score_dimensions、matched_themes、confidence；最终分数由导入程序计算。即使队列为空，也写入覆盖完整队列的空 results 数组。",
                 f"11. 运行：python3 {monitor_runner_path(state)} agent-import --config {config_path} --results <结果 JSON 路径>。",
                 f"12. 最后运行：academic-radar verify --config {config_path}，报告 API 采集数、官网卷期与论文数、补全摘要数、判断数、达到 70 分的入选论文、来源失败和仍需处理的项目。",
             ])
-            return templates.TemplateResponse(request,"status.html",context(request,"status",tasks=tasks,
+            return templates.TemplateResponse(request,"status.html",context(request,"status",
                 db_state=db_state,quality=verification["governance"],
-                checks=checks,update_summary=update_summary,update_prompt="\n\n".join(prompt_steps)))
+                recommendation_quality=recommendation_feedback_metrics(
+                    db_path,float(config.get("relevance_threshold",0.70))
+                ),checks=checks,healthy_count=len(all_checks)-len(checks),
+                update_summary=update_summary,update_prompt="\n\n".join(prompt_steps)))
         finally: db.close()
 
     return app

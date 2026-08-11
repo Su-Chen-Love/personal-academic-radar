@@ -8,6 +8,7 @@ import html
 from html.parser import HTMLParser
 import io
 import json
+import os
 import re
 import sqlite3
 import time
@@ -30,12 +31,13 @@ PROVIDER_LABELS = {
     "semantic_scholar": "Semantic Scholar",
     "europe_pmc": "Europe PMC",
     "pubmed": "PubMed",
+    "elsevier": "Elsevier 官方元数据",
     "publisher": "出版商官方页面",
 }
 MANUAL_EVIDENCE_TYPES = {
     "crossref_metadata", "openalex_metadata", "semantic_scholar_record",
     "europe_pmc_record", "pubmed_record", "publisher_metadata", "official_page",
-    "author_manuscript",
+    "author_manuscript", "elsevier_api_record",
 }
 
 
@@ -84,6 +86,10 @@ class OfficialMetaParser(HTMLParser):
             self.values[name] = content
 
 
+class ProviderTemporarilyUnavailable(RuntimeError):
+    """Stop repeated calls after a provider has explicitly rate-limited the run."""
+
+
 class MetadataClient:
     def __init__(self, config: dict[str, Any]) -> None:
         collection = config.get("collection", {})
@@ -91,25 +97,36 @@ class MetadataClient:
         self.timeout = int(collection.get("timeout_seconds", 30))
         self.retries = min(3, max(0, int(collection.get("max_retries", 2))))
         self.last_request: dict[str, float] = {}
+        self.provider_backoff_until: dict[str, float] = {}
         self.semantic_scholar_cache: dict[str, dict[str, Any] | None] | None = None
+        key_env = str(collection.get("elsevier_api_key_env", "ELSEVIER_API_KEY"))
+        self.elsevier_api_key = os.environ.get(key_env, "") if key_env else ""
         self.minimum_interval = {
             "crossref": 0.12,
             "openalex": 0.12,
             "semantic_scholar": 1.05,
             "europe_pmc": 0.35,
             "pubmed": 0.36,
+            "elsevier": 0.35,
             "publisher": 0.5,
         }
 
     def request(
         self, provider: str, url: str, *, max_bytes: int = 2_000_000, data: bytes | None = None,
         content_type: str = "", accept: str = "application/json, application/xml, text/html;q=0.8",
+        extra_headers: dict[str, str] | None = None,
     ) -> tuple[bytes, str, str]:
+        backoff = self.provider_backoff_until.get(provider, 0.0) - time.monotonic()
+        if backoff > 0:
+            raise ProviderTemporarilyUnavailable(
+                f"{provider} 因 429 限流暂停本轮后续请求（约 {int(backoff)} 秒）"
+            )
         elapsed = time.monotonic() - self.last_request.get(provider, 0.0)
         delay = self.minimum_interval.get(provider, 0.2) - elapsed
         if delay > 0:
             time.sleep(delay)
         headers = {"User-Agent": self.user_agent, "Accept": accept}
+        headers.update(extra_headers or {})
         if content_type:
             headers["Content-Type"] = content_type
         for attempt in range(self.retries + 1):
@@ -126,13 +143,21 @@ class MetadataClient:
                 self.last_request[provider] = time.monotonic()
                 status = getattr(exc, "code", None)
                 transient = status in {408, 429, 500, 502, 503, 504} or status is None
-                if attempt >= self.retries or not transient:
-                    raise
                 retry_after = getattr(exc, "headers", {}).get("Retry-After") if getattr(exc, "headers", None) else None
                 try:
                     wait = float(retry_after) if retry_after else 1.5 * (2 ** attempt)
                 except ValueError:
                     wait = 1.5 * (2 ** attempt)
+                if attempt >= self.retries or not transient:
+                    if status == 429:
+                        # A single enrichment run can contain hundreds of papers.
+                        # After retries are exhausted, do not repeat the same
+                        # rejected call for every remaining record.
+                        self.provider_backoff_until[provider] = max(
+                            self.provider_backoff_until.get(provider, 0.0),
+                            time.monotonic() + max(600.0, wait),
+                        )
+                    raise
                 time.sleep(min(30.0, max(0.0, wait)))
         raise RuntimeError("metadata request failed")
 
@@ -371,6 +396,41 @@ def lookup_publisher(_: sqlite3.Connection, paper: dict[str, Any], client: Metad
     }
 
 
+def lookup_elsevier(_: sqlite3.Connection, paper: dict[str, Any], client: MetadataClient) -> dict[str, Any] | None:
+    """Use Elsevier's official metadata API when the configured key is available."""
+
+    doi = str(paper.get("doi") or "").strip().lower()
+    if not doi.startswith("10.1016/") or not client.elsevier_api_key:
+        return None
+    url = (
+        "https://api.elsevier.com/content/article/doi/" +
+        urllib.parse.quote(doi, safe="") + "?httpAccept=application%2Fjson"
+    )
+    raw, final_url, _ = client.request(
+        "elsevier", url, accept="application/json",
+        extra_headers={"X-ELS-APIKey": client.elsevier_api_key}, max_bytes=8_000_000,
+    )
+    payload = json.loads(raw.decode("utf-8"))
+    response = payload.get("full-text-retrieval-response") or {}
+    core = response.get("coredata") or {}
+    actual_doi = str(core.get("prism:doi") or "").lower()
+    actual_title = str(core.get("dc:title") or "")
+    if actual_doi != doi or not _title_matches(str(paper.get("title") or ""), actual_title):
+        return None
+    abstract = clean_abstract(core.get("dc:description") or core.get("prism:abstract"))
+    if not abstract:
+        return None
+    return {
+        "abstract": abstract,
+        "source_name": "elsevier-official-api",
+        "source_url": final_url,
+        "evidence_type": "elsevier_api_record",
+        "publication_type_raw": "journal-article",
+        "publication_type_source": "elsevier-official-api",
+        "source_kind": "journal",
+    }
+
+
 PROVIDERS: list[tuple[str, Callable[[sqlite3.Connection, dict[str, Any], MetadataClient], dict[str, Any] | None]]] = [
     ("local", lookup_local),
     ("crossref", lookup_crossref),
@@ -378,6 +438,7 @@ PROVIDERS: list[tuple[str, Callable[[sqlite3.Connection, dict[str, Any], Metadat
     ("semantic_scholar", lookup_semantic_scholar),
     ("europe_pmc", lookup_europe_pmc),
     ("pubmed", lookup_pubmed),
+    ("elsevier", lookup_elsevier),
     ("publisher", lookup_publisher),
 ]
 
@@ -473,16 +534,17 @@ def enrich_abstracts(
                 if not retry:
                     recent = db.execute(
                         """SELECT status,attempted_at FROM abstract_attempts
-                        WHERE identity=? AND provider=? ORDER BY attempted_at DESC LIMIT 1""",
+                        WHERE identity=? AND provider=? AND status IN ('not_found','failed')
+                        ORDER BY attempted_at DESC LIMIT 1""",
                         (paper["identity"], provider),
                     ).fetchone()
-                    if recent and recent["status"] in {"not_found", "failed"}:
+                    if recent:
                         try:
                             age = dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(recent["attempted_at"])
                         except ValueError:
                             age = dt.timedelta(days=1)
-                        if age < dt.timedelta(hours=6):
-                            _record_attempt(db, task_id, paper["identity"], provider, "skipped", detail="六小时失败缓存")
+                        if age < dt.timedelta(hours=24):
+                            _record_attempt(db, task_id, paper["identity"], provider, "skipped", detail="二十四小时失败缓存")
                             db.commit()
                             continue
                 try:

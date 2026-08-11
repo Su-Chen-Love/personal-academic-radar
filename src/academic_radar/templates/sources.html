@@ -16,11 +16,12 @@
     <h2>{{ source.name }}</h2>
     <dl>
       <div><dt>上次 API 收到</dt><dd>{{ source.latest.count if source.latest else 0 }} 篇</dd></div>
-      <div><dt>摘要覆盖</dt><dd>{{ source.coverage.abstract_percent or 0 }}%</dd></div>
+      <div><dt>摘要覆盖</dt><dd>{{ source.coverage.abstract_percent or 0 }}% · 缺 {{ source.coverage.missing_abstracts or 0 }}</dd></div>
       <div><dt>已记录</dt><dd>{{ source.coverage.paper_count or 0 }} 篇</dd></div>
       <div><dt>官网已核验</dt><dd>{% if source.official_check %}{{ source.official_check.issue_count }} 期 · {{ source.official_check.article_count }} 篇{% elif source.official_status == 'verified' or source.official_issues_url %}等待首次核验{% else %}暂不适用{% endif %}</dd></div>
       <div><dt>标识</dt><dd>{{ source.issn or source.openalex_id or source.query_container or '—' }}</dd></div>
       <div><dt>官网采集</dt><dd>{% if source.official_status == 'verified' or source.official_issues_url %}{{ source.official_provider or '已验证' }}{% else %}API 过渡，待适配{% endif %}</dd></div>
+      <div><dt>最近状态</dt><dd>{% if source.official_latest %}{{ '成功' if source.official_latest.status == 'succeeded' else '待重试' }} · {{ source.official_latest.checked_at|human_time }}{% elif source.latest %}{{ source.latest.status|status_label }}{% else %}尚未运行{% endif %}</dd></div>
     </dl>
     {% if source.latest and source.latest.error %}<details class="minor-details"><summary>查看最近异常</summary><p class="warning">{{ source.latest.error }}</p></details>{% endif %}
     {% if source.official_latest and source.official_latest.status == 'failed' %}<details class="minor-details"><summary>官网核验待重试</summary><p class="warning">{{ source.official_latest.issue_key }}：{{ source.official_latest.detail }}</p></details>{% endif %}

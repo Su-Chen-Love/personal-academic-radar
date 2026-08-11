@@ -159,6 +159,24 @@ def pending_profile_review(db_path: Path) -> dict[str, Any]:
             WHERE e.rn=1 ORDER BY e.created_at,e.event_id""",
             (boundary,),
         )]
+        # A daily review must not forget yesterday's evidence.  The unseen
+        # events decide whether a review is due, while the current feedback
+        # state supplies cumulative calibration context so repeated weak
+        # signals can become a stable profile preference across several days.
+        feedback_history = [dict(row) for row in db.execute(
+            """SELECT f.identity,f.interest,f.reason,f.updated_at,
+            p.title,p.abstract,p.venue,s.score,s.reasons AS recommendation_reason
+            FROM paper_feedback f JOIN papers p ON p.identity=f.identity
+            LEFT JOIN (
+              SELECT * FROM (
+                SELECT screenings.*,
+                ROW_NUMBER() OVER(PARTITION BY identity ORDER BY screened_at DESC,rowid DESC) rn
+                FROM screenings WHERE provider='codex-agent'
+              ) WHERE rn=1
+            ) s ON s.identity=f.identity
+            WHERE f.interest IN ('interested','not_interested')
+            ORDER BY f.updated_at DESC"""
+        )]
         serialized = json.dumps(events, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         fingerprint = hashlib.sha256(serialized.encode()).hexdigest() if events else ""
         pending_suggestion = db.execute(
@@ -166,12 +184,27 @@ def pending_profile_review(db_path: Path) -> dict[str, Any]:
             JOIN profile_versions v ON v.id=r.profile_version_id
             WHERE r.status='suggested' AND v.status='draft' ORDER BY r.updated_at DESC LIMIT 1"""
         ).fetchone()
+        latest_review_row = db.execute(
+            """SELECT r.*,v.change_summary FROM profile_review_runs r
+            LEFT JOIN profile_versions v ON v.id=r.profile_version_id
+            ORDER BY r.updated_at DESC,r.rowid DESC LIMIT 1"""
+        ).fetchone()
+        latest_review = dict(latest_review_row) if latest_review_row else None
+        if latest_review:
+            try:
+                details = json.loads(latest_review.get("details_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                details = {}
+            latest_review["reason"] = str(details.get("reason") or "")
         return {
             "needed": bool(events),
             "fingerprint": fingerprint,
             "feedback_count": len(events),
             "events": events,
+            "feedback_history": feedback_history,
+            "history_count": len(feedback_history),
             "pending_suggestion": dict(pending_suggestion) if pending_suggestion else None,
+            "latest_review": latest_review,
         }
     finally:
         db.close()
@@ -192,7 +225,9 @@ def create_feedback_profile_suggestion(
                 """INSERT INTO profile_review_runs(
                 fingerprint,status,feedback_count,details_json,profile_version_id,created_at,updated_at
                 ) VALUES(?,'suggested',?,?,?,?,?)""",
-                (fingerprint, review["feedback_count"], json.dumps({"events": review["events"]}, ensure_ascii=False),
+                (fingerprint, review["feedback_count"], json.dumps({
+                    "events": review["events"], "feedback_history": review["feedback_history"],
+                }, ensure_ascii=False),
                  version["id"], now, now),
             )
         return {"status": "suggested", "feedback_count": review["feedback_count"], "version": version}
@@ -258,6 +293,12 @@ def set_feedback(
     try:
         if not db.execute("SELECT 1 FROM papers WHERE identity=?", (identity,)).fetchone():
             raise ValueError(f"Unknown paper identity: {identity}")
+        prior = db.execute("SELECT * FROM paper_feedback WHERE identity=?", (identity,)).fetchone()
+        normalized_reason = reason.strip() or None
+        semantic_changed = (
+            (prior["interest"] if prior else None) != interest
+            or (prior["reason"] if prior else None) != normalized_reason
+        )
         now = utc_now()
         with db:
             db.execute(
@@ -266,12 +307,14 @@ def set_feedback(
                 ) VALUES(?,?,?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET
                 interest=excluded.interest,reason=excluded.reason,favorite=excluded.favorite,
                 reading_status=excluded.reading_status,updated_at=excluded.updated_at""",
-                (identity, interest, reason.strip() or None, int(favorite), reading_status, now, now),
+                (identity, interest, normalized_reason, int(favorite), reading_status, now, now),
             )
-            db.execute(
-                "INSERT INTO feedback_events(identity,interest,reason,favorite,reading_status,created_at) VALUES(?,?,?,?,?,?)",
-                (identity, interest, reason.strip() or None, int(favorite), reading_status, now),
-            )
+            if semantic_changed:
+                db.execute(
+                    "INSERT INTO feedback_events(identity,interest,reason,favorite,reading_status,created_at) VALUES(?,?,?,?,?,?)",
+                    (identity, interest, normalized_reason, int(favorite), reading_status, now),
+                )
+                db.execute("UPDATE papers SET needs_rescreen=1,updated_at=? WHERE identity=?", (now, identity))
         return dict(db.execute("SELECT * FROM paper_feedback WHERE identity=?", (identity,)).fetchone())
     finally:
         db.close()
@@ -326,6 +369,8 @@ def clear_feedback(db_path: Path, identity: str) -> dict[str, Any]:
                     ) VALUES(?,NULL,'用户清除当前反馈',0,'unread',?)""",
                     (identity, utc_now()),
                 )
+                if prior["interest"] in {"interested", "not_interested"}:
+                    db.execute("UPDATE papers SET needs_rescreen=1,updated_at=? WHERE identity=?", (utc_now(), identity))
         return {"identity": identity, "cleared": bool(prior)}
     finally:
         db.close()

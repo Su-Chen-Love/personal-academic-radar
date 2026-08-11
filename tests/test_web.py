@@ -65,12 +65,35 @@ class WebTests(unittest.TestCase):
                     self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
                     self.assertIn('rel="icon" type="image/png"', response.text)
                     if path == "/":
-                        self.assertIn("app.js?v=0.9.0", response.text)
+                        self.assertIn("app.js?v=0.10.0", response.text)
                         self.assertEqual(response.text.count('class="nav-icon"'), 6)
                 favicon = client.get("/static/images/academic-radar-logo.png")
                 self.assertEqual(favicon.status_code, 200)
                 self.assertEqual(favicon.headers["content-type"], "image/png")
                 self.assertTrue(client.get("/healthz").json()["ok"])
+
+    def test_today_shows_recommendations_selected_after_rescreen(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            db = connect(db_path)
+            with db:
+                db.execute(
+                    "INSERT INTO pipeline_runs(run_id,kind,status,started_at,finished_at,collected_count,candidate_count,relevant_count) "
+                    "VALUES('agent-run','agent-export','succeeded','now','now',0,1,1)"
+                )
+                db.execute(
+                    "INSERT INTO agent_jobs(run_id,profile_hash,status,queue_path,exported_count,imported_count,created_at,imported_at,profile_version_id,feedback_snapshot_json) "
+                    "VALUES('agent-run',?,'imported','queue.json',1,1,'now','now',?,'[]')",
+                    (db.execute("SELECT profile_hash FROM profile_versions WHERE status='active'").fetchone()[0],
+                     db.execute("SELECT id FROM profile_versions WHERE status='active'").fetchone()[0]),
+                )
+                db.execute("INSERT INTO run_papers(run_id,identity,role) VALUES('agent-run','doi:10.1/test','selected')")
+                db.execute("UPDATE screenings SET run_id='agent-run' WHERE identity='doi:10.1/test'")
+            db.close()
+            with TestClient(app) as client:
+                response = client.get("/")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("A useful paper", response.text)
 
     def test_sources_show_completed_official_issue_count(self):
         with tempfile.TemporaryDirectory() as td:
@@ -377,6 +400,32 @@ class WebTests(unittest.TestCase):
             self.assertEqual(response.status_code, 400)
             self.assertIn("APA 引用过短", response.json()["error"])
 
+    def test_manual_abstract_updates_status_and_queues_rescreen(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            db = connect(db_path)
+            with db:
+                db.execute("UPDATE papers SET abstract='',abstract_source='missing',needs_rescreen=0")
+            db.close()
+            abstract = (
+                "This study examines how decision makers express preferences, revise candidate routes, "
+                "and collaborate with an optimization system across repeated planning rounds."
+            )
+            with TestClient(app) as client:
+                page = client.get("/library")
+                self.assertIn("保存摘要并重新评分", page.text)
+                response = client.post("/api/papers/abstract", json={
+                    "identity":"doi:10.1/test", "abstract":abstract,
+                    "source_url":"https://doi.org/10.1/test",
+                }, headers={"X-CSRF-Token":app.state.csrf_token})
+            self.assertEqual(response.status_code, 200)
+            db = connect(db_path)
+            paper = db.execute("SELECT abstract_source,abstract_failure_reason,needs_rescreen FROM papers").fetchone()
+            attempt = db.execute("SELECT provider,status FROM abstract_attempts ORDER BY id DESC LIMIT 1").fetchone()
+            db.close()
+            self.assertEqual(tuple(paper), ("user-provided", None, 1))
+            self.assertEqual(tuple(attempt), ("manual", "found"))
+
     def test_title_only_manual_paper_absorbs_a_later_doi_without_duplication(self):
         with tempfile.TemporaryDirectory() as td:
             app, db_path, _ = self.make_app(Path(td))
@@ -590,11 +639,11 @@ class WebTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             app, _, _=self.make_app(Path(td))
             with TestClient(app) as client: response=client.get("/status")
-            for label in ("更新数据库", "当前：", "由 Codex 完整执行", "自动检查", "最近任务"):
+            for label in ("更新数据库", "当前：", "由 Codex 完整执行", "需要处理", "推荐精确率"):
                 self.assertIn(label,response.text)
-            for label in ("agent-export", "agent-import", "默认收起；点击查看任务记录"):
+            for label in ("agent-export", "agent-import"):
                 self.assertIn(label,response.text)
-            self.assertNotIn('<details class="panel full recent-tasks-panel" open>', response.text)
+            self.assertNotIn("recent-tasks-panel", response.text)
             self.assertNotIn("网页运行方式", response.text)
             self.assertNotIn("交给 Codex 判断相关性", response.text)
             self.assertNotIn("数据库结构版本", response.text)

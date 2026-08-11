@@ -9,6 +9,25 @@ sys.modules[spec.name] = pm
 spec.loader.exec_module(pm)
 
 class MonitorTests(unittest.TestCase):
+    @staticmethod
+    def structured_result(identity, *, confidence=0.95):
+        return {
+            "identity": identity,
+            "reasoning": {
+                "evidence_summary": "摘要研究人在回路的偏好表达与候选方案迭代过程",
+                "profile_connection": "直接连接交互式优化与偏好融合这一核心研究主题",
+                "transfer_value": "实验任务和过程指标可迁移到车辆路径决策支持研究",
+                "limitations": "应用场景不同且尚需核对样本和外部效度",
+            },
+            "score_dimensions": {
+                "core_relevance": 0.9, "mechanism_alignment": 0.9,
+                "method_transfer": 0.8, "evidence_quality": 0.9,
+                "boundary_penalty": 0.0,
+            },
+            "matched_themes": ["interactive optimization"],
+            "confidence": confidence,
+        }
+
     def test_doi_normalization_and_identity(self):
         self.assertEqual(pm.normalize_doi("https://doi.org/10.1145/ABC. "), "10.1145/abc")
         self.assertEqual(pm.identity("10.1/X", "A"), pm.identity("doi:10.1/x", "B"))
@@ -244,14 +263,13 @@ class MonitorTests(unittest.TestCase):
             with patch("builtins.print") as output:
                 pm.agent_export(root/"config.toml",no_collect=True)
             run_id=json.loads(output.call_args.args[0])["run_id"]
-            results={"run_id":run_id,"profile_hash":profile_hash,"model":"codex-test","results":[{
-              "identity":p.identity,"relevant":True,"score":0.9,"reasons":"Directly studies the core problem",
-              "matched_themes":["interactive optimization"],"confidence":0.95}]}
+            results={"run_id":run_id,"profile_hash":profile_hash,"model":"codex-test","results":[
+              self.structured_result(p.identity)]}
             path=root/"results.json"; path.write_text(json.dumps(results),encoding="utf-8")
             self.assertEqual(pm.agent_import(root/"config.toml",path),0)
             db=pm.db_open(root/"papers.sqlite3")
             row=db.execute("select provider,relevant,score from screenings").fetchone()
-            self.assertEqual((row[0],row[1],row[2]),("codex-agent",1,0.9))
+            self.assertEqual((row[0],row[1],row[2]),("codex-agent",1,0.88))
 
     def test_agent_import_rejects_partial_exported_queue(self):
         with tempfile.TemporaryDirectory() as td:
@@ -288,14 +306,13 @@ class MonitorTests(unittest.TestCase):
             second=json.loads(output.call_args.args[0]); queue=json.loads(Path(second["queue_path"]).read_text())
             results=[]
             for index,paper in enumerate(queue["papers"]):
-                item={"identity":paper["identity"],"relevant":False,"score":0.1,"reasons":"Not related",
-                      "matched_themes":[],"confidence":0.9}
-                if index==1: item.pop("reasons")
+                item=self.structured_result(paper["identity"])
+                if index==1: item.pop("reasoning")
                 results.append(item)
             result_path=root/"invalid.json"
             result_path.write_text(json.dumps({"run_id":queue["run_id"],"profile_hash":queue["profile_hash"],
                                                "model":"codex-test","results":results}),encoding="utf-8")
-            with self.assertRaisesRegex(ValueError,"missing fields"):
+            with self.assertRaisesRegex(ValueError,"structured results require"):
                 pm.agent_import(config,result_path)
             db=pm.db_open(root/"papers.sqlite3")
             self.assertEqual(db.execute("SELECT COUNT(*) FROM screenings").fetchone()[0],0)
@@ -318,7 +335,9 @@ class MonitorTests(unittest.TestCase):
             with patch("builtins.print") as output:
                 pm.agent_export(config,no_collect=True)
             summary=json.loads(output.call_args.args[0]); queue=json.loads(Path(summary["queue_path"]).read_text())
-            self.assertEqual(queue["schema_version"],2)
+            self.assertEqual(queue["schema_version"],3)
+            self.assertEqual(queue["evaluation_policy"]["rubric_version"],"evidence-v1")
+            self.assertIn("reasoning", queue["evaluation_policy"]["result_fields"])
             self.assertEqual(queue["feedback_examples"][0]["reason"],"Direct transfer")
             profile.write_text("unconfirmed edit",encoding="utf-8")
             with self.assertRaisesRegex(ValueError,"confirmed active version"):

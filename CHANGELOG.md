@@ -2,6 +2,34 @@
 
 All notable changes to Personal Academic Radar are documented here.
 
+## 0.10.0 — 2026-08-11
+
+### Added
+
+- Evidence-structured screening with independently scored relevance, mechanism,
+  transfer, evidence quality, and boundary dimensions.
+- Manual abstract recovery from paper cards, with provenance and automatic
+  rescreening after a successful addition.
+- Optional official Elsevier Article API recovery for exact-DOI records.
+- Feedback precision and error indicators in the health dashboard.
+
+### Changed
+
+- Recommendation reasons now expose the abstract evidence, profile connection,
+  transfer value, and limitations behind each decision.
+- Daily profile review uses the cumulative feedback history while retaining an
+  exact unseen-event boundary for idempotent automation.
+- Source coverage reports missing-abstract counts and official-issue failures.
+- The status page shows only actionable failures instead of duplicating task
+  history and healthy checks.
+
+### Fixed
+
+- Profile reviews that correctly conclude no change is needed are now visible.
+- Legacy migration 012 checksums remain accepted by upgraded installations.
+- The Today view falls back to the latest completed recommendation set and
+  includes selected rescreen results.
+
 ## 0.9.0 — 2026-07-17
 
 ### Added

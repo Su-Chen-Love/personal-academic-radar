@@ -36,7 +36,7 @@ class OfficialIssueTests(unittest.TestCase):
                  "published-print":{"date-parts":[[2026,7,16]]},"type":"journal-article","author":[],
                  "link":[{"URL":"https://api.elsevier.com/content/article/PII:S037722172600002X?httpAccept=text/xml"}]},
                 {"DOI":"10.1016/j.ejor.2026.3","title":["Future"],"volume":"332","issue":"3",
-                 "published-print":{"date-parts":[[2026,8,1]]},"type":"journal-article","author":[]},
+                 "published-print":{"date-parts":[[2099,8,1]]},"type":"journal-article","author":[]},
             ]}},
             {"doi":"https://doi.org/10.1016/j.ejor.2026.2","abstract_inverted_index":{}},
             {"doi":"https://doi.org/10.1016/j.ejor.2026.1","abstract_inverted_index":{}},
@@ -122,7 +122,7 @@ class OfficialIssueTests(unittest.TestCase):
             }]}
             index = """
               <a itemprop='url' content='https://www.nature.com/nathumbehav/volumes/10/issues/7'>
-                <span itemprop='datePublished' content='August 2026'></span></a>
+                <span itemprop='datePublished' content='August 2099'></span></a>
               <a itemprop='url' content='https://www.nature.com/nathumbehav/volumes/10/issues/6'>
                 <span itemprop='datePublished' content='June 2026'></span></a>
               <a itemprop='url' content='https://www.nature.com/nathumbehav/volumes/10/issues/5'>
@@ -167,7 +167,7 @@ class OfficialIssueTests(unittest.TestCase):
             items = [
                 {
                     "DOI": "10.1080/00140139.2026.7", "title": ["Future issue paper"],
-                    "published-print": {"date-parts": [[2026, 8, 1]]}, "volume": "69", "issue": "7",
+                    "published-print": {"date-parts": [[2099, 8, 1]]}, "volume": "69", "issue": "7",
                     "resource": {"primary": {"URL": "https://www.tandfonline.com/doi/full/10.1080/00140139.2026.7"}},
                 },
                 {

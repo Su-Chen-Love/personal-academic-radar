@@ -15,7 +15,7 @@ from academic_radar.governance import publication_decision
 from academic_radar.product import abstract_source_for, classify_low_priority, manual_identity_for_title
 from academic_radar.storage import latest_schema_version, upgrade_database
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 try:
     import tomllib
@@ -299,6 +299,71 @@ def extract_json(text: str) -> dict[str,Any]:
     value["matched_themes"]=[clean_text(x) for x in value["matched_themes"]][:8]
     return value
 
+
+SCREENING_RUBRIC_VERSION = "evidence-v1"
+SCREENING_DIMENSIONS = {
+    "core_relevance": 0.40,
+    "mechanism_alignment": 0.25,
+    "method_transfer": 0.20,
+    "evidence_quality": 0.15,
+}
+
+
+def structured_judgment(item: dict[str,Any], paper: sqlite3.Row, threshold: float) -> dict[str,Any]:
+    """Validate evidence-bearing reasoning and calculate the authoritative score."""
+
+    reasoning = item.get("reasoning")
+    dimensions = item.get("score_dimensions")
+    if not isinstance(reasoning, dict) or not isinstance(dimensions, dict):
+        raise ValueError("structured results require reasoning and score_dimensions objects")
+    required_reasoning = ("evidence_summary", "profile_connection", "transfer_value", "limitations")
+    missing = [key for key in required_reasoning if key not in reasoning]
+    if missing:
+        raise ValueError("structured reasoning missing fields: " + ", ".join(missing))
+    clean_reasoning = {key: clean_text(reasoning.get(key)) for key in required_reasoning}
+    too_short = [key for key,value in clean_reasoning.items() if len(value) < 8]
+    if too_short:
+        raise ValueError("structured reasoning is too shallow: " + ", ".join(too_short))
+    required_dimensions = {*SCREENING_DIMENSIONS, "boundary_penalty"}
+    if not required_dimensions.issubset(dimensions):
+        raise ValueError("score_dimensions missing fields")
+    clean_dimensions = {
+        key: max(0.0, min(1.0, float(dimensions[key]))) for key in required_dimensions
+    }
+    score = sum(clean_dimensions[key] * weight for key,weight in SCREENING_DIMENSIONS.items())
+    score -= 0.35 * clean_dimensions["boundary_penalty"]
+    score = max(0.0, min(1.0, round(score, 4)))
+    abstract_missing = not (paper["abstract"] or "").strip()
+    if abstract_missing:
+        if not re.search(r"摘要.{0,4}(缺失|不可得|未找到)|abstract.{0,8}(missing|unavailable)", clean_reasoning["evidence_summary"], re.I):
+            raise ValueError("missing-abstract reasoning must explicitly identify the evidence limitation")
+        clean_dimensions["evidence_quality"] = min(clean_dimensions["evidence_quality"], 0.25)
+        score = sum(clean_dimensions[key] * weight for key,weight in SCREENING_DIMENSIONS.items())
+        score -= 0.35 * clean_dimensions["boundary_penalty"]
+        score = min(0.69, max(0.0, round(score, 4)))
+    themes = item.get("matched_themes")
+    if not isinstance(themes, list):
+        raise ValueError("matched_themes must be a list")
+    confidence = max(0.0, min(1.0, float(item.get("confidence", 0))))
+    if abstract_missing:
+        confidence = min(confidence, 0.5)
+    reasons = (
+        f"论文证据：{clean_reasoning['evidence_summary']}；"
+        f"画像关联：{clean_reasoning['profile_connection']}；"
+        f"可迁移价值：{clean_reasoning['transfer_value']}；"
+        f"边界与不确定性：{clean_reasoning['limitations']}"
+    )
+    return {
+        "relevant": score >= threshold,
+        "score": score,
+        "reasons": reasons,
+        "matched_themes": [clean_text(value) for value in themes if clean_text(value)][:8],
+        "confidence": confidence,
+        "reasoning": clean_reasoning,
+        "score_dimensions": clean_dimensions,
+        "rubric_version": SCREENING_RUBRIC_VERSION,
+    }
+
 def upsert(db: sqlite3.Connection, p: Paper, now: str) -> bool:
     exists=db.execute("SELECT 1 FROM papers WHERE identity=?",(p.identity,)).fetchone() is not None
     if not exists and p.doi:
@@ -566,10 +631,22 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
     queue_dir=state/"agent_queue"; queue_dir.mkdir(exist_ok=True)
     queue_path=queue_dir/f"{run_id.replace('+','_')}.json"
     examples=feedback_snapshot(db,int(cfg.get("feedback_examples_per_class",20)))
-    payload={"schema_version":2,"run_id":run_id,"profile_hash":phash,"profile_version_id":active["id"],
+    payload={"schema_version":3,"run_id":run_id,"profile_hash":phash,"profile_version_id":active["id"],
              "profile_confirmed_at":active["confirmed_at"],"profile_path":str(profile_path),
              "feedback_examples":examples,"threshold":float(cfg.get("relevance_threshold",0.70)),
-             "papers":papers,"source_failures":failures,"collection_run_id":batch_run}
+             "papers":papers,"source_failures":failures,"collection_run_id":batch_run,
+             "evaluation_policy":{
+               "rubric_version":SCREENING_RUBRIC_VERSION,
+               "result_fields":["identity","reasoning","score_dimensions","matched_themes","confidence"],
+               "reasoning_fields":["evidence_summary","profile_connection","transfer_value","limitations"],
+               "score_dimensions":SCREENING_DIMENSIONS | {"boundary_penalty":-0.35},
+               "requirements":[
+                 "Base evidence_summary on the abstract's actual question, method, mechanism, or finding.",
+                 "Explain a specific profile connection and transferable value; venue or keyword overlap is insufficient.",
+                 "State limitations and negative-feedback boundaries explicitly.",
+                 "For a missing abstract, evidence_summary must explicitly say 摘要缺失 or 摘要不可得; score cannot reach 0.70 and confidence cannot exceed 0.50.",
+               ],
+             }}
     queue_path.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
     summary={"run_id":run_id,"collected":len(collected),"new":len(new),"candidates":len(papers),
              "queue_path":str(queue_path),"profile_path":str(profile_path),"source_failures":failures,
@@ -632,9 +709,15 @@ def agent_import(config_path: Path, results_path: Path) -> int:
     for item in results:
         identity_value=item.get("identity",""); row=db.execute("SELECT * FROM papers WHERE identity=?",(identity_value,)).fetchone()
         if not row: raise ValueError(f"Unknown paper identity: {identity_value}")
-        result=extract_json(json.dumps(item,ensure_ascii=False)); result["relevant"]=result["score"]>=threshold
-        if not (row["abstract"] or "").strip():
-            result["confidence"]=min(result["confidence"],0.5)
+        if int(queue.get("schema_version", 1)) >= 3:
+            result=structured_judgment(item,row,threshold)
+        else:
+            result=extract_json(json.dumps(item,ensure_ascii=False)); result["relevant"]=result["score"]>=threshold
+            if not (row["abstract"] or "").strip():
+                result["confidence"]=min(result["confidence"],0.5)
+            result["reasoning"]={}
+            result["score_dimensions"]={}
+            result["rubric_version"]="legacy"
         validated.append((identity_value,row,result))
         if result["relevant"]: selected.append((row_to_paper(row),result))
     digest_dir=state/"digests"; digest_dir.mkdir(exist_ok=True)
@@ -647,11 +730,13 @@ def agent_import(config_path: Path, results_path: Path) -> int:
         for identity_value,_,result in validated:
             db.execute("""INSERT OR REPLACE INTO screenings(
               identity,profile_hash,provider,model,relevant,score,reasons,themes_json,confidence,screened_at,
-              profile_version_id,feedback_snapshot_json,run_id
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              profile_version_id,feedback_snapshot_json,run_id,reasoning_json,
+              score_dimensions_json,rubric_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
               (identity_value,phash,"codex-agent",model,int(result["relevant"]),result["score"],
                result["reasons"],json.dumps(result["matched_themes"],ensure_ascii=False),result["confidence"],now,
-               version_id,snapshot,run_id))
+               version_id,snapshot,run_id,json.dumps(result["reasoning"],ensure_ascii=False),
+               json.dumps(result["score_dimensions"],ensure_ascii=False),result["rubric_version"]))
             db.execute("UPDATE papers SET needs_rescreen=0 WHERE identity=?",(identity_value,))
             if result["relevant"]:
                 db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'selected')",(run_id,identity_value))

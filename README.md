@@ -4,7 +4,7 @@
 
 Personal Academic Assistant 是面向单个研究者的本地优先文献助手。代码可以公开；配置、研究兴趣、SQLite、反馈、队列、摘要结果、日志和 PDF 始终保存在私有状态目录，默认是 `~/.local/share/personal-academic-radar`。
 
-语义判断只使用 Codex 宿主的“导出队列 → 判断 → 原子导入”流程，不需要也不支持独立模型 API。摘要只从可追溯元数据或官方论文页获取，绝不生成或改写后冒充原始摘要。
+语义判断只使用 Codex 宿主的“导出队列 → 结构化证据判断 → 原子导入”流程，不需要也不支持独立模型 API。推荐理由必须分别说明论文证据、研究画像连接、可迁移价值与局限，并由分维度评分计算最终匹配度。摘要只从可追溯元数据或官方论文页获取，绝不生成或改写后冒充原始摘要。
 
 ## 最短安装流程
 
@@ -82,7 +82,7 @@ academic-radar abstracts export-missing \
   --output missing-abstracts.json
 ```
 
-自动流程依次复用同 DOI 本地记录，并访问 Crossref、OpenAlex、Semantic Scholar、Europe PMC、PubMed 和出版商结构化元数据。每次尝试都记录来源、URL、时间和失败原因；缺失项会反映在“更新与检查”的 Codex 任务中。人工导入接受严格 JSON/CSV 证据包，并校验 identity、URL、重复项和明显截断内容。
+自动流程依次复用同 DOI 本地记录，并访问 Crossref、OpenAlex、Semantic Scholar、Europe PMC、PubMed 和出版商结构化元数据；配置 `ELSEVIER_API_KEY` 后还会使用 Elsevier 官方元数据接口补全 ScienceDirect 论文。每次尝试都记录来源、URL、时间和失败原因；缺失项可在论文卡片中手动补充完整摘要，保存后会立即更新状态并安排重新评分。批量人工导入仍接受严格 JSON/CSV 证据包，并校验 identity、URL、重复项和明显截断内容。
 
 ## 清洗、备份与恢复
 

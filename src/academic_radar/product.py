@@ -393,6 +393,44 @@ def add_manual_paper(db_path: Path, apa_citation: str, abstract: str) -> dict[st
         db.close()
 
 
+def add_manual_abstract(db_path: Path, identity: str, abstract: str, source_url: str = "") -> dict[str, Any]:
+    """Fill one missing abstract with user-verified evidence and queue re-screening."""
+
+    abstract_text = re.sub(r"\s+", " ", abstract or "").strip()
+    if len(abstract_text) < 80:
+        raise ValueError("摘要至少需要 80 个字符，请粘贴完整摘要而不是搜索片段")
+    if len(abstract_text) > 50_000:
+        raise ValueError("摘要超过 50000 个字符，请检查是否误粘贴了全文")
+    url = (source_url or "").strip()
+    if url and urllib.parse.urlparse(url).scheme not in {"http", "https"}:
+        raise ValueError("摘要来源需要是 http 或 https 链接")
+    now = utc_now()
+    db = connect(db_path)
+    try:
+        paper = db.execute("SELECT * FROM papers WHERE identity=?", (identity,)).fetchone()
+        if not paper:
+            raise ValueError("没有找到这篇文献")
+        if (paper["abstract"] or "").strip():
+            raise ValueError("这篇文献已经有摘要，无需重复添加")
+        with db:
+            db.execute(
+                """UPDATE papers SET abstract=?,abstract_source='user-provided',
+                abstract_source_url=?,
+                abstract_retrieved_at=?,abstract_failure_reason=NULL,needs_rescreen=1,updated_at=?
+                WHERE identity=?""",
+                (abstract_text, url or paper["url"] or None, now, now, identity),
+            )
+            db.execute(
+                """INSERT INTO abstract_attempts(
+                task_id,identity,provider,status,source_url,evidence_type,detail,attempted_at
+                ) VALUES(?,?,'manual','found',?,'official_page_manual','用户核验并补充完整摘要',?)""",
+                ("manual-" + now, identity, url or paper["url"] or None, now),
+            )
+        return {"identity": identity, "title": paper["title"], "needs_rescreen": True}
+    finally:
+        db.close()
+
+
 def source_coverage(db_path: Path, configured_sources: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     db = connect(db_path)
     try:
@@ -412,6 +450,7 @@ def source_coverage(db_path: Path, configured_sources: list[dict[str, Any]]) -> 
             output[name] = {
                 "paper_count": count,
                 "abstract_count": abstracts,
+                "missing_abstracts": count - abstracts,
                 "abstract_percent": round((abstracts / count * 100), 1) if count else 0,
                 "oldest_published": min(dates) if dates else "",
                 "newest_published": max(dates) if dates else "",
