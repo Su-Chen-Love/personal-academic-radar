@@ -2,6 +2,23 @@
 
 All notable changes to Personal Academic Radar are documented here.
 
+## 0.10.1 — 2026-08-29
+
+### Changed
+
+- Reader-facing AI judgments are now natural analytical syntheses instead of
+  mechanically concatenated audit fields.
+- New screening queues specify explicit depth contracts for evidence,
+  profile connection, transferable value, limitations, and recommendation
+  reasons.
+
+### Fixed
+
+- Agent import reports every invalid result in one pass, including its paper
+  identity, instead of stopping at the first shallow field.
+- Digest creation is staged with the database transaction so a failed import
+  does not leave a misleading completed digest.
+
 ## 0.10.0 — 2026-08-11
 
 ### Added

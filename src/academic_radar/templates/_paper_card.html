@@ -18,7 +18,7 @@
         {% if paper.interest == 'interested' %}已完成 · 感兴趣{% elif paper.interest == 'not_interested' %}已完成 · 不感兴趣{% endif %}
       </span>
     </div>
-    {% if paper.reasons %}<p class="reason"><strong>AI 推荐理由：</strong>{{ paper.reasons }}</p>{% endif %}
+    {% if paper.reasons %}<p class="reason"><strong>AI 阅读判断：</strong>{{ paper.reasons }}</p>{% endif %}
     <details class="paper-details">
       <summary>展开详情</summary>
       <div class="paper-detail-content">

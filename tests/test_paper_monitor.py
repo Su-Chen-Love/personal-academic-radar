@@ -14,7 +14,7 @@ class MonitorTests(unittest.TestCase):
         return {
             "identity": identity,
             "reasoning": {
-                "evidence_summary": "摘要研究人在回路的偏好表达与候选方案迭代过程",
+                "evidence_summary": "摘要研究人在回路的偏好表达如何影响候选方案的迭代与最终选择过程",
                 "profile_connection": "直接连接交互式优化与偏好融合这一核心研究主题",
                 "transfer_value": "实验任务和过程指标可迁移到车辆路径决策支持研究",
                 "limitations": "应用场景不同且尚需核对样本和外部效度",
@@ -26,6 +26,7 @@ class MonitorTests(unittest.TestCase):
             },
             "matched_themes": ["interactive optimization"],
             "confidence": confidence,
+            "recommendation_reason": "摘要显示研究通过人在回路的偏好表达推进候选方案迭代；其价值在于把交互式优化机制转成可复用的实验任务和过程指标，可迁移到车辆路径决策支持，但应用场景与外部效度仍需进一步核验。",
         }
 
     def test_doi_normalization_and_identity(self):
@@ -268,8 +269,62 @@ class MonitorTests(unittest.TestCase):
             path=root/"results.json"; path.write_text(json.dumps(results),encoding="utf-8")
             self.assertEqual(pm.agent_import(root/"config.toml",path),0)
             db=pm.db_open(root/"papers.sqlite3")
-            row=db.execute("select provider,relevant,score from screenings").fetchone()
+            row=db.execute("select provider,relevant,score,reasons,rubric_version from screenings").fetchone()
             self.assertEqual((row[0],row[1],row[2]),("codex-agent",1,0.88))
+            self.assertIn("人在回路",row[3])
+            self.assertNotIn("论文证据：",row[3])
+            self.assertEqual(row[4],"evidence-v2")
+
+    def test_agent_import_reports_all_shallow_results_without_writing_digest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/"research-profile.md").write_text("profile",encoding="utf-8")
+            config=root/"config.toml"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "A"\ntype = "crossref"\nissn = "1234"\n',encoding="utf-8")
+            db=pm.db_open(root/"papers.sqlite3")
+            identities=[]
+            for suffix in ("a","b"):
+                paper=pm.Paper(f"doi:10.1/{suffix}",f"10.1/{suffix}",suffix,"Abstract evidence", "V","2026-01-01","u",[],"s")
+                paper.publication_type_raw="journal-article"; paper.publication_type_source="crossref"
+                pm.upsert(db,paper,"now"); identities.append(paper.identity)
+            db.commit(); db.close()
+            with patch("builtins.print") as output: pm.agent_export(config,no_collect=True)
+            summary=json.loads(output.call_args.args[0])
+            first=self.structured_result(identities[0]); first.pop("recommendation_reason")
+            second=self.structured_result(identities[1]); second["reasoning"]["limitations"]="场景不同。"
+            path=root/"invalid.json"
+            path.write_text(json.dumps({"run_id":summary["run_id"],"profile_hash":json.loads(Path(summary["queue_path"]).read_text())["profile_hash"],
+                                        "model":"codex-test","results":[first,second]}),encoding="utf-8")
+            with self.assertRaises(ValueError) as error: pm.agent_import(config,path)
+            message=str(error.exception)
+            self.assertIn(identities[0],message); self.assertIn("recommendation_reason",message)
+            self.assertIn(identities[1],message); self.assertIn("limitations<18",message)
+            db=pm.db_open(root/"papers.sqlite3")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM screenings").fetchone()[0],0)
+            db.close()
+            self.assertFalse(any((root/"digests").glob("*-agent.md")))
+
+    def test_schema_three_queue_keeps_legacy_reason_compatibility(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/"research-profile.md").write_text("profile",encoding="utf-8")
+            config=root/"config.toml"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "A"\ntype = "crossref"\nissn = "1234"\n',encoding="utf-8")
+            db=pm.db_open(root/"papers.sqlite3")
+            paper=pm.Paper("doi:10.1/legacy","10.1/legacy","Legacy","Abstract evidence","V","2026-01-01","u",[],"s")
+            paper.publication_type_raw="journal-article"; paper.publication_type_source="crossref"
+            pm.upsert(db,paper,"now"); db.commit(); db.close()
+            with patch("builtins.print") as output: pm.agent_export(config,no_collect=True)
+            summary=json.loads(output.call_args.args[0]); queue_path=Path(summary["queue_path"])
+            queue=json.loads(queue_path.read_text()); queue["schema_version"]=3
+            queue_path.write_text(json.dumps(queue),encoding="utf-8")
+            result=self.structured_result(paper.identity); result.pop("recommendation_reason")
+            path=root/"legacy.json"
+            path.write_text(json.dumps({"run_id":summary["run_id"],"profile_hash":queue["profile_hash"],
+                                        "model":"codex-test","results":[result]}),encoding="utf-8")
+            self.assertEqual(pm.agent_import(config,path),0)
+            db=pm.db_open(root/"papers.sqlite3")
+            reason=db.execute("SELECT reasons FROM screenings").fetchone()[0]
+            db.close()
+            self.assertTrue(reason.startswith("论文证据："))
 
     def test_agent_import_rejects_partial_exported_queue(self):
         with tempfile.TemporaryDirectory() as td:
@@ -335,9 +390,11 @@ class MonitorTests(unittest.TestCase):
             with patch("builtins.print") as output:
                 pm.agent_export(config,no_collect=True)
             summary=json.loads(output.call_args.args[0]); queue=json.loads(Path(summary["queue_path"]).read_text())
-            self.assertEqual(queue["schema_version"],3)
-            self.assertEqual(queue["evaluation_policy"]["rubric_version"],"evidence-v1")
+            self.assertEqual(queue["schema_version"],4)
+            self.assertEqual(queue["evaluation_policy"]["rubric_version"],"evidence-v2")
             self.assertIn("reasoning", queue["evaluation_policy"]["result_fields"])
+            self.assertIn("recommendation_reason", queue["evaluation_policy"]["result_fields"])
+            self.assertEqual(queue["evaluation_policy"]["minimum_reasoning_characters"]["limitations"],18)
             self.assertEqual(queue["feedback_examples"][0]["reason"],"Direct transfer")
             profile.write_text("unconfirmed edit",encoding="utf-8")
             with self.assertRaisesRegex(ValueError,"confirmed active version"):

@@ -15,7 +15,7 @@ from academic_radar.governance import publication_decision
 from academic_radar.product import abstract_source_for, classify_low_priority, manual_identity_for_title
 from academic_radar.storage import latest_schema_version, upgrade_database
 
-VERSION = "0.10.0"
+VERSION = "0.10.1"
 
 try:
     import tomllib
@@ -300,7 +300,8 @@ def extract_json(text: str) -> dict[str,Any]:
     return value
 
 
-SCREENING_RUBRIC_VERSION = "evidence-v1"
+SCREENING_SCHEMA_VERSION = 4
+SCREENING_RUBRIC_VERSION = "evidence-v2"
 SCREENING_DIMENSIONS = {
     "core_relevance": 0.40,
     "mechanism_alignment": 0.25,
@@ -308,8 +309,52 @@ SCREENING_DIMENSIONS = {
     "evidence_quality": 0.15,
 }
 
+REASONING_MIN_LENGTHS = {
+    "evidence_summary": 24,
+    "profile_connection": 18,
+    "transfer_value": 18,
+    "limitations": 18,
+}
+RECOMMENDATION_REASON_MIN_LENGTH = 48
+RECOMMENDATION_REASON_MAX_LENGTH = 360
 
-def structured_judgment(item: dict[str,Any], paper: sqlite3.Row, threshold: float) -> dict[str,Any]:
+
+def legacy_reason_text(reasoning: dict[str,str]) -> str:
+    """Render the audit fields for queues created before reader-facing summaries."""
+
+    return (
+        f"论文证据：{reasoning['evidence_summary']}；"
+        f"画像关联：{reasoning['profile_connection']}；"
+        f"可迁移价值：{reasoning['transfer_value']}；"
+        f"边界与不确定性：{reasoning['limitations']}"
+    )
+
+
+def recommendation_reason(item: dict[str,Any], reasoning: dict[str,str], required: bool) -> str:
+    """Validate a natural reader-facing synthesis separately from audit fields."""
+
+    value = clean_text(item.get("recommendation_reason"))
+    if not value:
+        if required:
+            raise ValueError("recommendation_reason is required")
+        return legacy_reason_text(reasoning)
+    if len(value) < RECOMMENDATION_REASON_MIN_LENGTH:
+        raise ValueError(
+            f"recommendation_reason is too shallow (minimum {RECOMMENDATION_REASON_MIN_LENGTH} characters)"
+        )
+    if len(value) > RECOMMENDATION_REASON_MAX_LENGTH:
+        raise ValueError(
+            f"recommendation_reason is too long (maximum {RECOMMENDATION_REASON_MAX_LENGTH} characters)"
+        )
+    if value in reasoning.values():
+        raise ValueError("recommendation_reason must synthesize rather than repeat one audit field")
+    if any(label in value for label in ("论文证据：", "画像关联：", "可迁移价值：", "边界与不确定性：")):
+        raise ValueError("recommendation_reason must be natural prose, not concatenated audit labels")
+    return value
+
+
+def structured_judgment(item: dict[str,Any], paper: sqlite3.Row, threshold: float,
+                        schema_version: int=SCREENING_SCHEMA_VERSION) -> dict[str,Any]:
     """Validate evidence-bearing reasoning and calculate the authoritative score."""
 
     reasoning = item.get("reasoning")
@@ -321,7 +366,11 @@ def structured_judgment(item: dict[str,Any], paper: sqlite3.Row, threshold: floa
     if missing:
         raise ValueError("structured reasoning missing fields: " + ", ".join(missing))
     clean_reasoning = {key: clean_text(reasoning.get(key)) for key in required_reasoning}
-    too_short = [key for key,value in clean_reasoning.items() if len(value) < 8]
+    minimums = REASONING_MIN_LENGTHS if schema_version >= 4 else {key: 8 for key in required_reasoning}
+    too_short = [
+        f"{key}<{minimums[key]}" for key,value in clean_reasoning.items()
+        if len(value) < minimums[key]
+    ]
     if too_short:
         raise ValueError("structured reasoning is too shallow: " + ", ".join(too_short))
     required_dimensions = {*SCREENING_DIMENSIONS, "boundary_penalty"}
@@ -347,12 +396,7 @@ def structured_judgment(item: dict[str,Any], paper: sqlite3.Row, threshold: floa
     confidence = max(0.0, min(1.0, float(item.get("confidence", 0))))
     if abstract_missing:
         confidence = min(confidence, 0.5)
-    reasons = (
-        f"论文证据：{clean_reasoning['evidence_summary']}；"
-        f"画像关联：{clean_reasoning['profile_connection']}；"
-        f"可迁移价值：{clean_reasoning['transfer_value']}；"
-        f"边界与不确定性：{clean_reasoning['limitations']}"
-    )
+    reasons = recommendation_reason(item, clean_reasoning, required=schema_version >= 4)
     return {
         "relevant": score >= threshold,
         "score": score,
@@ -631,19 +675,27 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
     queue_dir=state/"agent_queue"; queue_dir.mkdir(exist_ok=True)
     queue_path=queue_dir/f"{run_id.replace('+','_')}.json"
     examples=feedback_snapshot(db,int(cfg.get("feedback_examples_per_class",20)))
-    payload={"schema_version":3,"run_id":run_id,"profile_hash":phash,"profile_version_id":active["id"],
+    payload={"schema_version":SCREENING_SCHEMA_VERSION,"run_id":run_id,"profile_hash":phash,"profile_version_id":active["id"],
              "profile_confirmed_at":active["confirmed_at"],"profile_path":str(profile_path),
              "feedback_examples":examples,"threshold":float(cfg.get("relevance_threshold",0.70)),
              "papers":papers,"source_failures":failures,"collection_run_id":batch_run,
              "evaluation_policy":{
                "rubric_version":SCREENING_RUBRIC_VERSION,
-               "result_fields":["identity","reasoning","score_dimensions","matched_themes","confidence"],
+               "result_fields":["identity","reasoning","score_dimensions","matched_themes","confidence","recommendation_reason"],
                "reasoning_fields":["evidence_summary","profile_connection","transfer_value","limitations"],
+               "minimum_reasoning_characters":REASONING_MIN_LENGTHS,
+               "recommendation_reason_contract":{
+                 "minimum_characters":RECOMMENDATION_REASON_MIN_LENGTH,
+                 "maximum_characters":RECOMMENDATION_REASON_MAX_LENGTH,
+                 "purpose":"Natural reader-facing Chinese synthesis; separate from the four audit fields.",
+               },
                "score_dimensions":SCREENING_DIMENSIONS | {"boundary_penalty":-0.35},
                "requirements":[
-                 "Base evidence_summary on the abstract's actual question, method, mechanism, or finding.",
-                 "Explain a specific profile connection and transferable value; venue or keyword overlap is insufficient.",
-                 "State limitations and negative-feedback boundaries explicitly.",
+                 "Base evidence_summary on the abstract's actual question, method, mechanism, and finding; do not copy or truncate the abstract.",
+                 "Name the precise profile mechanism and a concrete transferable design, measure, hypothesis, or method; venue or keyword overlap is insufficient.",
+                 "State the main evidence boundary and why it limits transfer, rather than naming only the application domain.",
+                 "Write recommendation_reason as natural Chinese analytical prose: lead with the paper's distinctive mechanism or finding, explain why it matters to the active research, name the most concrete transfer, and close with the decisive caveat.",
+                 "Do not concatenate audit labels, merely restate the title, praise the venue, list keywords, or use generic claims such as 有参考价值 without saying what transfers and why.",
                  "For a missing abstract, evidence_summary must explicitly say 摘要缺失 or 摘要不可得; score cannot reach 0.70 and confidence cannot exceed 0.50.",
                ],
              }}
@@ -705,48 +757,68 @@ def agent_import(config_path: Path, results_path: Path) -> int:
         missing=sorted(expected-received); extra=sorted(received-expected)
         raise ValueError(f"Results must cover the complete queue (missing={len(missing)}, extra={len(extra)})")
     threshold=float(cfg.get("relevance_threshold",0.70))
-    validated=[]
+    validated=[]; validation_errors=[]
+    queue_schema_version=int(queue.get("schema_version", 1))
     for item in results:
-        identity_value=item.get("identity",""); row=db.execute("SELECT * FROM papers WHERE identity=?",(identity_value,)).fetchone()
-        if not row: raise ValueError(f"Unknown paper identity: {identity_value}")
-        if int(queue.get("schema_version", 1)) >= 3:
-            result=structured_judgment(item,row,threshold)
-        else:
-            result=extract_json(json.dumps(item,ensure_ascii=False)); result["relevant"]=result["score"]>=threshold
-            if not (row["abstract"] or "").strip():
-                result["confidence"]=min(result["confidence"],0.5)
-            result["reasoning"]={}
-            result["score_dimensions"]={}
-            result["rubric_version"]="legacy"
+        identity_value=str(item.get("identity","") or "")
+        row=db.execute("SELECT * FROM papers WHERE identity=?",(identity_value,)).fetchone()
+        if not row:
+            validation_errors.append(f"{identity_value or '<missing identity>'}: unknown paper identity")
+            continue
+        try:
+            if queue_schema_version >= 3:
+                result=structured_judgment(item,row,threshold,queue_schema_version)
+            else:
+                result=extract_json(json.dumps(item,ensure_ascii=False)); result["relevant"]=result["score"]>=threshold
+                if not (row["abstract"] or "").strip():
+                    result["confidence"]=min(result["confidence"],0.5)
+                result["reasoning"]={}
+                result["score_dimensions"]={}
+                result["rubric_version"]="legacy"
+        except (TypeError, ValueError) as exc:
+            validation_errors.append(f"{identity_value}: {exc}")
+            continue
         validated.append((identity_value,row,result))
         if result["relevant"]: selected.append((row_to_paper(row),result))
-    digest_dir=state/"digests"; digest_dir.mkdir(exist_ok=True)
-    markdown,_=render_digest(selected,data.get("source_failures",[]),run_id)
-    digest_path=digest_dir/f"{str(run_id).replace('+','_')}-agent.md"; digest_path.write_text(markdown,encoding="utf-8")
+    if validation_errors:
+        db.close()
+        raise ValueError("Agent result validation failed:\n- " + "\n- ".join(validation_errors))
     snapshot=job["feedback_snapshot_json"]; version_id=job["profile_version_id"]
     model=str(data.get("model","")).strip()
     if not model: raise ValueError("results must identify the actual model")
-    with db:
-        for identity_value,_,result in validated:
-            db.execute("""INSERT OR REPLACE INTO screenings(
+    digest_dir=state/"digests"; digest_dir.mkdir(exist_ok=True)
+    markdown,_=render_digest(selected,data.get("source_failures",[]),run_id)
+    digest_path=digest_dir/f"{str(run_id).replace('+','_')}-agent.md"
+    digest_tmp=digest_path.with_name(f".{digest_path.name}.{os.getpid()}.tmp")
+    digest_tmp.write_text(markdown,encoding="utf-8")
+    digest_replaced=False
+    try:
+        with db:
+            for identity_value,_,result in validated:
+                db.execute("""INSERT OR REPLACE INTO screenings(
               identity,profile_hash,provider,model,relevant,score,reasons,themes_json,confidence,screened_at,
               profile_version_id,feedback_snapshot_json,run_id,reasoning_json,
               score_dimensions_json,rubric_version
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-              (identity_value,phash,"codex-agent",model,int(result["relevant"]),result["score"],
-               result["reasons"],json.dumps(result["matched_themes"],ensure_ascii=False),result["confidence"],now,
-               version_id,snapshot,run_id,json.dumps(result["reasoning"],ensure_ascii=False),
-               json.dumps(result["score_dimensions"],ensure_ascii=False),result["rubric_version"]))
-            db.execute("UPDATE papers SET needs_rescreen=0 WHERE identity=?",(identity_value,))
-            if result["relevant"]:
-                db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'selected')",(run_id,identity_value))
-                if db.execute("SELECT 1 FROM run_papers WHERE run_id=? AND identity=? AND role='new'",(run_id,identity_value)).fetchone():
-                    db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'selected_new')",(run_id,identity_value))
-        imported=len(validated)
-        db.execute("""UPDATE pipeline_runs SET status='succeeded',finished_at=?,relevant_count=?,details_json=?
-          WHERE run_id=?""",(now,len(selected),json.dumps({"results_path":str(results_path),"digest_path":str(digest_path)},ensure_ascii=False),run_id))
-        db.execute("""UPDATE agent_jobs SET status='imported',results_path=?,imported_count=?,imported_at=?
-          WHERE run_id=?""",(str(results_path),imported,now,run_id))
+                  (identity_value,phash,"codex-agent",model,int(result["relevant"]),result["score"],
+                   result["reasons"],json.dumps(result["matched_themes"],ensure_ascii=False),result["confidence"],now,
+                   version_id,snapshot,run_id,json.dumps(result["reasoning"],ensure_ascii=False),
+                   json.dumps(result["score_dimensions"],ensure_ascii=False),result["rubric_version"]))
+                db.execute("UPDATE papers SET needs_rescreen=0 WHERE identity=?",(identity_value,))
+                if result["relevant"]:
+                    db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'selected')",(run_id,identity_value))
+                    if db.execute("SELECT 1 FROM run_papers WHERE run_id=? AND identity=? AND role='new'",(run_id,identity_value)).fetchone():
+                        db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'selected_new')",(run_id,identity_value))
+            imported=len(validated)
+            db.execute("""UPDATE pipeline_runs SET status='succeeded',finished_at=?,relevant_count=?,details_json=?
+              WHERE run_id=?""",(now,len(selected),json.dumps({"results_path":str(results_path),"digest_path":str(digest_path)},ensure_ascii=False),run_id))
+            db.execute("""UPDATE agent_jobs SET status='imported',results_path=?,imported_count=?,imported_at=?
+              WHERE run_id=?""",(str(results_path),imported,now,run_id))
+            os.replace(digest_tmp,digest_path); digest_replaced=True
+    except Exception:
+        if digest_tmp.exists(): digest_tmp.unlink()
+        if digest_replaced and digest_path.exists(): digest_path.unlink()
+        raise
     db.close()
     print(json.dumps({"run_id":run_id,"imported":imported,"relevant":len(selected),"digest_path":str(digest_path)},ensure_ascii=False,indent=2))
     return 0

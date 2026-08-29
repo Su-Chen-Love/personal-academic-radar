@@ -817,7 +817,9 @@ def create_app(config_path: Path) -> FastAPI:
                 f"9. 阅读 {state / 'agent_queue'} 中最新的 JSON 队列。逐篇按已激活研究兴趣和反馈判断；每篇必须恰好有一条结果。",
                 "10. 将严格 results JSON 保存到 agent-results 目录，保留队列的 run_id、profile_hash、source_failures。"
                 "按 evaluation_policy 为每篇提供 identity、reasoning（论文证据、画像关联、可迁移价值、局限）、"
-                "score_dimensions、matched_themes、confidence；最终分数由导入程序计算。即使队列为空，也写入覆盖完整队列的空 results 数组。",
+                "score_dimensions、matched_themes、confidence 和自然中文 recommendation_reason；后者必须综合独特证据、"
+                "精确画像机制、具体可迁移内容与决定性局限，不能机械拼接字段标签或复述题名。最终分数由导入程序计算。"
+                "即使队列为空，也写入覆盖完整队列的空 results 数组。",
                 f"11. 运行：python3 {monitor_runner_path(state)} agent-import --config {config_path} --results <结果 JSON 路径>。",
                 f"12. 最后运行：academic-radar verify --config {config_path}，报告 API 采集数、官网卷期与论文数、补全摘要数、判断数、达到 70 分的入选论文、来源失败和仍需处理的项目。",
             ])

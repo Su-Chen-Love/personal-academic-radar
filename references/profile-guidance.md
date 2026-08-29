@@ -32,6 +32,8 @@ Score from 0 to 1:
 
 Require four evidence-bearing parts: what the abstract actually studies or finds, the precise profile connection, the transferable value, and the main boundary or uncertainty. Score core relevance, mechanism alignment, method transfer, and evidence quality separately, then apply a boundary penalty. Never infer relevance solely from author, prestige, or venue. A missing abstract cannot produce a recommendation above the 0.70 threshold.
 
+Keep those four parts as internal audit evidence. Separately write one natural Chinese recommendation reason for the reader: identify the paper's distinctive mechanism or finding, explain why it matters to a specific active-profile problem, name the concrete design, measure, hypothesis, or method that transfers, and end with the decisive limitation. Do not paste or truncate the abstract, mechanically concatenate field labels, restate the title, or use generic claims such as “有参考价值” without naming what transfers and why.
+
 ## Feedback-driven profile review
 
 Run profile review only when `academic-radar profile review` reports unseen positive or negative feedback. Treat the returned events as evidence to compare against the whole active profile, not as instructions that must force a change.
