@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import datetime as dt
 import os
 import plistlib
 import re
@@ -13,6 +14,7 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 try:
     import tomllib
@@ -26,6 +28,32 @@ from .storage import connect, database_status, latest_schema_version, migrate_st
 
 
 WEB_SERVICE_LABEL = "com.personal-academic-radar.web"
+
+
+def recommendation_freshness(database: Any, timezone: str = "Asia/Shanghai") -> dict[str, Any]:
+    """Distinguish a completed import from collection and from historical results."""
+    latest = database.execute("""SELECT imported_at FROM agent_jobs
+        WHERE status='imported' AND profile_hash=(
+          SELECT profile_hash FROM profile_versions WHERE status='active')
+        ORDER BY imported_at DESC LIMIT 1""").fetchone()
+    now = dt.datetime.now(ZoneInfo(timezone))
+    imported = None
+    if latest and latest["imported_at"]:
+        try:
+            imported = dt.datetime.fromisoformat(latest["imported_at"])
+            if imported.tzinfo is None:
+                imported = imported.replace(tzinfo=dt.timezone.utc)
+            imported = imported.astimezone(now.tzinfo)
+        except ValueError:
+            pass
+    collection = database.execute("SELECT started_at FROM pipeline_runs WHERE kind='collection' ORDER BY started_at DESC LIMIT 1").fetchone()
+    pending_collection = bool(collection and (not latest or collection["started_at"] > latest["imported_at"]))
+    return {
+        "is_today": bool(imported and imported.date() == now.date()),
+        "overdue": not imported or now - imported > dt.timedelta(hours=36),
+        "last_import": imported.strftime("%Y-%m-%d %H:%M") if imported else "尚无完整更新",
+        "pending_collection": pending_collection,
+    }
 
 
 def _web_healthy(port: int = 8765) -> bool:
@@ -201,7 +229,7 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
         check(
             "official_issue_coverage",
             not incomplete_official,
-            "全部官网来源至少完成最近两期核验" if not incomplete_official
+            "全部官网来源历史上至少核验过两期；是否为最新卷期需本轮官网计划确认" if not incomplete_official
             else "官网两期核验尚未完成：" + "、".join(incomplete_official),
             "warning",
             "运行 official plan/collect-supported，并继续核验未完成的官网卷期",
@@ -234,6 +262,14 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
             f"最近任务={latest_job['run_id'] if latest_job else '无'}；状态={latest_job['status'] if latest_job else '尚未运行'}",
             "warning",
             "先运行 collect-only 与官网卷期核验，再导出完整队列并运行 agent-import",
+        )
+        freshness = recommendation_freshness(database, str(config.get("timezone", "Asia/Shanghai")))
+        check(
+            "recommendation_freshness",
+            not freshness["overdue"] and not freshness["pending_collection"],
+            f"最近完整更新：{freshness['last_import']}" + ("；存在尚未完成评分导入的采集" if freshness["pending_collection"] else ""),
+            "warning",
+            "完成今日 collect-only、官网核验和 agent-import；本地定时任务需要电脑开机且 Codex 保持运行",
         )
 
         eligible_count = int(database.execute(

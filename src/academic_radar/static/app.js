@@ -63,8 +63,23 @@
     finally { submit.disabled = false; }
   }));
 
-  const orderTodayCards = () => {
-    const list = document.querySelector("[data-today-list]");
+  const matchingCards = (identity) => [...document.querySelectorAll("[data-paper-identity]")]
+    .filter((card) => card.dataset.paperIdentity === identity);
+  const syncFavorite = (card, favorite) => {
+    const button = card.querySelector("[data-favorite]");
+    if (button) {
+      button.setAttribute("aria-pressed", String(favorite));
+      button.classList.toggle("is-favorite", favorite);
+      button.textContent = favorite ? "★" : "☆";
+      button.setAttribute("aria-label", favorite ? "取消收藏" : "收藏到本地文献库");
+    }
+    const checkbox = card.querySelector('input[name="favorite"]');
+    if (checkbox) checkbox.checked = favorite;
+    const star = card.querySelector(".feedback-heading .star");
+    if (star) star.hidden = !favorite;
+  };
+
+  const orderRecommendationCards = (list) => {
     if (!list) return;
     const cards = [...list.querySelectorAll(":scope > .paper-card")];
     const pending = cards.filter((card) => !card.dataset.interest);
@@ -87,19 +102,28 @@
     submit.disabled = true;
     try {
       const result = await api("/api/feedback", {method: "POST", body: JSON.stringify(payload)});
-      const card = form.closest(".paper-card");
-      const status = card?.querySelector("[data-feedback-status]");
-      if (card) card.dataset.interest = result.interest || "";
-      if (status) {
-        status.textContent = result.status_label;
-        status.hidden = !result.status_label;
-        status.className = `completion-status ${result.interest || "neutral"}`;
-      }
-      if (card && document.querySelector("[data-today-list]")) {
-        card.classList.add("is-completing");
-        orderTodayCards();
-        setTimeout(() => card.classList.remove("is-completing"), 780);
-      }
+      matchingCards(payload.identity).forEach((card) => {
+        card.dataset.interest = result.interest || "";
+        const status = card.querySelector("[data-feedback-status]");
+        if (status) {
+          status.textContent = result.status_label;
+          status.hidden = !result.status_label;
+          status.className = `completion-status ${result.interest || "neutral"}`;
+        }
+        const otherForm = card.querySelector("[data-feedback-form]");
+        if (otherForm) {
+          otherForm.elements.interest.value = result.interest || "";
+          otherForm.elements.reason.value = payload.reason;
+          otherForm.elements.reading_status.value = payload.reading_status;
+        }
+        syncFavorite(card, payload.favorite);
+        const list = card.closest("[data-today-list], [data-history-list]");
+        if (list) {
+          card.classList.add("is-completing");
+          orderRecommendationCards(list);
+          setTimeout(() => card.classList.remove("is-completing"), 780);
+        }
+      });
       announce(result.message);
     } catch (error) { announce(error.message, true); }
     finally { submit.disabled = false; }
@@ -113,10 +137,7 @@
       favorite.disabled = true;
       try {
         const result = await api("/api/favorite", {method: "POST", body: JSON.stringify({identity: favorite.dataset.identity, favorite: next})});
-        favorite.setAttribute("aria-pressed", String(result.favorite));
-        favorite.classList.toggle("is-favorite", result.favorite);
-        favorite.textContent = result.favorite ? "★" : "☆";
-        favorite.setAttribute("aria-label", result.favorite ? "取消收藏" : "收藏到本地文献库");
+        matchingCards(favorite.dataset.identity).forEach((card) => syncFavorite(card, result.favorite));
         announce(result.message);
       } catch (error) { announce(error.message, true); }
       finally { favorite.disabled = false; }

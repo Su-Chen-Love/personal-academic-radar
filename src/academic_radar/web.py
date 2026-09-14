@@ -38,7 +38,8 @@ from .engagement import (
 )
 from .governance import governance_stats, latest_scores_sql, recommendation_feedback_metrics
 from .official import configure_official_source, resolve_official_source
-from .operations import verify_installation
+from .operations import recommendation_freshness, verify_installation
+from .recommendations import local_today, recommendation_days, recommendations_on
 from .product import (
     MAX_PDF_BYTES,
     add_manual_abstract,
@@ -368,12 +369,21 @@ def create_app(config_path: Path) -> FastAPI:
         return {"ok": status.get("integrity") == "ok", "schema_version": status.get("schema_version")}
 
     @app.get("/", response_class=HTMLResponse)
-    def today(request: Request) -> HTMLResponse:
+    def today(request: Request, history_date: str = "") -> HTMLResponse:
+        timezone = str(config.get("timezone", "Asia/Shanghai"))
+        yesterday = local_today(timezone) - dt.timedelta(days=1)
+        try:
+            selected_day = dt.date.fromisoformat(history_date) if history_date else yesterday
+        except ValueError:
+            raise HTTPException(400, "请选择有效的历史日期（YYYY-MM-DD）")
+        if selected_day > yesterday:
+            raise HTTPException(400, "历史推荐日期应早于今天")
         db = connect(db_path)
         try:
             active = row(db, "SELECT * FROM profile_versions WHERE status='active'")
             profile_hash = active["profile_hash"] if active else ""
-            latest_job = row(db,"SELECT * FROM agent_jobs WHERE status='imported' ORDER BY imported_at DESC LIMIT 1")
+            latest_job = row(db,"SELECT * FROM agent_jobs WHERE status='imported' AND profile_hash=? ORDER BY imported_at DESC LIMIT 1", (profile_hash,))
+            freshness = recommendation_freshness(db, str(config.get("timezone", "Asia/Shanghai")))
             run_id = latest_job["run_id"] if latest_job else ""
             threshold=float(config.get("relevance_threshold",0.70))
             papers = rows(db, """SELECT p.*,s.score,s.reasons,s.confidence,s.screened_at,s.themes_json,
@@ -405,33 +415,10 @@ def create_app(config_path: Path) -> FastAPI:
               ORDER BY CASE WHEN f.interest IS NULL THEN 0 ELSE 1 END,
                 CASE f.interest WHEN 'interested' THEN 0 WHEN 'not_interested' THEN 1 ELSE 0 END,
                 s.score DESC,p.published DESC""", (run_id,profile_hash,threshold))
-            # Keep the daily signal honest, but do not make a prior valid
-            # recommendation appear to have vanished when the newest run has
-            # no papers above the threshold.  The template labels this as a
-            # historical fallback rather than mixing it into today's count.
-            recent_job = None
-            recent_papers = []
-            if not papers:
-                recent_job = row(db, """SELECT aj.* FROM agent_jobs aj
-                  WHERE aj.status='imported' AND aj.profile_hash=?
-                    AND EXISTS(SELECT 1 FROM run_papers prior_rp
-                      WHERE prior_rp.run_id=aj.run_id AND prior_rp.role='selected')
-                  ORDER BY aj.imported_at DESC LIMIT 1""", (profile_hash,))
-                if recent_job and recent_job["run_id"] != run_id:
-                    recent_papers = rows(db, """SELECT p.*,s.score,s.reasons,s.confidence,s.screened_at,s.themes_json,
-                      s.reasoning_json,s.score_dimensions_json,s.rubric_version,
-                      f.interest,f.reason AS feedback_reason,COALESCE(f.favorite,0) favorite,
-                      COALESCE(f.reading_status,'unread') reading_status,
-                      EXISTS(SELECT 1 FROM fulltext_files ft WHERE ft.identity=p.identity) fulltext_count,
-                      (SELECT ft.id FROM fulltext_files ft WHERE ft.identity=p.identity
-                        ORDER BY ft.imported_at DESC,ft.id DESC LIMIT 1) fulltext_id
-                      FROM run_papers rp JOIN papers p ON p.identity=rp.identity
-                      JOIN screenings s ON s.identity=p.identity AND s.run_id=rp.run_id AND s.provider='codex-agent'
-                      LEFT JOIN paper_feedback f ON f.identity=p.identity
-                      WHERE rp.run_id=? AND rp.role='selected' AND s.profile_hash=?
-                        AND s.score>=? AND p.eligibility_status='eligible'
-                      ORDER BY s.score DESC,p.published DESC""",
-                        (recent_job["run_id"], profile_hash, threshold))
+            if not freshness["is_today"]:
+                papers = []
+            history_papers, history_runs, history_incomplete = recommendations_on(db, selected_day, timezone)
+            history_days = [day for day in recommendation_days(db, timezone) if day <= yesterday.isoformat()]
             latest_run = row(db, "SELECT * FROM pipeline_runs WHERE run_id=?",(run_id,)) if run_id else None
             totals = row(db, """SELECT COUNT(*) papers,
               (SELECT COUNT(*) FROM paper_feedback WHERE favorite=1) favorites,
@@ -439,8 +426,12 @@ def create_app(config_path: Path) -> FastAPI:
               (SELECT COUNT(*) FROM papers WHERE eligibility_status='excluded') excluded
               FROM papers WHERE eligibility_status='eligible'""")
             return templates.TemplateResponse(request,"today.html",context(request,"today",papers=papers,
-                recent_papers=recent_papers,recent_job=recent_job,latest_run=latest_run,
-                latest_job=latest_job,totals=totals,active_profile=active))
+                history_papers=history_papers,history_runs=history_runs,history_incomplete=history_incomplete,history_days=history_days,
+                history_date=selected_day.isoformat(),yesterday=yesterday.isoformat(),
+                history_previous=(selected_day-dt.timedelta(days=1)).isoformat() if selected_day > dt.date.min else None,
+                history_next=(selected_day+dt.timedelta(days=1)).isoformat() if selected_day < yesterday else None,
+                display_timezone="北京时间" if timezone == "Asia/Shanghai" else timezone,latest_run=latest_run,
+                latest_job=latest_job,totals=totals,active_profile=active,freshness=freshness))
         finally:
             db.close()
 

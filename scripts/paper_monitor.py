@@ -14,6 +14,7 @@ from academic_radar.enrichment import enrich_abstracts as run_enrichment
 from academic_radar.governance import publication_decision
 from academic_radar.product import abstract_source_for, classify_low_priority, manual_identity_for_title
 from academic_radar.storage import latest_schema_version, upgrade_database
+from academic_radar.recommendations import snapshot_run
 
 VERSION = "0.10.1"
 
@@ -421,6 +422,22 @@ def upsert(db: sqlite3.Connection, p: Paper, now: str) -> bool:
         p.low_priority,p.low_priority_reason=classify_low_priority(p.title,p.venue)
     p.abstract_source=abstract_source_for(p.abstract,p.abstract_source)
     decision=publication_decision(p.title,p.venue,p.publication_type_raw,p.publication_type_source,p.source_kind)
+    prior=db.execute("SELECT * FROM papers WHERE identity=?", (p.identity,)).fetchone()
+    if prior and (
+        (prior['publication_type_source']=='publisher-official' and p.publication_type_source!='publisher-official')
+        or (prior['eligibility_status']!='quarantine' and decision['eligibility_status']=='quarantine')
+        or (prior['eligibility_status']=='excluded' and p.publication_type_raw.lower() in {'article','journal-article','review'})
+    ):
+        decision={
+            'publication_type':prior['publication_type'],
+            'eligibility_status':prior['eligibility_status'],
+            'exclusion_reason':prior['exclusion_reason'],
+            'evidence':json.loads(prior['publication_type_evidence_json'] or '[]'),
+        }
+        p.publication_type_raw=prior['publication_type_raw'] or ''
+        p.publication_type_source=prior['publication_type_source'] or ''
+        p.low_priority=bool(prior['low_priority'])
+        p.low_priority_reason=prior['low_priority_reason'] or ''
     db.execute("""INSERT INTO papers(
       identity,doi,title,abstract,venue,published,url,authors_json,first_seen,updated_at,
       abstract_source,low_priority,low_priority_reason,publication_type,publication_type_raw,
@@ -556,9 +573,17 @@ def enrich_missing_abstracts(papers: list[Paper], cfg: dict[str,Any], db: sqlite
             paper.abstract_source=abstract_source_for(paper.abstract,paper.abstract_source)
 
 def collect_into_db(cfg: dict[str,Any], db: sqlite3.Connection, now: str, run_id: str) -> tuple[list[Paper],list[Paper],list[dict[str,str]]]:
-    since=(dt.date.today()-dt.timedelta(days=int(cfg.get("lookback_days",14)))).isoformat()
+    default_since=(dt.date.today()-dt.timedelta(days=int(cfg.get("lookback_days",14)))).isoformat()
     failures=[]; collected=[]
     for source in cfg["sources"]:
+        since = default_since
+        previous = db.execute("SELECT last_success_at FROM source_health WHERE source=?", (source["name"],)).fetchone()
+        if previous and previous[0]:
+            try:
+                recovery_since = (dt.date.fromisoformat(previous[0][:10]) - dt.timedelta(days=1)).isoformat()
+                since = min(since, recovery_since)
+            except ValueError:
+                pass
         papers=[]; errors=[]; attempted=0; succeeded=0
         if source.get("type") in ("crossref","crossref-query"):
             attempted += 1
@@ -704,8 +729,7 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
              "queue_path":str(queue_path),"profile_path":str(profile_path),"source_failures":failures,
              "collection_run_id":batch_run}
     if enrichment is not None: summary["enrichment"]=enrichment
-    run_status="partial" if failures else "succeeded"
-    if failures and all(x.get("status")=="failed" for x in failures): run_status="failed"
+    run_status="running"  # An exported queue is not a completed recommendation update.
     profile_row=db.execute("SELECT id FROM profile_versions WHERE profile_hash=? AND status='active'",(phash,)).fetchone()
     with db:
         db.execute("""INSERT OR REPLACE INTO pipeline_runs(
@@ -809,9 +833,10 @@ def agent_import(config_path: Path, results_path: Path) -> int:
                     db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'selected')",(run_id,identity_value))
                     if db.execute("SELECT 1 FROM run_papers WHERE run_id=? AND identity=? AND role='new'",(run_id,identity_value)).fetchone():
                         db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'selected_new')",(run_id,identity_value))
+            snapshot_run(db, run_id)
             imported=len(validated)
-            db.execute("""UPDATE pipeline_runs SET status='succeeded',finished_at=?,relevant_count=?,details_json=?
-              WHERE run_id=?""",(now,len(selected),json.dumps({"results_path":str(results_path),"digest_path":str(digest_path)},ensure_ascii=False),run_id))
+            db.execute("""UPDATE pipeline_runs SET status=?,finished_at=?,relevant_count=?,details_json=?
+              WHERE run_id=?""",("partial" if queue.get("source_failures") else "succeeded",now,len(selected),json.dumps({"results_path":str(results_path),"digest_path":str(digest_path),"collection_run_id":queue.get("collection_run_id")},ensure_ascii=False),run_id))
             db.execute("""UPDATE agent_jobs SET status='imported',results_path=?,imported_count=?,imported_at=?
               WHERE run_id=?""",(str(results_path),imported,now,run_id))
             os.replace(digest_tmp,digest_path); digest_replaced=True
@@ -823,6 +848,78 @@ def agent_import(config_path: Path, results_path: Path) -> int:
     print(json.dumps({"run_id":run_id,"imported":imported,"relevant":len(selected),"digest_path":str(digest_path)},ensure_ascii=False,indent=2))
     return 0
 
+def backfill_history(config_path: Path) -> int:
+    """Recover overwritten judgments only from their matching frozen import artifacts."""
+    cfg=config_load(config_path); state=resolve_state(cfg,config_path)
+    db=db_open(state/"papers.sqlite3")
+    recovered=0; unavailable=0
+    try:
+        jobs=db.execute("""SELECT aj.*,pr.relevant_count FROM agent_jobs aj
+          LEFT JOIN pipeline_runs pr ON pr.run_id=aj.run_id
+          WHERE aj.status='imported' AND (
+            EXISTS(SELECT 1 FROM recommendation_snapshots rs WHERE rs.run_id=aj.run_id AND rs.evidence_source='unavailable')
+            OR (pr.relevant_count>0 AND NOT EXISTS(
+              SELECT 1 FROM recommendation_snapshots rs WHERE rs.run_id=aj.run_id)))""").fetchall()
+        for job in jobs:
+            try:
+                data=json.loads(Path(job['results_path']).read_text(encoding='utf-8'))
+                queue=json.loads(Path(job['queue_path']).read_text(encoding='utf-8'))
+                if any(artifact.get('run_id')!=job['run_id'] or artifact.get('profile_hash')!=job['profile_hash']
+                       for artifact in (data,queue)):
+                    continue
+                originals={p['identity']:p for p in queue['papers']}
+                items={p['identity']:p for p in data['results']}
+                if len(items)!=len(data['results']):
+                    continue
+            except (OSError,ValueError,KeyError,TypeError):
+                continue
+            with db:
+                # Very old imports predate run_papers. Reconstruct membership
+                # only when the complete frozen queue and recorded count agree.
+                if not db.execute('SELECT 1 FROM recommendation_snapshots WHERE run_id=?',(job['run_id'],)).fetchone():
+                    try:
+                        threshold=float(queue['threshold']); schema=int(queue.get('schema_version',1))
+                        if set(items)!=set(originals):
+                            continue
+                        judgments={identity:(structured_judgment(item,originals[identity],threshold,schema)
+                          if schema>=3 else extract_json(json.dumps(item,ensure_ascii=False))) for identity,item in items.items()}
+                        selected_ids=[identity for identity,result in judgments.items() if result['score']>=threshold]
+                        if len(selected_ids)!=job['relevant_count']:
+                            continue
+                        for identity in selected_ids:
+                            db.execute("""INSERT OR IGNORE INTO recommendation_snapshots(run_id,identity)
+                              SELECT ?,identity FROM papers WHERE identity=?""",(job['run_id'],identity))
+                    except (ValueError,KeyError,TypeError):
+                        continue
+                missing=db.execute("SELECT identity FROM recommendation_snapshots WHERE run_id=? AND evidence_source='unavailable'",
+                                   (job['run_id'],)).fetchall()
+                for saved in missing:
+                    identity_value=saved['identity']
+                    try:
+                        item=items[identity_value]; original=originals[identity_value]
+                        schema=int(queue.get('schema_version',1))
+                        if schema>=3:
+                            result=structured_judgment(item,original,0.70,schema)
+                        else:
+                            result=extract_json(json.dumps(item,ensure_ascii=False))
+                            if not (original.get('abstract') or '').strip():
+                                result['confidence']=min(result['confidence'],0.5)
+                        db.execute("""UPDATE recommendation_snapshots SET score=?,reasons=?,confidence=?,themes_json=?,
+                          screened_at=?,reasoning_json=?,score_dimensions_json=?,rubric_version=?,evidence_source='import-result'
+                          WHERE run_id=? AND identity=? AND evidence_source='unavailable'""",
+                          (result['score'],result['reasons'],result['confidence'],json.dumps(result['matched_themes'],ensure_ascii=False),
+                           job['imported_at'],json.dumps(result.get('reasoning',{}),ensure_ascii=False),
+                           json.dumps(result.get('score_dimensions',{})),result.get('rubric_version','legacy'),job['run_id'],identity_value))
+                        recovered+=1
+                    except (ValueError,KeyError,TypeError):
+                        continue
+        unavailable=db.execute("SELECT COUNT(*) FROM recommendation_snapshots WHERE evidence_source='unavailable'").fetchone()[0]
+    finally:
+        db.close()
+    print(json.dumps({'recovered':recovered,'unavailable':unavailable}))
+    return 0
+
+
 def enrich_abstracts(config_path: Path, limit: int=100) -> int:
     """Run the traceable multi-provider metadata enrichment pipeline."""
     cfg=config_load(config_path); state=resolve_state(cfg,config_path)
@@ -833,7 +930,7 @@ def enrich_abstracts(config_path: Path, limit: int=100) -> int:
 def main() -> int:
     parser=argparse.ArgumentParser(description=__doc__); parser.add_argument("--version",action="version",version=VERSION)
     sub=parser.add_subparsers(dest="command",required=True)
-    for name in ("doctor","collect-only","agent-export","agent-import","enrich-abstracts"):
+    for name in ("doctor","collect-only","agent-export","agent-import","enrich-abstracts","backfill-history"):
         p=sub.add_parser(name); p.add_argument("--config",required=True,type=Path)
         if name=="agent-export":
             p.add_argument("--rescreen",action="store_true",help="export all stored papers, including previously judged papers")
@@ -850,6 +947,7 @@ def main() -> int:
         if a.command=="agent-export": return agent_export(a.config,a.rescreen,a.no_collect,a.batch_run)
         if a.command=="agent-import": return agent_import(a.config,a.results)
         if a.command=="enrich-abstracts": return enrich_abstracts(a.config,a.limit)
+        if a.command=="backfill-history": return backfill_history(a.config)
         raise ValueError("Unsupported command")
     except Exception as e: print(json.dumps({"ok":False,"error":f"{type(e).__name__}: {e}"},ensure_ascii=False),file=sys.stderr); return 2
 

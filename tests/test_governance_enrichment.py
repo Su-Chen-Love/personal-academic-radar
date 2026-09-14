@@ -27,6 +27,23 @@ from academic_radar.storage import connect, upgrade_database, utc_now
 
 
 class GovernanceEnrichmentTests(unittest.TestCase):
+    def test_budget_preserves_progress_and_defers_remaining_without_false_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td)/"papers.sqlite3"
+            self.add_paper(db_path)
+            def exhaust(db, paper, client):
+                client.deadline = 0
+                return None
+            with patch("academic_radar.enrichment.PROVIDERS", [("crossref", exhaust), ("publisher", lambda *_: None)]):
+                result = enrich_abstracts(db_path, {})
+            self.assertEqual(result['status'], 'partial')
+            self.assertTrue(result['budget_exhausted'])
+            self.assertEqual(result['checked'], 0)
+            self.assertEqual(result['deferred'], 1)
+            with connect(db_path) as db:
+                self.assertEqual(db.execute("SELECT status FROM task_runs").fetchone()[0], 'partial')
+                self.assertIsNone(db.execute("SELECT abstract_failure_reason FROM papers").fetchone()[0])
+
     def test_rate_limited_provider_is_paused_for_the_rest_of_the_run(self):
         client = MetadataClient({"collection": {"max_retries": 0}})
         limited = urllib.error.HTTPError("https://example.test", 429, "limited", {}, None)

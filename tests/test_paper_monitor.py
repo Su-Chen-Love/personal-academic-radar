@@ -9,6 +9,28 @@ sys.modules[spec.name] = pm
 spec.loader.exec_module(pm)
 
 class MonitorTests(unittest.TestCase):
+    def test_generic_api_type_cannot_overwrite_official_comment(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=pm.db_open(Path(td)/'papers.sqlite3')
+            official=pm.Paper('doi:10.1/x','10.1/x','Discussion of AI','Evidence','Journal','2026-01-01','',[],'Official',publication_type_raw='Comment',publication_type_source='publisher-official')
+            pm.upsert(db,official,'before')
+            api=pm.Paper('doi:10.1/x','10.1/x','Discussion of AI','Longer abstract evidence','Journal','2026-01-01','',[],'OpenAlex',publication_type_raw='article',publication_type_source='openalex',source_kind='journal')
+            pm.upsert(db,api,'after')
+            saved=db.execute('SELECT * FROM papers').fetchone()
+            self.assertEqual(saved['eligibility_status'],'excluded')
+            self.assertEqual(saved['publication_type_source'],'publisher-official')
+            self.assertEqual(saved['abstract'],'Longer abstract evidence')
+            db.close()
+
+    def test_collection_recovers_a_gap_longer_than_rolling_window(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = pm.db_open(Path(td)/'papers.sqlite3')
+            pm.update_source_health(db, 'V', 'healthy', '2020-01-01T00:00:00+00:00')
+            with patch.object(pm, 'crossref_collect', return_value=[]) as collect:
+                pm.collect_into_db({'sources':[{'name':'V','type':'crossref','issn':'1234'}]}, db, 'now', 'recovery')
+            self.assertEqual(collect.call_args.args[2], '2019-12-31')
+            db.close()
+
     @staticmethod
     def structured_result(identity, *, confidence=0.95):
         return {
@@ -274,6 +296,38 @@ class MonitorTests(unittest.TestCase):
             self.assertIn("人在回路",row[3])
             self.assertNotIn("论文证据：",row[3])
             self.assertEqual(row[4],"evidence-v2")
+            saved=dict(db.execute("SELECT * FROM recommendation_snapshots").fetchone())
+            self.assertEqual((saved['run_id'],saved['score'],saved['reasons']),(run_id,row[2],row[3]))
+            with db:
+                db.execute("UPDATE screenings SET score=.1,reasons='Later judgment'")
+                db.execute("UPDATE recommendation_snapshots SET score=NULL,reasons=NULL,evidence_source='unavailable'")
+            db.close()
+            # A mismatched file must never be used to invent a historical judgment.
+            results['profile_hash']='wrong-profile'
+            path.write_text(json.dumps(results),encoding='utf-8')
+            with patch('builtins.print') as output:
+                pm.backfill_history(root/'config.toml')
+            self.assertEqual(json.loads(output.call_args.args[0]),{'recovered':0,'unavailable':1})
+            results['profile_hash']=profile_hash
+            path.write_text(json.dumps(results),encoding='utf-8')
+            with patch('builtins.print') as output:
+                pm.backfill_history(root/'config.toml')
+            self.assertEqual(json.loads(output.call_args.args[0]),{'recovered':1,'unavailable':0})
+            with patch('builtins.print') as output:
+                pm.backfill_history(root/'config.toml')
+            self.assertEqual(json.loads(output.call_args.args[0])['recovered'],0)
+            db=pm.db_open(root/'papers.sqlite3')
+            restored=db.execute('SELECT score,reasons FROM recommendation_snapshots').fetchone()
+            self.assertEqual(tuple(restored),(saved['score'],saved['reasons']))
+            self.assertEqual(db.execute('SELECT score FROM screenings').fetchone()[0],.1)
+            # Imports from before the selection ledger existed remain recoverable.
+            with db:
+                db.execute('DELETE FROM recommendation_snapshots')
+                db.execute('DELETE FROM run_papers')
+            db.close()
+            with patch('builtins.print') as output:
+                pm.backfill_history(root/'config.toml')
+            self.assertEqual(json.loads(output.call_args.args[0]),{'recovered':1,'unavailable':0})
 
     def test_agent_import_reports_all_shallow_results_without_writing_digest(self):
         with tempfile.TemporaryDirectory() as td:

@@ -8,11 +8,26 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from academic_radar.engagement import seed_active_profile
-from academic_radar.operations import install_web_service, setup_installation, verify_installation, web_service_status
+from academic_radar.operations import install_web_service, setup_installation, verify_installation, web_service_status, recommendation_freshness
 from academic_radar.storage import connect, upgrade_database
 
 
 class OperationsTests(unittest.TestCase):
+    def test_old_import_is_overdue_even_when_collection_succeeded(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td)/"papers.sqlite3"
+            upgrade_database(path)
+            active = seed_active_profile(path, "profile")
+            with connect(path) as db:
+                db.execute("INSERT INTO pipeline_runs(run_id,kind,status,started_at) VALUES('old','agent-export','succeeded','2020-01-01')")
+                db.execute("INSERT INTO agent_jobs(run_id,profile_hash,status,created_at,imported_at) VALUES('old',?,'imported','2020-01-01','2020-01-01T00:00:00+00:00')", (active['profile_hash'],))
+                db.execute("INSERT INTO pipeline_runs(run_id,kind,status,started_at) VALUES('new','collection','succeeded','2026-09-14T00:00:00+00:00')")
+                result = recommendation_freshness(db)
+            self.assertFalse(result['is_today'])
+            self.assertTrue(result['overdue'])
+            self.assertTrue(result['pending_collection'])
+            self.assertEqual(result['last_import'], '2020-01-01 08:00')
+
     @staticmethod
     def stopped_service(config, port=8765):
         state=Path(config).parent

@@ -1,3 +1,4 @@
+import datetime as dt
 import hashlib
 import sqlite3
 import sys
@@ -16,6 +17,7 @@ except ModuleNotFoundError:  # Allows core tests without optional web dependenci
 
 from academic_radar.engagement import create_profile_draft, seed_active_profile
 from academic_radar.storage import connect, upgrade_database
+from academic_radar.recommendations import snapshot_run
 
 
 @unittest.skipIf(TestClient is None, "web test dependencies are not installed")
@@ -65,12 +67,28 @@ class WebTests(unittest.TestCase):
                     self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
                     self.assertIn('rel="icon" type="image/png"', response.text)
                     if path == "/":
-                        self.assertIn("app.js?v=0.10.0", response.text)
+                        self.assertIn("app.js?v=0.10.3", response.text)
                         self.assertEqual(response.text.count('class="nav-icon"'), 6)
                 favicon = client.get("/static/images/academic-radar-logo.png")
                 self.assertEqual(favicon.status_code, 200)
                 self.assertEqual(favicon.headers["content-type"], "image/png")
                 self.assertTrue(client.get("/healthz").json()["ok"])
+
+    def test_old_recommendations_are_history_and_not_today(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            with connect(db_path) as db:
+                active = db.execute("SELECT profile_hash FROM profile_versions WHERE status='active'").fetchone()[0]
+                db.execute("INSERT INTO pipeline_runs(run_id,kind,status,started_at) VALUES('run','agent-export','succeeded','2020-01-01')")
+                db.execute("INSERT INTO agent_jobs(run_id,profile_hash,status,created_at,imported_at) VALUES('run',?,'imported','2020-01-01','2020-01-01T00:00:00+00:00')", (active,))
+                db.execute("INSERT INTO run_papers VALUES('run','doi:10.1/test','selected')")
+                snapshot_run(db, 'run')
+            with TestClient(app) as client:
+                page = client.get('/?history_date=2020-01-01').text
+            self.assertIn('今天尚未完成更新', page)
+            self.assertIn('2020-01-01 08:00', page)
+            self.assertIn('data-history-list', page)
+            self.assertNotIn('A useful paper', page.split('data-today-list')[1].split('historical-recommendations')[0])
 
     def test_today_shows_recommendations_selected_after_rescreen(self):
         with tempfile.TemporaryDirectory() as td:
@@ -89,6 +107,8 @@ class WebTests(unittest.TestCase):
                 )
                 db.execute("INSERT INTO run_papers(run_id,identity,role) VALUES('agent-run','doi:10.1/test','selected')")
                 db.execute("UPDATE screenings SET run_id='agent-run' WHERE identity='doi:10.1/test'")
+            with db:
+                db.execute("UPDATE agent_jobs SET imported_at=?", (dt.datetime.now(dt.timezone.utc).isoformat(),))
             db.close()
             with TestClient(app) as client:
                 response = client.get("/")
@@ -490,6 +510,8 @@ class WebTests(unittest.TestCase):
                 db.execute("""INSERT INTO agent_jobs(run_id,profile_hash,status,exported_count,imported_count,created_at,imported_at,profile_version_id)
                   VALUES('run',?,'imported',1,1,'now','now',?)""",(active[0],active[1]))
                 db.execute("INSERT INTO run_papers VALUES('run','doi:10.1/test','selected_new')")
+            with db:
+                db.execute("UPDATE agent_jobs SET imported_at=?", (dt.datetime.now(dt.timezone.utc).isoformat(),))
             db.close()
             with TestClient(app) as client: response=client.get("/")
             self.assertIn("A useful paper",response.text)
@@ -522,6 +544,8 @@ class WebTests(unittest.TestCase):
                   VALUES('run',?,'imported',3,3,'now','now',?)""", (active[0], active[1]))
                 db.executemany("INSERT INTO run_papers VALUES('run',?,'selected_new')",
                                [("doi:10.1/test",), ("doi:10.1/second",), ("doi:10.1/third",)])
+            with db:
+                db.execute("UPDATE agent_jobs SET imported_at=?", (dt.datetime.now(dt.timezone.utc).isoformat(),))
             db.close()
             with TestClient(app) as client:
                 for identity, interest, reason in (("doi:10.1/second", "interested", "Useful"),

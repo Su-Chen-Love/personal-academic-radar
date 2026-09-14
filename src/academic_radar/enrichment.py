@@ -90,6 +90,10 @@ class ProviderTemporarilyUnavailable(RuntimeError):
     """Stop repeated calls after a provider has explicitly rate-limited the run."""
 
 
+class EnrichmentBudgetExceeded(TimeoutError):
+    """Defer unfinished enrichment without blocking semantic import."""
+
+
 class MetadataClient:
     def __init__(self, config: dict[str, Any]) -> None:
         collection = config.get("collection", {})
@@ -99,6 +103,7 @@ class MetadataClient:
         self.last_request: dict[str, float] = {}
         self.provider_backoff_until: dict[str, float] = {}
         self.semantic_scholar_cache: dict[str, dict[str, Any] | None] | None = None
+        self.deadline: float | None = None
         key_env = str(collection.get("elsevier_api_key_env", "ELSEVIER_API_KEY"))
         self.elsevier_api_key = os.environ.get(key_env, "") if key_env else ""
         self.minimum_interval = {
@@ -116,6 +121,8 @@ class MetadataClient:
         content_type: str = "", accept: str = "application/json, application/xml, text/html;q=0.8",
         extra_headers: dict[str, str] | None = None,
     ) -> tuple[bytes, str, str]:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise EnrichmentBudgetExceeded("摘要补全时间预算已到，剩余项留待后续运行")
         backoff = self.provider_backoff_until.get(provider, 0.0) - time.monotonic()
         if backoff > 0:
             raise ProviderTemporarilyUnavailable(
@@ -130,9 +137,12 @@ class MetadataClient:
         if content_type:
             headers["Content-Type"] = content_type
         for attempt in range(self.retries + 1):
+            remaining = self.deadline - time.monotonic() if self.deadline is not None else self.timeout
+            if remaining <= 0:
+                raise EnrichmentBudgetExceeded("摘要补全时间预算已到，剩余项留待后续运行")
             try:
                 request = urllib.request.Request(url, headers=headers, data=data)
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(request, timeout=min(self.timeout, remaining)) as response:
                     self.last_request[provider] = time.monotonic()
                     content_type = response.headers.get("Content-Type", "")
                     data = response.read(max_bytes + 1)
@@ -158,7 +168,8 @@ class MetadataClient:
                             time.monotonic() + max(600.0, wait),
                         )
                     raise
-                time.sleep(min(30.0, max(0.0, wait)))
+                remaining = self.deadline - time.monotonic() if self.deadline is not None else 30.0
+                time.sleep(min(30.0, max(0.0, remaining), max(0.0, wait)))
         raise RuntimeError("metadata request failed")
 
     def json(self, provider: str, url: str) -> tuple[dict[str, Any], str]:
@@ -506,12 +517,15 @@ def enrich_abstracts(
 
     db = connect(db_path)
     client = MetadataClient(config)
+    client.deadline = time.monotonic() + max(1.0, float(config.get("enrichment", {}).get("time_budget_seconds", 180)))
     try:
         where = "eligibility_status<>'excluded' AND COALESCE(abstract,'')=''"
         if include_type_unknown:
             where = "eligibility_status<>'excluded' AND (COALESCE(abstract,'')='' OR publication_type='Unknown' OR eligibility_status='quarantine')"
         paper_rows = [dict(row) for row in db.execute(
-            f"SELECT * FROM papers WHERE {where} ORDER BY first_seen LIMIT ?", (max(1, limit),)
+            f"""SELECT * FROM papers WHERE {where} ORDER BY
+            COALESCE((SELECT MAX(attempted_at) FROM abstract_attempts a WHERE a.identity=papers.identity),'') ASC,
+            first_seen DESC LIMIT ?""", (max(1, limit),)
         )]
         task_id = _start_task(db, "abstract_enrichment", len(paper_rows))
         if any(lookup is lookup_semantic_scholar for _, lookup in PROVIDERS):
@@ -524,11 +538,19 @@ def enrich_abstracts(
         type_updated = 0
         unresolved: list[dict[str, str]] = []
         provider_found: dict[str, int] = {}
+        checked = 0
+        budget_exhausted = False
         for index, paper in enumerate(paper_rows, 1):
+            if time.monotonic() >= client.deadline:
+                budget_exhausted = True
+                break
             abstract_found = bool((paper.get("abstract") or "").strip())
             type_found = paper.get("publication_type") != "Unknown" and paper.get("eligibility_status") != "quarantine"
             failures: list[str] = []
             for provider, lookup in PROVIDERS:
+                if time.monotonic() >= client.deadline:
+                    budget_exhausted = True
+                    break
                 if abstract_found and type_found:
                     break
                 if not retry:
@@ -549,6 +571,9 @@ def enrich_abstracts(
                             continue
                 try:
                     result = lookup(db, paper, client)
+                except EnrichmentBudgetExceeded:
+                    budget_exhausted = True
+                    break
                 except Exception as exc:
                     detail = f"{type(exc).__name__}: {str(exc)[:300]}"
                     failures.append(f"{PROVIDER_LABELS[provider]}：{detail}")
@@ -608,6 +633,9 @@ def enrich_abstracts(
                     )
                 if changed and abstract_found and type_found:
                     break
+            if budget_exhausted:
+                break
+            checked = index
             if not abstract_found:
                 reason = "；".join(failures[-3:]) if failures else "所有公开渠道均未返回可核验的原始摘要"
                 with db:
@@ -620,7 +648,9 @@ def enrich_abstracts(
                 )
         details = {
             "task_id": task_id,
-            "checked": len(paper_rows),
+            "checked": checked,
+            "deferred": len(paper_rows) - checked,
+            "budget_exhausted": budget_exhausted,
             "updated": updated,
             "type_updated": type_updated,
             "unresolved": len(unresolved),
@@ -629,6 +659,8 @@ def enrich_abstracts(
             "requires_rescreen": updated,
         }
         status = "succeeded" if not unresolved else ("partial" if updated or type_updated else "failed")
+        if budget_exhausted:
+            status = "partial"
         _finish_task(db, task_id, status, details)
         return details | {"status": status}
     except Exception:

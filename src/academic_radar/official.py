@@ -8,6 +8,8 @@ import html
 import json
 import re
 import sqlite3
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
@@ -218,21 +220,28 @@ def write_official_plan(db_path: Path, config: dict[str, Any], output: Path) -> 
 
 
 def _fetch_text(url: str) -> str:
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 PersonalAcademicRadar/0.8"},
-    )
-    with urllib.request.urlopen(request, timeout=45) as response:
-        return response.read().decode("utf-8", "replace")
+    request = urllib.request.Request(url, headers={"User-Agent": "PersonalAcademicRadar/0.10 (official issue verifier)"})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read().decode("utf-8", "replace")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            status = getattr(exc, "code", None)
+            if attempt == 2 or status not in (None, 408, 429, 500, 502, 503, 504):
+                raise
+            retry_after = getattr(exc, "headers", {}).get("Retry-After") if getattr(exc, "headers", None) else None
+            try:
+                delay = float(retry_after) if retry_after else 2 ** attempt
+            except ValueError:
+                delay = 2 ** attempt
+            if delay > 30:
+                raise  # Defer to a later run rather than ignoring a long server cooldown.
+            time.sleep(max(0, delay))
+    raise RuntimeError("官网请求失败")
 
 
 def _fetch_json(url: str) -> dict[str, Any]:
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "PersonalAcademicRadar/0.8 (official issue verifier)"},
-    )
-    with urllib.request.urlopen(request, timeout=45) as response:
-        value = json.loads(response.read().decode("utf-8", "replace"))
+    value = json.loads(_fetch_text(url))
     if not isinstance(value, dict):
         raise ValueError("元数据响应不是对象")
     return value
@@ -686,7 +695,8 @@ def record_official_failure(
     source = next((item for item in config.get("sources", []) if item.get("name") == source_name), None)
     spec = resolve_official_source(source or {}) if source else None
     clean_key = _clean(issue_key)
-    clean_detail = _clean(detail)
+    # urllib errors are enclosed in angle brackets; they are plain text, not HTML.
+    clean_detail = re.sub(r"\s+", " ", str(detail or "")).strip()
     expected_host = urllib.parse.urlparse(spec["issues_url"]).hostname if spec else ""
     actual_host = urllib.parse.urlparse(issue_url).hostname or ""
     if not source or not spec:

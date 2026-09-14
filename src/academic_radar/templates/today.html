@@ -3,12 +3,12 @@
 {% block title %}今日推荐 · 个人学术助手{% endblock %}
 {% block content %}
 <header class="page-head hero-head">
-  <div><p class="kicker">DAILY SIGNAL · 今日信号</p><h1>今天值得你看的研究</h1><p>基于已确认画像与真实反馈，由 Codex 完成语义判断。</p></div>
-  <div class="run-badge {{ latest_run.status if latest_run else 'unknown' }}"><span></span>{{ latest_run.status|status_label if latest_run else '尚无运行' }}</div>
+  <div><p class="kicker">DAILY SIGNAL · 今日信号</p><h1>今天值得你看的研究</h1><p>最近推荐更新：{{ freshness.last_import }}（{{ display_timezone }}）</p></div>
+  <div class="run-badge {{ latest_run.status if freshness.is_today and latest_run else 'unknown' }}"><span></span>{% if freshness.is_today and latest_run %}{{ '推荐已更新 · 部分来源待重试' if latest_run.status == 'partial' else latest_run.status|status_label }}{% else %}今日待更新{% endif %}</div>
 </header>
 <section class="metric-grid" aria-label="概览">
   <div><strong>{{ papers|length }}</strong><span>今日入选</span></div>
-  <div><strong>{{ totals.papers or 0 }}</strong><span>文献总数</span></div>
+  <div><strong>{{ totals.papers or 0 }}</strong><span>已收录研究论文</span></div>
   <div><strong>{{ totals.favorites or 0 }}</strong><span>已收藏</span></div>
   <div><strong>{{ totals.read_later or 0 }}</strong><span>稍后阅读</span></div>
   <div><strong>{{ totals.excluded or 0 }}</strong><span>已排除非论文</span></div>
@@ -16,12 +16,26 @@
 <section class="section-head"><div><p class="kicker">CURATED TODAY</p><h2>今日推荐</h2></div><a href="/library">查看完整文献库 →</a></section>
 <div class="paper-list" data-today-list>
   {% for paper in papers %}{{ paper_card(paper, '/') }}
-  {% else %}<div class="empty"><strong>今天还没有新的入选论文</strong><p>最新任务没有论文达到 70% 推荐阈值。下面保留最近一次有效推荐，避免推荐结果看起来像消失。</p><a class="button" href="/status">查看更新与检查</a></div>{% endfor %}
+  {% else %}<div class="empty"><strong>{{ '本轮暂无新的入选论文' if freshness.is_today else '今天尚未完成更新' }}</strong><p>{% if freshness.is_today %}本轮评分没有论文达到推荐阈值，可以继续浏览历史推荐。{% else %}下方显示历史推荐。{% if freshness.pending_collection %}已有采集结果尚未完成评分导入。{% else %}本地定时任务需要电脑开机且 Codex 保持运行。{% endif %}{% endif %}</p><a class="button" href="/status">查看更新与检查</a></div>{% endfor %}
 </div>
-{% if not papers and recent_papers %}
-<section class="section-head historical-recommendations"><div><p class="kicker">RECENT SIGNAL</p><h2>最近一次有效推荐</h2><p>推荐日期：{{ recent_job.imported_at[:10] }}</p></div><a href="/library">查看完整文献库 →</a></section>
-<div class="paper-list" data-recent-list>
-  {% for paper in recent_papers %}{{ paper_card(paper, '/') }}{% endfor %}
-</div>
-{% endif %}
+<section id="history" class="historical-recommendations" aria-labelledby="history-heading">
+  <div class="section-head"><div><p class="kicker">PAST SIGNALS</p><h2 id="history-heading">{{ '昨日推荐' if history_date == yesterday else '历史推荐' }}</h2><p>{{ history_date }} · {{ history_papers|length }} 篇 · {{ display_timezone }}</p></div><a href="/library">查看完整文献库 →</a></div>
+  <form class="filter-bar history-filter" method="get" action="/#history">
+    <label for="history-date">推荐日期</label>
+    <input id="history-date" type="date" name="history_date" value="{{ history_date }}" max="{{ yesterday }}" required>
+    <button type="submit">查看推荐</button>
+    <span class="history-navigation">{% if history_previous %}<a href="/?history_date={{ history_previous }}#history">前一天</a>{% endif %}
+    {% if history_next %}<a href="/?history_date={{ history_next }}#history">后一天</a><a href="/#history">回到昨日</a>{% endif %}</span>
+  </form>
+  {% if history_days %}<form class="history-jump" method="get" action="/#history">
+    <label for="history-available">已有更新的日期</label>
+    <select id="history-available" name="history_date">{% for day in history_days %}<option value="{{ day }}" {{ 'selected' if day == history_date }}>{{ day }}</option>{% endfor %}</select>
+    <button type="submit" class="secondary">跳转</button>
+  </form>{% endif %}
+  {% if history_incomplete %}<p class="warning">当天部分历史推荐记录尚未恢复，当前显示已保存的内容。</p>{% endif %}
+  <div class="paper-list" data-history-list data-recommendation-date="{{ history_date }}">
+    {% for paper in history_papers %}{{ paper_card(paper, '/?history_date=' ~ history_date, anchor_prefix='history-') }}
+    {% else %}<div class="empty"><strong>{{ '历史推荐详情暂不可用' if history_incomplete else ('当天没有入选论文' if history_runs else '当天没有完成推荐更新') }}</strong><p>{{ '可以选择其他日期，继续阅读历史推荐。' if history_runs else '可从已有更新的日期中选择，查看之前的推荐。' }}</p></div>{% endfor %}
+  </div>
+</section>
 {% endblock %}
