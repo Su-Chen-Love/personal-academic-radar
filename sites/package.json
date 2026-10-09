@@ -7,6 +7,12 @@
     "validate": "node scripts/validate-artifact.mjs",
     "db:generate": "drizzle-kit generate"
   },
-  "dependencies": {"drizzle-orm": "^0.44.7"},
-  "devDependencies": {"drizzle-kit": "^0.31.5"}
+  "dependencies": {
+    "drizzle-orm": "^0.44.7"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.5",
+    "esbuild": "^0.25.12",
+    "nunjucks": "^3.2.4"
+  }
 }

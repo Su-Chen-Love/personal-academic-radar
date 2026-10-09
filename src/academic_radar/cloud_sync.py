@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import sqlite3
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -15,6 +17,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .recommendations import local_today, recommendation_days, recommendations_on
+from .cloud_views import export_view_contexts
 from .storage import connect, utc_now
 from .product import load_config, resolve_state
 
@@ -55,6 +58,8 @@ def apply_remote_feedback(db: sqlite3.Connection, events: list[dict], cursor: in
         previous_cursor = int(saved[0]) if saved else 0
         if cursor < previous_cursor:
             raise ValueError("Cloud feedback cursor cannot move backwards")
+        if not events and cursor == previous_cursor:
+            return 0
         for event in events:
             if not isinstance(event, dict):
                 raise ValueError("Invalid cloud feedback event")
@@ -107,6 +112,8 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
           FROM screenings s WHERE s.provider='codex-agent' AND s.profile_hash=?) WHERE rn=1"""
         query = f"""SELECT p.identity,p.doi,p.title,p.abstract,p.venue,p.published,p.published_precision,p.url,p.authors_json,
           p.abstract_source,p.abstract_source_url,p.abstract_retrieved_at,p.eligibility_status,p.publication_type,
+          EXISTS(SELECT 1 FROM fulltext_files ft WHERE ft.identity=p.identity) fulltext_count,
+          (SELECT ft.id FROM fulltext_files ft WHERE ft.identity=p.identity ORDER BY ft.imported_at DESC,ft.id DESC LIMIT 1) fulltext_id,
           p.needs_rescreen,s.score,s.reasons,s.confidence,s.themes_json,s.reasoning_json,s.score_dimensions_json,s.rubric_version
           FROM papers p LEFT JOIN ({scores}) s ON s.identity=p.identity AND s.rn=1 ORDER BY p.identity"""
         papers = [dict(row) for row in db.execute(query, (profile_hash,))]
@@ -165,6 +172,8 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
         latest_import = db.execute("SELECT MAX(imported_at) t FROM agent_jobs WHERE status='imported' AND profile_hash=?", (profile_hash,)).fetchone()[0]
         append("meta", "overview", {"sources": sources, "counts": totals, "days": days, "timezone": timezone,
                                    "threshold": config.get("relevance_threshold", 0.70), "last_import": latest_import})
+        for page, context in export_view_contexts(db, config, db_path.parent).items():
+            append("meta", "ui:" + page, context)
         return sorted(records, key=lambda record: (record["kind"], record["key"]))
     finally:
         db.close()
@@ -257,23 +266,129 @@ def sync_configured(config_path: Path) -> dict:
 
 def _save_status(state: Path, result: dict) -> None:
     path = state / "cloud-sync-status.json"
-    temp = path.with_suffix(".tmp")
-    temp.write_text(canonical(result), encoding="utf-8")
-    os.replace(temp, path)
+    handle, name = tempfile.mkstemp(prefix=".cloud-sync-status-", suffix=".tmp", dir=state)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(canonical(result))
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def safe_sync_configured(config_path: Path) -> dict:
+    """Run synchronization for a UI without returning credential/error details."""
+    try:
+        return sync_configured(config_path)
+    except Exception:
+        # Web responses must not surface connection exceptions, local paths
+        # or credentials, including failures before the sync lock was opened.
+        result = {"status": "failed", "checked_at": utc_now(),
+                  "error": "Cloud synchronization failed; retry from the local update page."}
+        try:
+            config = load_config(config_path)
+            state = resolve_state(config_path, config)
+            _save_status(state, result)
+        except Exception:
+            pass
+        return result
+
+
+_background_lock = threading.Lock()
+_background_threads: dict[str, threading.Thread] = {}
+_background_pending: dict[str, bool] = {}
+
+
+def background_sync_state(config_path: Path) -> dict:
+    """Expose only whether this web process has an in-flight sync thread."""
+    key = str(Path(config_path).expanduser().resolve())
+    with _background_lock:
+        worker = _background_threads.get(key)
+        return {"running": bool(worker and worker.is_alive())}
+
+
+def background_sync(config_path: Path) -> dict:
+    """Queue a bounded background sync after a local edit or manual request.
+
+    Repeated requests in the same web process share one in-flight thread. The
+    existing file lock also serializes it against scheduled/CLI processes.
+    """
+    config_path = Path(config_path).expanduser().resolve()
+    key = str(config_path)
+    with _background_lock:
+        previous = _background_threads.get(key)
+        if previous and previous.is_alive():
+            # An edit may arrive after the running sync's snapshot. Remember
+            # it and take one fresh snapshot before the shared worker exits.
+            _background_pending[key] = True
+            return {"status": "busy"}
+
+        def run() -> None:
+            try:
+                while True:
+                    safe_sync_configured(config_path)
+                    with _background_lock:
+                        if _background_pending.pop(key, False):
+                            continue
+                        _background_threads.pop(key, None)
+                        return
+            finally:
+                with _background_lock:
+                    # A request can start a replacement after the old worker
+                    # removes itself but before this finalizer runs.
+                    if _background_threads.get(key) is threading.current_thread():
+                        _background_threads.pop(key, None)
+                        _background_pending.pop(key, None)
+
+        worker = threading.Thread(target=run, name="radar-cloud-sync", daemon=True)
+        _background_pending.pop(key, None)
+        _background_threads[key] = worker
+        worker.start()
+    return {"status": "queued"}
+
+
+def _save_sync_meta(db_path: Path, values: dict[str, str | int]) -> None:
+    db = connect(db_path)
+    try:
+        with db:
+            db.executemany("""INSERT INTO meta(key,value) VALUES(?,?)
+              ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                           [(key, str(value)) for key, value in values.items()])
+    finally:
+        db.close()
 
 
 def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) -> dict:
     db = connect(db_path)
     pulled = 0
+    remote_generation = None
+    remote_synced_at = None
+    request_id = None
+    remote_acknowledged_request = None
+    remote_acknowledged_cursor = None
     try:
-        row = db.execute("SELECT value FROM meta WHERE key='cloud_feedback_cursor'").fetchone()
-        cursor = int(row[0]) if row else 0
+        saved = dict(db.execute("""SELECT key,value FROM meta WHERE key IN
+          ('cloud_feedback_cursor','cloud_last_synced_generation',
+           'cloud_acknowledged_request_id','cloud_acknowledged_cursor')"""))
+        cursor = int(saved.get("cloud_feedback_cursor", "0"))
         while True:
             response = request_json(endpoint, f"/api/sync/feedback?after={cursor}", credentials)
             if response.get("more") and (type(response.get("cursor")) is not int or response["cursor"] <= cursor):
                 raise ValueError("Cloud feedback pagination did not advance its cursor")
             pulled += apply_remote_feedback(db, response["events"], response["cursor"])
             cursor = response["cursor"]
+            # The last page is the freshest view of the active snapshot. Older
+            # servers omit these fields and retain begin/manifest negotiation.
+            remote_generation = response.get("active_generation")
+            remote_synced_at = response.get("synced_at")
+            for field in ("acknowledged_request_id", "acknowledged_cursor"):
+                if field in response and (type(response[field]) is not int or response[field] < 0):
+                    raise ValueError("Invalid cloud synchronization acknowledgement state")
+            remote_acknowledged_request = response.get("acknowledged_request_id")
+            remote_acknowledged_cursor = response.get("acknowledged_cursor")
+            if "request_id" in response:
+                if type(response["request_id"]) is not int or response["request_id"] < 0:
+                    raise ValueError("Invalid cloud synchronization request ID")
+                request_id = max(request_id or 0, response["request_id"])
             if not response.get("more"):
                 break
     finally:
@@ -281,10 +396,39 @@ def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) 
     records = snapshot_records(db_path, config)
     fingerprint = "\n".join(f"{r['kind']}:{r['key']}:{r['checksum']}" for r in records)
     generation = hashlib.sha256(fingerprint.encode()).hexdigest()
+    base = {"generation": generation, "records": len(records), "feedback_imported": pulled}
+    if isinstance(remote_synced_at, str):
+        base["remote_synced_at"] = remote_synced_at
+
+    def complete(result: dict) -> dict:
+        # Record verified activation even when acknowledging a UI request
+        # subsequently fails. The next run can retry that ACK without upload.
+        if saved.get("cloud_last_synced_generation") != generation:
+            _save_sync_meta(db_path, {"cloud_last_synced_generation": generation})
+        # Remote acknowledgements are authoritative; an ACK pointer may have
+        # been restored independently of the local checkpoint. Older servers
+        # omit them and continue using the durable local ACK checkpoint.
+        acknowledged_request = (remote_acknowledged_request if remote_acknowledged_request is not None
+                                else int(saved.get("cloud_acknowledged_request_id", "0")))
+        acknowledged_cursor = (remote_acknowledged_cursor if remote_acknowledged_cursor is not None
+                               else int(saved.get("cloud_acknowledged_cursor", "0")))
+        if request_id is not None and (request_id > acknowledged_request or cursor > acknowledged_cursor):
+            acknowledged = request_json(endpoint, "/api/sync/ack", credentials,
+                                        {"request_id": request_id, "cursor": cursor,
+                                         "generation": generation})
+            if acknowledged.get("ok") is not True:
+                raise ValueError("Cloud synchronization acknowledgement could not be confirmed")
+            _save_sync_meta(db_path, {"cloud_acknowledged_request_id": request_id,
+                                     "cloud_acknowledged_cursor": cursor})
+            result["request_acknowledged"] = request_id
+        return result
+
+    if generation == saved.get("cloud_last_synced_generation") == remote_generation:
+        return complete({"status": "unchanged", "uploaded_records": 0, **base})
     manifest = [{k: row[k] for k in ("kind", "key", "checksum")} for row in records]
     opened = request_json(endpoint, "/api/sync/begin", credentials, {"generation": generation, "count": len(records), "manifest": manifest})
     if opened.get("active"):
-        return {"status": "unchanged", "generation": generation, "records": len(records), "feedback_imported": pulled}
+        return complete({"status": "unchanged", "uploaded_records": 0, **base})
     pending = records
     if "missing" in opened:
         missing = {(row["kind"], row["key"]) for row in opened["missing"]}
@@ -305,4 +449,4 @@ def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) 
     completed = request_json(endpoint, "/api/sync/finish", credentials, {"generation": generation})
     if completed.get("generation") != generation or completed.get("count") != len(records):
         raise ValueError("Cloud snapshot verification failed; remote activation could not be confirmed")
-    return {"status": "succeeded", "generation": generation, "records": len(records), "uploaded_records": len(pending), "feedback_imported": pulled}
+    return complete({"status": "succeeded", "uploaded_records": len(pending), **base})

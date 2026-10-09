@@ -1,6 +1,7 @@
 import hashlib
 import json
 import tempfile
+import threading
 import unittest
 import urllib.error
 from pathlib import Path
@@ -11,8 +12,11 @@ from academic_radar.cloud_sync import (
     _synchronize,
     _verified_sites_origin,
     apply_remote_feedback,
+    background_sync,
+    background_sync_state,
     canonical,
     request_json,
+    safe_sync_configured,
     snapshot_records,
 )
 from academic_radar.storage import connect, upgrade_database
@@ -222,6 +226,238 @@ class CloudSyncTests(unittest.TestCase):
                 _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
         self.assertEqual(request.call_count, 1)
         self.assertIsNone(self.db.execute("SELECT value FROM meta WHERE key='cloud_feedback_cursor'").fetchone())
+
+    def seed_generation(self, records):
+        fingerprint = "\n".join(f"{r['kind']}:{r['key']}:{r['checksum']}" for r in records)
+        generation = hashlib.sha256(fingerprint.encode()).hexdigest()
+        with self.db:
+            self.db.execute("INSERT INTO meta(key,value) VALUES('cloud_last_synced_generation',?)", (generation,))
+        return generation
+
+    def test_unchanged_poll_does_not_submit_manifest_chunks_or_ack(self):
+        records = snapshot_records(self.path, {})
+        generation = self.seed_generation(records)
+        response = {"events": [], "cursor": 0, "request_id": 0,
+                    "active_generation": generation, "synced_at": "2026-10-09T03:00:00Z"}
+        with patch("academic_radar.cloud_sync.request_json", return_value=response) as request:
+            result = _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+        self.assertEqual(result["status"], "unchanged")
+        self.assertEqual(result["uploaded_records"], 0)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args[1], "/api/sync/feedback?after=0")
+        self.assertEqual(result["remote_synced_at"], response["synced_at"])
+
+    def test_changed_remote_generation_and_legacy_server_negotiate_manifest(self):
+        records = snapshot_records(self.path, {})
+        generation = self.seed_generation(records)
+        for response in ({"events": [], "cursor": 0, "active_generation": "another-snapshot"},
+                         {"events": [], "cursor": 0}):
+            with self.subTest(response=response):
+                def request(endpoint, path, credentials, data=None):
+                    if path.startswith("/api/sync/feedback"):
+                        return response
+                    self.assertEqual(path, "/api/sync/begin")
+                    self.assertEqual(data["generation"], generation)
+                    self.assertEqual(len(data["manifest"]), len(records))
+                    return {"active": True}
+                with patch("academic_radar.cloud_sync.request_json", side_effect=request) as mocked:
+                    result = _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+                self.assertEqual(mocked.call_count, 2)
+                self.assertEqual(result["status"], "unchanged")
+
+    def test_first_connection_does_not_trust_remote_generation_without_local_success(self):
+        records = snapshot_records(self.path, {})
+        fingerprint = "\n".join(f"{r['kind']}:{r['key']}:{r['checksum']}" for r in records)
+        generation = hashlib.sha256(fingerprint.encode()).hexdigest()
+        responses = [{"events": [], "cursor": 0, "active_generation": generation}, {"active": True}]
+        with patch("academic_radar.cloud_sync.request_json", side_effect=responses) as request:
+            result = _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(result["status"], "unchanged")
+        self.assertEqual(self.db.execute("SELECT value FROM meta WHERE key='cloud_last_synced_generation'").fetchone()[0], generation)
+
+    def test_new_cloud_feedback_changes_snapshot_and_is_acknowledged_after_activation(self):
+        old_generation = self.seed_generation(snapshot_records(self.path, {}))
+        calls = []
+        uploaded = []
+        def request(endpoint, path, credentials, data=None):
+            calls.append(path)
+            if path.startswith("/api/sync/feedback"):
+                return {"events": [self.event()], "cursor": 1, "request_id": 2, "active_generation": old_generation}
+            if path == "/api/sync/begin":
+                self.assertNotEqual(data["generation"], old_generation)
+                return {"active": False}
+            if path == "/api/sync/chunk":
+                uploaded.extend(data["records"])
+                return {"ok": True}
+            if path == "/api/sync/finish":
+                return {"generation": data["generation"], "count": len(uploaded)}
+            if path == "/api/sync/ack":
+                self.assertEqual(data["request_id"], 2)
+                self.assertEqual(data["cursor"], 1)
+                self.assertEqual(data["generation"],
+                                 self.db.execute("SELECT value FROM meta WHERE key='cloud_last_synced_generation'").fetchone()[0])
+                return {"ok": True, "acknowledged_request_id": 2, "acknowledged_cursor": 1}
+            raise AssertionError(path)
+        with patch("academic_radar.cloud_sync.request_json", side_effect=request):
+            result = _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["feedback_imported"], 1)
+        self.assertEqual(calls[-2:], ["/api/sync/finish", "/api/sync/ack"])
+        feedback = json.loads(next(row["data"] for row in uploaded if row["kind"] == "feedback"))
+        self.assertEqual(feedback["interest"], "interested")
+        self.assertEqual(self.db.execute("SELECT value FROM meta WHERE key='cloud_acknowledged_cursor'").fetchone()[0], "1")
+
+    def test_newer_local_feedback_uploads_without_losing_to_older_cloud_edit(self):
+        old_generation = self.seed_generation(snapshot_records(self.path, {}))
+        local = self.event(interest="not_interested", reason="Outside current research", favorite=0,
+                           reading_status="read", updated_at="2026-10-09T03:01:00Z")
+        apply_remote_feedback(self.db, [local], local["seq"])
+        uploaded = []
+        def request(endpoint, path, credentials, data=None):
+            if path.startswith("/api/sync/feedback"):
+                return {"events": [self.event(seq=2)], "cursor": 2, "request_id": 0,
+                        "active_generation": old_generation}
+            if path == "/api/sync/begin":
+                self.assertNotEqual(data["generation"], old_generation)
+                return {"active": False}
+            if path == "/api/sync/chunk":
+                uploaded.extend(data["records"])
+                return {"ok": True}
+            if path == "/api/sync/finish":
+                return {"generation": data["generation"], "count": len(uploaded)}
+            self.assertEqual(path, "/api/sync/ack")
+            return {"ok": True}
+        with patch("academic_radar.cloud_sync.request_json", side_effect=request):
+            result = _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+        self.assertEqual(result["feedback_imported"], 0)
+        feedback = json.loads(next(row["data"] for row in uploaded if row["kind"] == "feedback"))
+        for key in ("interest", "reason", "favorite", "reading_status", "updated_at"):
+            self.assertEqual(feedback[key], local[key])
+
+    def test_unchanged_snapshot_acknowledges_new_request_only_once(self):
+        generation = self.seed_generation(snapshot_records(self.path, {}))
+        calls = []
+        def request(endpoint, path, credentials, data=None):
+            calls.append(path)
+            if path.startswith("/api/sync/feedback"):
+                return {"events": [], "cursor": 0, "request_id": 4, "active_generation": generation}
+            self.assertEqual(path, "/api/sync/ack")
+            self.assertEqual(data, {"request_id": 4, "cursor": 0, "generation": generation})
+            return {"ok": True}
+        with patch("academic_radar.cloud_sync.request_json", side_effect=request):
+            first = _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+            second = _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+        self.assertEqual(first["request_acknowledged"], 4)
+        self.assertNotIn("request_acknowledged", second)
+        self.assertEqual(calls, ["/api/sync/feedback?after=0", "/api/sync/ack", "/api/sync/feedback?after=0"])
+
+    def test_ack_failure_retries_without_reupload(self):
+        generation = self.seed_generation(snapshot_records(self.path, {}))
+        calls = []
+        attempts = 0
+        def request(endpoint, path, credentials, data=None):
+            nonlocal attempts
+            calls.append(path)
+            if path.startswith("/api/sync/feedback"):
+                return {"events": [], "cursor": 0, "request_id": 4, "active_generation": generation}
+            self.assertEqual(path, "/api/sync/ack")
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("Connection unavailable")
+            return {"ok": True}
+        with patch("academic_radar.cloud_sync.request_json", side_effect=request):
+            with self.assertRaises(RuntimeError):
+                _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+            self.assertIsNone(self.db.execute("SELECT value FROM meta WHERE key='cloud_acknowledged_request_id'").fetchone())
+            result = _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+        self.assertEqual(result["request_acknowledged"], 4)
+        self.assertEqual(calls.count("/api/sync/ack"), 2)
+        self.assertNotIn("/api/sync/begin", calls)
+
+    def test_remote_ack_state_overrides_a_larger_local_checkpoint(self):
+        generation = self.seed_generation(snapshot_records(self.path, {}))
+        with self.db:
+            self.db.execute("INSERT INTO meta VALUES('cloud_acknowledged_request_id','9')")
+            self.db.execute("INSERT INTO meta VALUES('cloud_acknowledged_cursor','7')")
+        response = {"events": [], "cursor": 0, "request_id": 1, "active_generation": generation,
+                    "acknowledged_request_id": 0, "acknowledged_cursor": 0}
+        with patch("academic_radar.cloud_sync.request_json", side_effect=[response, {"ok": True}]) as request:
+            result = _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+        self.assertEqual(result["request_acknowledged"], 1)
+        self.assertEqual(request.call_args.args[1], "/api/sync/ack")
+        self.assertEqual(request.call_args.args[3], {"request_id": 1, "cursor": 0, "generation": generation})
+        self.assertEqual(self.db.execute("SELECT value FROM meta WHERE key='cloud_acknowledged_request_id'").fetchone()[0], "1")
+
+    def test_already_confirmed_remote_state_does_not_repeat_ack(self):
+        generation = self.seed_generation(snapshot_records(self.path, {}))
+        response = {"events": [], "cursor": 0, "request_id": 4, "active_generation": generation,
+                    "acknowledged_request_id": 4, "acknowledged_cursor": 0}
+        with patch("academic_radar.cloud_sync.request_json", return_value=response) as request:
+            result = _synchronize(self.path, {}, "https://radar.chatgpt.site", {"sync_token": "test"})
+        self.assertEqual(result["status"], "unchanged")
+        self.assertNotIn("request_acknowledged", result)
+        self.assertEqual(request.call_count, 1)
+
+    def test_web_sync_failure_returns_and_saves_generic_status(self):
+        with patch("academic_radar.cloud_sync.sync_configured", side_effect=RuntimeError("SECRET-CREDENTIAL")), \
+                patch("academic_radar.cloud_sync.load_config", return_value={"state_dir": str(self.root)}):
+            result = safe_sync_configured(self.root / "config.toml")
+        self.assertEqual(result["status"], "failed")
+        self.assertNotIn("SECRET-CREDENTIAL", canonical(result))
+        self.assertEqual(json.loads((self.root / "cloud-sync-status.json").read_text()), result)
+
+    def test_background_edits_share_one_worker_and_queue_a_fresh_followup(self):
+        entered, release = threading.Event(), threading.Event()
+        def sync(path):
+            entered.set()
+            release.wait(5)
+            return {"status": "unchanged"}
+        with patch("academic_radar.cloud_sync.safe_sync_configured", side_effect=sync) as mocked:
+            first = background_sync(self.root / "config.toml")
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(background_sync_state(self.root / "config.toml"), {"running": True})
+            second = background_sync(self.root / "config.toml")
+            release.set()
+            from academic_radar import cloud_sync
+            with cloud_sync._background_lock:
+                worker = cloud_sync._background_threads.get(str((self.root / "config.toml").resolve()))
+            if worker:
+                worker.join(2)
+        self.assertEqual(first["status"], "queued")
+        self.assertEqual(second["status"], "busy")
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(background_sync_state(self.root / "config.toml"), {"running": False})
+
+    def test_clearing_local_feedback_syncs_a_tombstone_and_blocks_old_cloud_edits(self):
+        from academic_radar.engagement import clear_feedback, list_feedback
+        apply_remote_feedback(self.db, [self.event()], 1)
+        with patch("academic_radar.engagement.utc_now", return_value="2026-10-09T03:01:00Z"):
+            clear_feedback(self.path, "doi:10.1/x")
+        self.assertEqual(list_feedback(self.path), [])
+        self.assertEqual(apply_remote_feedback(self.db, [self.event(seq=2)], 2), 0)
+        record = next(row for row in snapshot_records(self.path, {}) if row["kind"] == "feedback")
+        tombstone = json.loads(record["data"])
+        self.assertIsNone(tombstone["interest"])
+        self.assertIsNone(tombstone["reason"])
+        self.assertEqual(tombstone["favorite"], 0)
+        self.assertEqual(tombstone["reading_status"], "unread")
+        self.assertEqual(tombstone["updated_at"], "2026-10-09T03:01:00Z")
+        self.assertEqual(apply_remote_feedback(self.db, [self.event(seq=3, updated_at="2026-10-09T03:02:00Z")], 3), 1)
+        self.assertEqual(len(list_feedback(self.path)), 1)
+
+    def test_clearing_cloud_feedback_removes_visible_local_marks(self):
+        from academic_radar.engagement import list_feedback
+        apply_remote_feedback(self.db, [self.event()], 1)
+        clear = self.event(seq=2, interest=None, reason=None, favorite=0, reading_status="unread",
+                           updated_at="2026-10-09T03:01:00Z")
+        self.assertEqual(apply_remote_feedback(self.db, [clear], 2), 1)
+        self.assertEqual(list_feedback(self.path), [])
+        self.assertEqual(apply_remote_feedback(self.db, [self.event(seq=3)], 3), 0)
+        contexts = snapshot_records(self.path, {})
+        ui = json.loads(next(row["data"] for row in contexts if row["key"] == "ui:feedback"))
+        self.assertEqual(ui["items"], [])
+        self.assertEqual(ui["stats"]["total"], 0)
 
     def test_origin_validation_rejects_credential_redirection_tricks(self):
         for endpoint in (

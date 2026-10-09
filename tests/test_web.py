@@ -1,5 +1,6 @@
 import datetime as dt
 import hashlib
+import json
 import sqlite3
 import sys
 import tempfile
@@ -67,12 +68,21 @@ class WebTests(unittest.TestCase):
                     self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
                     self.assertIn('rel="icon" type="image/png"', response.text)
                     if path == "/":
-                        self.assertIn("app.js?v=0.10.3", response.text)
+                        self.assertIn("app.js?v=0.12.0", response.text)
                         self.assertEqual(response.text.count('class="nav-icon"'), 6)
                 favicon = client.get("/static/images/academic-radar-logo.png")
                 self.assertEqual(favicon.status_code, 200)
                 self.assertEqual(favicon.headers["content-type"], "image/png")
                 self.assertTrue(client.get("/healthz").json()["ok"])
+
+    def test_sync_status_has_polling_message_and_pending_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, _, _ = self.make_app(Path(td))
+            with TestClient(app) as client:
+                status = client.get("/api/sync/status").json()
+                self.assertIsInstance(status["message"], str)
+                self.assertTrue(status["message"])
+                self.assertIs(status["pending"], False)
 
     def test_old_recommendations_are_history_and_not_today(self):
         with tempfile.TemporaryDirectory() as td:
@@ -341,7 +351,7 @@ class WebTests(unittest.TestCase):
                 response = client.get("/library?sort=score_asc&favorite=yes&q=useful&interest=&page_no=1")
             self.assertEqual(response.status_code, 200)
             self.assertIn("匹配度：低到高", response.text)
-            self.assertIn("对应论文卡片中直接导入 PDF", response.text)
+            self.assertIn("本地对应论文卡片中导入 PDF", response.text)
             self.assertEqual(response.text.count('action="/fulltext"'), 1)
             self.assertNotIn('id="pdf-dialog"', response.text)
             self.assertIn("data-inline-pdf-form", response.text)
@@ -696,6 +706,74 @@ class WebTests(unittest.TestCase):
             self.assertNotIn("数据库结构版本", response.text)
             self.assertNotIn("API Key",response.text)
             self.assertNotIn("DeepSeek",response.text)
+
+    def test_local_feedback_edits_queue_sync_after_saving(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            app, db_path, _ = self.make_app(root)
+            app.state.config["cloud_sync"] = {"enabled": True}
+            token = app.state.csrf_token
+            payload = {"identity": "doi:10.1/test", "interest": "interested", "reason": "Useful mechanism",
+                       "favorite": True, "reading_status": "read_later"}
+            with TestClient(app) as client, patch("academic_radar.web.background_sync", return_value={"status": "queued"}) as queued:
+                self.assertEqual(client.post("/api/feedback", json=payload, headers={"X-CSRF-Token": token}).status_code, 200)
+                self.assertEqual(client.post("/api/favorite", json={"identity": "doi:10.1/test", "favorite": False},
+                                             headers={"X-CSRF-Token": token}).status_code, 200)
+                self.assertEqual(client.post("/feedback", data={"csrf_token": token, "identity": "doi:10.1/test",
+                    "interest": "not_interested", "reason": "Mechanism outside scope", "reading_status": "read"},
+                    follow_redirects=False).status_code, 303)
+                self.assertEqual(client.post("/feedback/clear", data={"csrf_token": token, "identity": "doi:10.1/test"},
+                                             follow_redirects=False).status_code, 303)
+                self.assertEqual(queued.call_count, 4)
+                for call in queued.call_args_list:
+                    self.assertEqual(call.args, ((root / "config.toml").resolve(),))
+                page = client.get("/feedback")
+                self.assertNotIn("A useful paper", page.text)
+                self.assertIn("没有符合筛选条件的当前反馈", page.text)
+            db = connect(db_path)
+            try:
+                self.assertEqual(tuple(db.execute("SELECT interest,reason,favorite,reading_status FROM paper_feedback").fetchone()),
+                                 (None, None, 0, "unread"))
+            finally:
+                db.close()
+
+    def test_manual_sync_requires_csrf_and_status_never_exposes_private_diagnostics(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            app, _, _ = self.make_app(root)
+            app.state.config["cloud_sync"] = {"enabled": True}
+            (root / "cloud-sync-status.json").write_text(json.dumps({
+                "status": "failed", "checked_at": "2026-10-09T01:00:00Z", "generation": "a" * 64,
+                "records": 20, "error": "TOKEN-SECRET /private/installation https://user:password@example",
+                "credentials_file": "/private/installation/credentials", "sync_token": "SECRET",
+            }))
+            with TestClient(app) as client, patch("academic_radar.web.background_sync", return_value={"status": "queued"}) as queued, \
+                 patch("academic_radar.web.background_sync_state", return_value={"running": False}):
+                self.assertEqual(client.post("/api/sync", json={}).status_code, 403)
+                queued.assert_not_called()
+                response = client.post("/api/sync", json={}, headers={"X-CSRF-Token": app.state.csrf_token})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "queued")
+                queued.assert_called_once_with((root / "config.toml").resolve())
+                status = client.get("/api/sync/status")
+                self.assertEqual(status.status_code, 200)
+                self.assertEqual(status.json()["status"], "failed")
+                self.assertEqual(status.json()["records"], 20)
+                self.assertEqual(status.json()["generation"], "a" * 64)
+                for private in ("SECRET", "/private/installation", "password", "credentials_file", "sync_token"):
+                    self.assertNotIn(private, status.text)
+            with TestClient(app) as client, patch("academic_radar.web.background_sync_state", return_value={"running": True}):
+                self.assertEqual(client.get("/api/sync/status").json()["status"], "running")
+
+    def test_feedback_remains_available_when_cloud_sync_is_not_configured(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, _, _ = self.make_app(Path(td))
+            with TestClient(app) as client, patch("academic_radar.web.background_sync") as queued:
+                response = client.post("/api/favorite", json={"identity": "doi:10.1/test", "favorite": True},
+                                       headers={"X-CSRF-Token": app.state.csrf_token})
+                self.assertEqual(response.status_code, 200)
+                queued.assert_not_called()
+                self.assertEqual(client.get("/api/sync/status").json()["status"], "disabled")
 
 
 if __name__ == "__main__":

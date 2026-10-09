@@ -33,6 +33,7 @@ REASONING_MIN_LENGTHS = {
 }
 RECOMMENDATION_REASON_MIN_LENGTH = 48
 RECOMMENDATION_REASON_MAX_LENGTH = 360
+STUDY_SUMMARY_FIELDS = ("problem_motivation", "approach", "findings_value")
 RECOMMENDATION_SCORE_CAPS = {
     "core": 1.0,
     "method_transfer": 0.84,
@@ -47,7 +48,7 @@ def evaluation_policy() -> dict[str, Any]:
         "rubric_version": SCREENING_RUBRIC_VERSION,
         "result_fields": [
             "identity", "reasoning", "score_dimensions", "matched_themes",
-            "confidence", "recommendation_reason", "recommendation_type", "evidence_anchors",
+            "confidence", "recommendation_reason", "study_summary", "recommendation_type", "evidence_anchors",
         ],
         "reasoning_fields": list(REASONING_MIN_LENGTHS),
         "minimum_reasoning_characters": dict(REASONING_MIN_LENGTHS),
@@ -55,7 +56,9 @@ def evaluation_policy() -> dict[str, Any]:
             "minimum_characters": RECOMMENDATION_REASON_MIN_LENGTH,
             "maximum_characters": RECOMMENDATION_REASON_MAX_LENGTH,
             "purpose": "Natural Chinese analysis for the reader, separate from the audit evidence.",
-            "preferred_length": "Two or three sentences, usually 80–180 Chinese characters.",
+            "preferred_length": "Three short natural Chinese paragraphs, usually 140–280 characters in total.",
+            "order": list(STUDY_SUMMARY_FIELDS),
+            "study_summary": "Return these three parts separately and join them in the same order as recommendation_reason. Existing schema-5 queues without this field remain importable.",
         },
         "evidence_anchors_contract": {
             "count": "1–3",
@@ -90,12 +93,40 @@ def evaluation_policy() -> dict[str, Any]:
             "In transfer_value name a concrete factor, task, measure, hypothesis, identification strategy, or algorithm and its target use. Label your proposed adaptation separately from the authors' tested contribution.",
             "In limitations give the decisive uncertainty and its consequence: causality, construct validity, confounding, external validity, or missing evidence. A different application domain alone is not a reason to penalize a sound method transfer.",
             "Do not equate reported trust with calibrated reliance, perceived control with actual control, prediction with causation, algorithmic performance with joint human–AI benefit, or a non-significant result with proven equivalence.",
-            "Write recommendation_reason as two or three natural Chinese sentences: lead with one distinctive mechanism or result, connect it to the user's specific research, give the most useful transfer, and close with the decisive caveat. For low scores explain the actual mismatch, without manufacturing a benefit.",
+            "Write study_summary as three substantive Chinese parts: problem_motivation explains the actual research question and why the authors study it; approach explains what they did; findings_value states their reported result, then any concrete proposed transfer and decisive limitation. Join the parts in that order as recommendation_reason. Never substitute the user's profile for the authors' motivation; when motivation or findings are not supplied, state that limitation. For low scores explain the actual mismatch without manufacturing a benefit.",
             "Do not concatenate audit labels, paraphrase the title, list possible mechanisms using 或, praise a venue, repeat generic 有参考价值 claims, or reuse the same generic recommendation across different papers.",
             "Confidence describes certainty in this judgment, including uncertainty about an exclusion; it is separate from relevance. Missing abstracts must be explicit, cannot score above 0.69, and cannot have confidence above 0.50.",
             "Return every exported identity exactly once. Do not report a supplied score as authoritative: the runner computes the weighted score and applies classification and evidence caps.",
         ],
     }
+
+
+def validate_study_summary(item: Mapping[str, Any]) -> dict[str, str] | None:
+    """Validate the reader's research narrative without inferring its content.
+
+    The field is optional for already exported schema-5 jobs. When present, it
+    must describe distinct stages and preserve their order in the public prose.
+    Original-text evidence is checked separately by validate_judgment_evidence.
+    """
+    value = item.get("study_summary")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != set(STUDY_SUMMARY_FIELDS):
+        raise ValueError("study_summary requires problem_motivation, approach, and findings_value")
+    parts = {}
+    for field in STUDY_SUMMARY_FIELDS:
+        text = value[field]
+        if not isinstance(text, str) or len(text.strip()) < 18:
+            raise ValueError(f"study_summary.{field} must be substantive Chinese prose")
+        parts[field] = re.sub(r"\s+", " ", text).strip()
+    if len(set(parts.values())) != len(parts):
+        raise ValueError("study_summary parts must describe distinct research stages")
+    reason = item.get("recommendation_reason")
+    if not isinstance(reason, str) or re.sub(r"\s+", "", reason) != "".join(
+        re.sub(r"\s+", "", parts[field]) for field in STUDY_SUMMARY_FIELDS
+    ):
+        raise ValueError("recommendation_reason must join study_summary in problem, approach, findings order")
+    return parts
 
 
 def unit_number(value: Any, name: str) -> float:

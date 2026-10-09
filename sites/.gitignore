@@ -2,3 +2,5 @@ dist/
 site.tar.gz
 node_modules/
 .sites-runtime/
+
+worker/generated-ui.js

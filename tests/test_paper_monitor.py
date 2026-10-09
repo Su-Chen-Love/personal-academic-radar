@@ -518,6 +518,22 @@ class MonitorTests(unittest.TestCase):
         result=pm.structured_judgment(item,paper,.7,4)
         self.assertEqual(result["rubric_version"],"evidence-v2")
 
+    def test_study_narrative_persists_without_changing_rubric_or_score(self):
+        item=self.structured_result("doi:10.1/x")
+        paper={"abstract":"Abstract","title":"Paper"}
+        original=pm.structured_judgment(item,paper,.7,5)
+        summary={
+            "problem_motivation":"研究检验明确偏好能否进入决策机制，回应固定建议难以调整的问题。",
+            "approach":"作者比较偏好输入条件下的决策过程，原摘要不足以确认详细实验规模。",
+            "findings_value":"当前证据支持研究方向的具体关联，但没有完整结果，不能据此声称用户收益已获验证。",
+        }
+        item.update(study_summary=summary,recommendation_reason="\n\n".join(summary.values()))
+        result=pm.structured_judgment(item,paper,.7,5)
+        self.assertEqual(result["reasoning"]["study_summary"],summary)
+        self.assertEqual(result["score"],original["score"])
+        self.assertEqual(result["score_dimensions"],original["score_dimensions"])
+        self.assertEqual(result["rubric_version"],"evidence-v3")
+
     def test_schema_five_rejects_nonfinite_scores(self):
         item=self.structured_result("doi:10.1/x");item["score_dimensions"]["core_relevance"]=float("nan")
         with self.assertRaisesRegex(ValueError,"finite"):

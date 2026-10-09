@@ -11,13 +11,29 @@ from academic_radar.engagement import seed_active_profile
 from academic_radar.recommendations import (
     SCREENING_RUBRIC_VERSION, calibrated_score, evaluation_policy,
     recommendation_days, recommendations_on, snapshot_run,
-    unit_number, validate_judgment_evidence,
+    unit_number, validate_judgment_evidence, validate_study_summary,
 )
 from academic_radar.storage import connect, load_migrations, upgrade_database
 from academic_radar.web import create_app
 
 
 class RecommendationQualityTests(unittest.TestCase):
+    def test_research_narrative_requires_three_distinct_stages_in_order(self):
+        summary = {
+            "problem_motivation": "研究关注偏好输入变化后调度决策能否稳定回应，这是可控策略的关键问题。",
+            "approach": "作者把偏好向量输入调度策略，利用仿真实验检查决策与输入偏好的匹配。",
+            "findings_value": "仿真中偏好匹配改善，可借鉴其校准指标；原文未进行用户实验，尚不能推断协作收益。",
+        }
+        item = {"study_summary": summary, "recommendation_reason": "\n\n".join(summary.values())}
+        self.assertEqual(validate_study_summary(item), summary)
+        item["recommendation_reason"] = "\n\n".join(reversed(list(summary.values())))
+        with self.assertRaisesRegex(ValueError, "order"):
+            validate_study_summary(item)
+        item["study_summary"] = {"problem_motivation": "问题", "approach": "方法"}
+        with self.assertRaisesRegex(ValueError, "requires"):
+            validate_study_summary(item)
+        self.assertIsNone(validate_study_summary({"recommendation_reason": "Existing exported judgment"}))
+
     def setUp(self):
         self.paper = {
             "title": "Preference-conditioned dispatching",

@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from .cloud_sync import background_sync, background_sync_state
 from .engagement import (
     clear_feedback,
     confirm_profile,
@@ -311,6 +312,57 @@ def create_app(config_path: Path) -> FastAPI:
     }.get(str(value), str(value))
     app.mount("/static", StaticFiles(directory=str(PACKAGE_DIR / "static")), name="static")
 
+    def queue_cloud_sync() -> dict[str, Any]:
+        if not config.get("cloud_sync", {}).get("enabled"):
+            return {"status": "disabled"}
+        return background_sync(config_path)
+
+    def public_sync_status() -> dict[str, Any]:
+        """Only stable diagnostics and counters may reach a browser response."""
+        enabled = bool(config.get("cloud_sync", {}).get("enabled"))
+        value: dict[str, Any] = {}
+        try:
+            loaded = json.loads((state / "cloud-sync-status.json").read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                value = loaded
+        except (OSError, ValueError):
+            pass
+        statuses = {"succeeded", "unchanged", "failed", "busy", "queued", "disabled"}
+        status = value.get("status") if value.get("status") in statuses else "unknown"
+        running = bool(background_sync_state(config_path).get("running")) if enabled else False
+        if enabled and (state / ".cloud-sync.lock").exists():
+            import fcntl
+            try:
+                with (state / ".cloud-sync.lock").open("r") as lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        running = True
+            except OSError:
+                pass
+        result: dict[str, Any] = {"status": "running" if running else (status if enabled else "disabled"),
+                                  "running": running, "enabled": enabled}
+        for key in ("records", "uploaded_records", "feedback_imported", "request_acknowledged"):
+            if type(value.get(key)) is int and value[key] >= 0:
+                result[key] = value[key]
+        for key in ("synced_at", "checked_at", "remote_synced_at"):
+            if isinstance(value.get(key), str):
+                try:
+                    dt.datetime.fromisoformat(value[key].replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                result[key] = value[key]
+        if isinstance(value.get("generation"), str) and re.fullmatch(r"[0-9a-f]{64}", value["generation"]):
+            result["generation"] = value["generation"]
+        result["pending"] = enabled and (running or status not in {"succeeded", "unchanged"})
+        result["message"] = ("同步正在进行；有变化时会更新云端。" if running else
+            "当前安装尚未配置云端同步。" if not enabled else
+            "两端同步已完成；暂无待同步更新。" if status in {"succeeded", "unchanged"} else
+            "同步等待执行或重试。")
+        if status == "failed" and not running:
+            result["message"] = "云端同步尚未完成，请稍后重试；已保存的本地和云端数据继续保留。"
+        return result
+
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
         response=await call_next(request)
@@ -321,18 +373,14 @@ def create_app(config_path: Path) -> FastAPI:
         return response
 
     def context(request: Request, page: str, **values: Any) -> dict[str, Any]:
-        sync_status = {}
-        try:
-            sync_status = json.loads((state / "cloud-sync-status.json").read_text())
-        except (OSError, ValueError):
-            pass
         return {
             "request": request,
             "page": page,
             "csrf_token": app.state.csrf_token,
             "state_path": str(state),
             "cloud_url": str(config.get("cloud_sync", {}).get("endpoint", "")),
-            "cloud_sync_status": sync_status,
+            "cloud_sync_status": public_sync_status(),
+            "site_mode": "local",
             **values,
         }
 
@@ -427,7 +475,7 @@ def create_app(config_path: Path) -> FastAPI:
                 AND s.score>=? AND p.eligibility_status='eligible'
               ORDER BY CASE WHEN f.interest IS NULL THEN 0 ELSE 1 END,
                 CASE f.interest WHEN 'interested' THEN 0 WHEN 'not_interested' THEN 1 ELSE 0 END,
-                s.score DESC,p.published DESC""", (run_id,profile_hash,threshold))
+                s.score DESC,p.published DESC,p.identity ASC""", (run_id,profile_hash,threshold))
             if not freshness["is_today"]:
                 papers = []
             history_papers, history_runs, history_incomplete = recommendations_on(db, selected_day, timezone)
@@ -485,7 +533,7 @@ def create_app(config_path: Path) -> FastAPI:
                 ORDER BY ft.imported_at DESC,ft.id DESC LIMIT 1) fulltext_id
               FROM papers p JOIN ({latest}) s ON s.identity=p.identity
               LEFT JOIN paper_feedback f ON f.identity=p.identity WHERE {where}
-              ORDER BY {order_by} LIMIT ? OFFSET ?"""
+              ORDER BY {order_by},p.identity ASC LIMIT ? OFFSET ?"""
             paper_rows=rows(db,query,tuple([active["profile_hash"]]+parameters+[limit,offset]))
             count=row(db,f"""SELECT COUNT(*) count FROM papers p JOIN ({latest}) s ON s.identity=p.identity
               LEFT JOIN paper_feedback f ON f.identity=p.identity WHERE {where}""",
@@ -646,7 +694,7 @@ def create_app(config_path: Path) -> FastAPI:
     def feedback(request: Request, interest: str = "", favorite: str = "", sort: str = "updated") -> HTMLResponse:
         db=connect(db_path)
         try:
-            clauses=["1=1"]; params=[]
+            clauses=["(f.interest IS NOT NULL OR COALESCE(f.reason,'')<>'' OR f.favorite=1 OR f.reading_status<>'unread')"]; params=[]
             if interest in {"interested","not_interested"}:
                 clauses.append("f.interest=?"); params.append(interest)
             if favorite=="yes": clauses.append("f.favorite=1")
@@ -658,7 +706,8 @@ def create_app(config_path: Path) -> FastAPI:
               LEFT JOIN ({latest}) s ON s.identity=p.identity WHERE {' AND '.join(clauses)} ORDER BY {order}""",tuple(params))
             stats=row(db,"""SELECT COUNT(*) total,SUM(interest='interested') interested,
               SUM(interest='not_interested') not_interested,SUM(favorite) favorites,
-              SUM(reading_status='read') was_read FROM paper_feedback""")
+              SUM(reading_status='read') was_read FROM paper_feedback
+              WHERE interest IS NOT NULL OR COALESCE(reason,'')<>'' OR favorite=1 OR reading_status<>'unread'""")
             return templates.TemplateResponse(request,"feedback.html",context(request,"feedback",items=items,stats=stats,
                 interest=interest,favorite=favorite,sort=sort))
         finally: db.close()
@@ -669,6 +718,7 @@ def create_app(config_path: Path) -> FastAPI:
         interest=data.get("interest") or None
         set_feedback(db_path,data["identity"],interest,data.get("reason",""),data.get("favorite")=="on",
                      data.get("reading_status","unread"))
+        queue_cloud_sync()
         return RedirectResponse(safe_return(data.get("return_to"),"/library"),303)
 
     @app.post("/api/feedback")
@@ -684,6 +734,7 @@ def create_app(config_path: Path) -> FastAPI:
             str(data.get("reading_status", "unread")),
         )
         labels={"interested":"已完成 · 感兴趣", "not_interested":"已完成 · 不感兴趣"}
+        queue_cloud_sync()
         return JSONResponse({"ok":True,"interest":result["interest"],"favorite":bool(result["favorite"]),
                              "reading_status":result["reading_status"],
                              "status_label":labels.get(result["interest"], ""),
@@ -693,14 +744,29 @@ def create_app(config_path: Path) -> FastAPI:
     async def remove_feedback(request: Request) -> RedirectResponse:
         data=await form_data(request); validate_csrf(data)
         clear_feedback(db_path,data["identity"])
+        queue_cloud_sync()
         return RedirectResponse(safe_return(data.get("return_to"),"/feedback"),303)
 
     @app.post("/api/favorite")
     async def favorite_api(request: Request) -> JSONResponse:
         validate_json_csrf(request); data=await json_data(request)
         result=set_favorite(db_path,str(data.get("identity","")),bool(data.get("favorite")))
+        queue_cloud_sync()
         return JSONResponse({"ok":True,"favorite":bool(result["favorite"]),
                              "message":"已收藏到本地文献库" if result["favorite"] else "已取消收藏"})
+
+    @app.post("/api/sync")
+    async def synchronize_api(request: Request) -> JSONResponse:
+        validate_json_csrf(request)
+        result = queue_cloud_sync()
+        status = result.get("status", "queued")
+        message = {"queued": "已安排同步；只有内容变化时才上传。", "busy": "同步正在进行。",
+                   "disabled": "当前安装尚未配置云端同步。"}.get(status, "已安排同步。")
+        return JSONResponse({"ok": status in {"queued", "busy"}, "status": status, "message": message})
+
+    @app.get("/api/sync/status")
+    def synchronize_status_api() -> JSONResponse:
+        return JSONResponse(public_sync_status())
 
     @app.post("/api/papers/manual")
     async def manual_paper_api(request: Request) -> JSONResponse:

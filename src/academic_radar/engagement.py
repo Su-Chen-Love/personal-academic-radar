@@ -345,6 +345,8 @@ def list_feedback(db_path: Path) -> list[dict[str, Any]]:
     try:
         return [dict(row) for row in db.execute(
             """SELECT f.*,p.title,p.venue FROM paper_feedback f JOIN papers p ON p.identity=f.identity
+            WHERE f.interest IS NOT NULL OR COALESCE(f.reason,'')!=''
+              OR f.favorite=1 OR f.reading_status!='unread'
             ORDER BY f.updated_at DESC"""
         )]
     finally:
@@ -360,18 +362,27 @@ def clear_feedback(db_path: Path, identity: str) -> dict[str, Any]:
         if not db.execute("SELECT 1 FROM papers WHERE identity=?", (identity,)).fetchone():
             raise ValueError(f"Unknown paper identity: {identity}")
         prior = db.execute("SELECT * FROM paper_feedback WHERE identity=?", (identity,)).fetchone()
+        had_feedback = bool(prior and (prior["interest"] is not None or prior["reason"]
+                                       or prior["favorite"] or prior["reading_status"] != "unread"))
+        now = utc_now()
         with db:
-            db.execute("DELETE FROM paper_feedback WHERE identity=?", (identity,))
-            if prior:
+            # Keep the clear edit's timestamp so a delayed older cloud edit
+            # cannot resurrect it. Neutral rows are omitted from user lists.
+            db.execute("""INSERT INTO paper_feedback(
+              identity,interest,reason,favorite,reading_status,created_at,updated_at
+              ) VALUES(?,NULL,NULL,0,'unread',?,?) ON CONFLICT(identity) DO UPDATE SET
+              interest=NULL,reason=NULL,favorite=0,reading_status='unread',updated_at=excluded.updated_at""",
+                       (identity, now, now))
+            if had_feedback:
                 db.execute(
                     """INSERT INTO feedback_events(
                     identity,interest,reason,favorite,reading_status,created_at
                     ) VALUES(?,NULL,'用户清除当前反馈',0,'unread',?)""",
-                    (identity, utc_now()),
+                    (identity, now),
                 )
-                if prior["interest"] in {"interested", "not_interested"}:
-                    db.execute("UPDATE papers SET needs_rescreen=1,updated_at=? WHERE identity=?", (utc_now(), identity))
-        return {"identity": identity, "cleared": bool(prior)}
+                if prior["interest"] is not None or prior["reason"]:
+                    db.execute("UPDATE papers SET needs_rescreen=1,updated_at=? WHERE identity=?", (now, identity))
+        return {"identity": identity, "cleared": had_feedback}
     finally:
         db.close()
 

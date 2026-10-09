@@ -6,7 +6,8 @@ dist_root="$project_root/dist"
 
 rm -rf "$dist_root"
 mkdir -p "$dist_root/server" "$dist_root/.openai"
-cp "$project_root/worker/"* "$dist_root/server/"
+cd "$project_root"
+node scripts/build-ui.mjs
 cp "$project_root/.openai/hosting.json" "$dist_root/.openai/hosting.json"
 cp -R "$project_root/drizzle" "$dist_root/drizzle"
 

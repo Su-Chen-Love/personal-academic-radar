@@ -24,7 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Verify the Site shares the complete local UI
+        run: python3 scripts/sync-site-ui.py --check
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - run: node sites/scripts/test-worker.mjs
+      - run: npm ci
+        working-directory: sites
+      - run: npm run build && npm run validate && node scripts/test-worker.mjs
+        working-directory: sites

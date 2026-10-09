@@ -20,7 +20,7 @@ from academic_radar.recommendations import (
     snapshot_run, SCREENING_SCHEMA_VERSION, SCREENING_RUBRIC_VERSION,
     SCREENING_DIMENSIONS, REASONING_MIN_LENGTHS,
     RECOMMENDATION_REASON_MIN_LENGTH, RECOMMENDATION_REASON_MAX_LENGTH,
-    evaluation_policy, unit_number, validate_judgment_evidence, calibrated_score,
+    evaluation_policy, unit_number, validate_judgment_evidence, calibrated_score, validate_study_summary,
 )
 
 VERSION = "0.11.0"
@@ -425,6 +425,9 @@ def structured_judgment(item: dict[str,Any], paper: sqlite3.Row, threshold: floa
     if abstract_missing:
         confidence = min(confidence, 0.5)
     reasons = recommendation_reason(item, clean_reasoning, required=schema_version >= 4)
+    study_summary = validate_study_summary(item)
+    if study_summary is not None:
+        clean_reasoning["study_summary"] = study_summary
     if schema_version>=5:
         quality=validate_judgment_evidence(item,paper)
         score=calibrated_score(clean_dimensions,quality["recommendation_type"],abstract_missing)
