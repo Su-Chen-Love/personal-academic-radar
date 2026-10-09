@@ -396,6 +396,36 @@ class MonitorTests(unittest.TestCase):
         out=pm._toml_load_fallback(text)
         self.assertEqual(out["s"]["n"],3); self.assertEqual(out["sources"][0]["name"],"A")
 
+    def test_import_preserves_review_needed_when_feedback_or_evidence_changed_after_export(self):
+        for change, expected in [("feedback", 1), ("late_feedback", 1), ("abstract", 1), ("reading", 0)]:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as td:
+                root=Path(td); config=root/"config.toml"; database=root/"papers.sqlite3"
+                (root/"research-profile.md").write_text("profile")
+                config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "V"\ntype = "crossref"\nissn = "1234"\n')
+                db=pm.db_open(database)
+                abstract="Abstract evidence provided for the complete original design."
+                paper=pm.Paper("doi:10.1/update","10.1/update","Preference-aware routing",abstract,"V","2026-01-01","",[],"s",
+                               publication_type_raw="journal-article",publication_type_source="crossref")
+                pm.upsert(db,paper,"before"); db.commit(); db.close()
+                with patch("builtins.print") as output:pm.agent_export(config,no_collect=True)
+                summary=json.loads(output.call_args.args[0]);queue=json.loads(Path(summary["queue_path"]).read_text())
+                db=pm.db_open(database)
+                with db:
+                    if change in {"feedback", "late_feedback"}:
+                        stamp = "2020-01-01T00:00:00Z" if change == "late_feedback" else "9999-01-01T00:00:00Z"
+                        db.execute("INSERT INTO feedback_events(identity,interest,reason,favorite,reading_status,created_at) VALUES(?,'not_interested','A new confirmed preference',0,'unread',?)",(paper.identity,stamp))
+                        db.execute("UPDATE papers SET needs_rescreen=1")
+                    elif change=="abstract":db.execute("UPDATE papers SET abstract=abstract||' Additional design details.',needs_rescreen=1")
+                    else:db.execute("INSERT INTO paper_feedback(identity,favorite,reading_status,created_at,updated_at) VALUES(?,1,'read','now','now')",(paper.identity,))
+                db.close()
+                result=self.structured_result(paper.identity);result["evidence_anchors"][0]["quote"]=abstract
+                path=root/"results.json";path.write_text(json.dumps({"run_id":summary["run_id"],"profile_hash":queue["profile_hash"],"model":"codex-test","results":[result]}))
+                with patch("builtins.print"):self.assertEqual(pm.agent_import(config,path),0)
+                db=pm.db_open(database)
+                self.assertEqual(db.execute("SELECT needs_rescreen FROM papers").fetchone()[0],expected)
+                self.assertEqual(db.execute("SELECT status FROM agent_jobs").fetchone()[0],"imported")
+                db.close()
+
     def test_agent_import_records_semantic_judgment(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); (root/"research-profile.md").write_text("interactive optimization",encoding="utf-8")

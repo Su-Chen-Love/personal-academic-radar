@@ -760,6 +760,10 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
         # Complete traceable metadata before freezing the one authoritative
         # queue so this run retains its `new` identities for Today's Radar.
         enrichment=run_enrichment(state/"papers.sqlite3",cfg,limit=500)
+    # Freeze evidence, calibration examples and the event watermark together.
+    # A later cloud pull may carry an old UTC timestamp but still be new to
+    # this host, so timestamps alone cannot detect feedback missing at export.
+    db.execute("BEGIN IMMEDIATE")
     if rescreen:
         rows=db.execute("SELECT * FROM papers WHERE eligibility_status='eligible' ORDER BY first_seen").fetchall()
     else:
@@ -781,7 +785,8 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
     examples=feedback_snapshot(db,int(cfg.get("feedback_examples_per_class",20)))
     payload={"schema_version":SCREENING_SCHEMA_VERSION,"run_id":run_id,"profile_hash":phash,"profile_version_id":active["id"],
              "profile_confirmed_at":active["confirmed_at"],"profile_path":str(profile_path),
-             "feedback_examples":examples,"threshold":float(cfg.get("relevance_threshold",0.70)),
+             "feedback_examples":examples,"feedback_event_cursor":db.execute("SELECT COALESCE(MAX(id),0) FROM feedback_events").fetchone()[0],
+             "threshold":float(cfg.get("relevance_threshold",0.70)),
              "papers":papers,"source_failures":failures,"collection_run_id":batch_run,
              "total_candidates":total_candidates,"deferred_candidates":total_candidates-len(papers),
              "evaluation_policy":evaluation_policy()}
@@ -838,6 +843,9 @@ def agent_import(config_path: Path, results_path: Path) -> int:
     if data.get("source_failures",[])!=queue.get("source_failures",[]):
         raise ValueError("Result source_failures do not match the exported queue")
     expected={paper["identity"] for paper in queue.get("papers",[])}
+    frozen_papers={paper["identity"]:paper for paper in queue.get("papers",[])}
+    feedback_cursor=queue.get("feedback_event_cursor")
+    if type(feedback_cursor) is not int or feedback_cursor<0:feedback_cursor=None
     received=set(identities)
     if received != expected:
         missing=sorted(expected-received); extra=sorted(received-expected)
@@ -890,7 +898,14 @@ def agent_import(config_path: Path, results_path: Path) -> int:
                    result["reasons"],json.dumps(result["matched_themes"],ensure_ascii=False),result["confidence"],now,
                    version_id,snapshot,run_id,json.dumps(result["reasoning"],ensure_ascii=False),
                    json.dumps(result["score_dimensions"],ensure_ascii=False),result["rubric_version"]))
-                db.execute("UPDATE papers SET needs_rescreen=0 WHERE identity=?",(identity_value,))
+                frozen=frozen_papers[identity_value]
+                db.execute("""UPDATE papers SET needs_rescreen=CASE
+                  WHEN COALESCE(title,'')<>? OR COALESCE(abstract,'')<>? OR EXISTS(
+                    SELECT 1 FROM feedback_events f WHERE f.identity=papers.identity
+                    AND ((? IS NOT NULL AND f.id>?) OR (? IS NULL
+                      AND julianday(f.created_at)>julianday(?)))) THEN 1 ELSE 0 END WHERE identity=?""",
+                  (frozen.get('title') or '',frozen.get('abstract') or '',feedback_cursor,feedback_cursor,
+                   feedback_cursor,job['created_at'],identity_value))
                 if result["relevant"]:
                     db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'selected')",(run_id,identity_value))
                     if db.execute("SELECT 1 FROM run_papers WHERE run_id=? AND identity=? AND role='new'",(run_id,identity_value)).fetchone():
