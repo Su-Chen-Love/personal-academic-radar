@@ -27,8 +27,11 @@ def public_source_url(value: str | None) -> str | None:
     """Keep public provenance links without collector contact or API credentials."""
     if not value:
         return None
-    parsed = urllib.parse.urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         return None
     # Identity is in the API path. Query parameters can carry mailto/API keys.
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
@@ -109,6 +112,7 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
         papers = [dict(row) for row in db.execute(query, (profile_hash,))]
         for paper in papers:
             paper["abstract_source_url"] = public_source_url(paper["abstract_source_url"])
+            paper["url"] = public_source_url(paper["url"])
             append("paper", paper["identity"], paper)
         timezone = config.get("timezone", "Asia/Shanghai")
         days = recommendation_days(db, timezone)
@@ -137,6 +141,8 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
         sources = []
         for source in config.get("sources", []):
             item = {key: source[key] for key in ("name", "type", "issn", "official_issues_url") if key in source}
+            if "official_issues_url" in item:
+                item["official_issues_url"] = public_source_url(item["official_issues_url"])
             health = db.execute("SELECT status,last_success_at,last_error,updated_at FROM source_health WHERE source=?", (source["name"],)).fetchone()
             item["health"] = dict(health) if health else {"status": "unknown"}
             if item["health"].get("last_error"):

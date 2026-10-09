@@ -117,6 +117,7 @@ class CloudSyncTests(unittest.TestCase):
         secret = "PRIVATE-TOKEN-ONLY-LOCAL"
         private_path = "/Users/private/research/paper.pdf"
         with self.db:
+            self.db.execute("UPDATE papers SET url=?", ("file://" + private_path,))
             self.db.execute("""INSERT INTO fulltext_files(identity,stored_path,original_name,sha256,size_bytes,imported_at)
               VALUES('doi:10.1/x',?,'paper.pdf','sha',30,'now')""", (private_path,))
             self.db.execute("""INSERT INTO source_health(source,status,last_error,updated_at)
@@ -131,7 +132,8 @@ class CloudSyncTests(unittest.TestCase):
               VALUES('history','doi:10.1/x',.8,'Historical recommendation','screening')""")
         config = {"state_dir": str(self.root), "api_key": secret, "timezone": "Asia/Shanghai",
                   "cloud_sync": {"credentials_file": private_path, "sync_token": secret},
-                  "sources": [{"name": "Journal", "type": "crossref", "secret": secret, "config_path": private_path}]}
+                  "sources": [{"name": "Journal", "type": "crossref", "secret": secret, "config_path": private_path,
+                               "official_issues_url": "https://journal.example/issues?key=" + secret}]}
         records = snapshot_records(self.path, config)
         payload = canonical(records)
         for omitted in (private_path, secret, str(self.root), "queue_path", "results_path", "stored_path", "credentials_file", "sync_token"):
@@ -142,6 +144,7 @@ class CloudSyncTests(unittest.TestCase):
         self.assertEqual(records, sorted(records, key=lambda record: (record["kind"], record["key"])))
         overview = json.loads(next(record["data"] for record in records if record["kind"] == "meta"))
         self.assertEqual(overview["sources"][0]["health"]["status"], "failed")
+        self.assertEqual(overview["sources"][0]["official_issues_url"], "https://journal.example/issues")
         self.assertIn("本地日志", overview["sources"][0]["health"]["last_error"])
 
     def test_today_snapshot_uses_latest_active_profile_run_not_daily_union(self):
