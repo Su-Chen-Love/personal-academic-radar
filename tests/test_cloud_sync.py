@@ -259,6 +259,19 @@ class CloudSyncTests(unittest.TestCase):
         handler = _NoCredentialRedirect()
         self.assertIsNone(handler.redirect_request(None, None, 307, "redirect", {}, "https://evil.example"))
 
+    def test_malformed_credentials_fail_before_building_a_request(self):
+        for credentials in (
+            {"sync_token": "PRIVATE-TOKEN\ninvalid"},
+            {"sync_token": "valid", "sites_token": "PRIVATE-TOKEN\rinvalid"},
+            {"sync_token": ""},
+            {"sync_token": None},
+        ):
+            with self.subTest(credentials=credentials), patch("urllib.request.build_opener") as build:
+                with self.assertRaisesRegex(ValueError, "header-safe tokens") as raised:
+                    request_json("https://radar.chatgpt.site", "/api/sync/feedback?after=0", credentials)
+                self.assertNotIn("PRIVATE-TOKEN", str(raised.exception))
+                build.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

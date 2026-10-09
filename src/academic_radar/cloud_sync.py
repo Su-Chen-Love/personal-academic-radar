@@ -187,6 +187,13 @@ class _NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
 
 def request_json(endpoint: str, path: str, credentials: dict, data: dict | None = None) -> dict:
     endpoint = _verified_sites_origin(endpoint)
+    for key in ("sync_token", "sites_token"):
+        value = credentials.get(key)
+        if key == "sync_token" or value:
+            if not isinstance(value, str) or not value or any(not 33 <= ord(c) <= 126 for c in value):
+                # urllib's invalid-header error contains the header value.
+                # Reject malformed credentials before it can expose a token.
+                raise ValueError("Cloud credentials require nonempty header-safe tokens")
     headers = {"Authorization": "Bearer " + credentials["sync_token"], "Accept": "application/json"}
     if credentials.get("sites_token"):
         headers["OAI-Sites-Authorization"] = "Bearer " + credentials["sites_token"]
