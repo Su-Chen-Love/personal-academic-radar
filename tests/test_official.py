@@ -17,6 +17,172 @@ from academic_radar.storage import connect, upgrade_database
 
 
 class OfficialIssueTests(unittest.TestCase):
+    @staticmethod
+    def metadata_package():
+        return {"as_of_date":"2026-10-09","failures":[],"sources":[{
+            "source_name":"Management Science","issues":[{
+                "issue_key":f"volume-72-issue-{issue}",
+                "issue_url":f"https://pubsonline.informs.org/toc/mnsc/72/{issue}",
+                "issue_evidence_type":"publisher_deposited_metadata",
+                "issue_evidence_url":"https://api.crossref.org/journals/0025-1909/works?cursor=*",
+                "papers":[{"doi":f"10.1287/mnsc.test{issue}","title":f"Original research paper {issue}",
+                           "abstract":"","abstract_unavailable_traceable":True,
+                           "abstract_failure_reason":"Original abstract absent from exact DOI metadata",
+                           "source_url":f"https://pubsonline.informs.org/doi/10.1287/mnsc.test{issue}",
+                           "published":f"2026-{issue:02d}-01","published_precision":"month"}]
+            } for issue in [10,9]]}]}
+
+    def test_idempotent_latest_two_metadata_refresh_keeps_old_failure_and_validates_skips(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);db_path=root/"papers.sqlite3";upgrade_database(db_path)
+            config={"sources":[{"name":"Management Science","type":"crossref","issn":"0025-1909"}]}
+            package=self.metadata_package();path=root/"result.json";path.write_text(json.dumps(package))
+            first=preview_official_import(db_path,config,path)
+            self.assertEqual(len(first["metadata_refreshes"]),1)
+            apply_official_import(db_path,first)
+            with connect(db_path) as db:
+                self.assertEqual({row[0] for row in db.execute("SELECT published_precision FROM papers")}, {"month"})
+            record_official_failure(db_path,config,"Management Science","as-of-old-unverified",
+                                    "https://pubsonline.informs.org/loi/mnsc","Older network failure")
+            with connect(db_path) as db:
+                before=[tuple(row) for row in db.execute("SELECT identity,updated_at FROM papers ORDER BY identity")]
+            repeated=preview_official_import(db_path,config,path)
+            self.assertEqual(repeated["counts"],{"issues":0,"papers":0,"skipped":2,"failed":0})
+            applied=apply_official_import(db_path,repeated)
+            self.assertEqual(applied["metadata_refreshed"],1)
+            with connect(db_path) as db:
+                self.assertEqual(before,[tuple(row) for row in db.execute("SELECT identity,updated_at FROM papers ORDER BY identity")])
+                self.assertEqual(db.execute("SELECT status FROM official_issue_checks WHERE issue_key='as-of-old-unverified'").fetchone()[0],"failed")
+                refresh=db.execute("SELECT detail FROM official_issue_checks WHERE issue_key='metadata-latest-two-as-of-2026-10-09'").fetchone()[0]
+                count=db.execute("SELECT COUNT(*) FROM official_issue_checks").fetchone()[0]
+            evidence=json.loads(refresh)
+            self.assertEqual(count,4)
+            self.assertEqual(evidence["evidence_type"],"publisher_deposited_metadata")
+            self.assertEqual(evidence["phase"],"latest_two_metadata_refresh")
+            self.assertEqual(evidence["issue_keys"],["volume-72-issue-10","volume-72-issue-9"])
+            self.assertEqual([issue["uncertain_date_count"] for issue in evidence["issues"]],[1,0])
+            self.assertEqual(len(build_official_plan(db_path,config)["sources"][0]["checked_issues"]),2)
+            status=official_status(db_path,config)["sources"][0]
+            self.assertEqual(status["succeeded_issues"],2)
+            self.assertIsNotNone(status["latest_metadata_refresh"])
+            package["sources"][0]["issues"][0]["papers"][0]["title"]="Completely unrelated corrupted title"
+            path.write_text(json.dumps(package))
+            corrupted=preview_official_import(db_path,config,path)
+            self.assertTrue(corrupted["errors"])
+            self.assertEqual(corrupted["metadata_refreshes"],[])
+            with self.assertRaises(ValueError):apply_official_import(db_path,corrupted)
+
+    def test_failed_or_incomplete_package_cannot_claim_latest_two_metadata_refresh(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);db_path=root/"papers.sqlite3";upgrade_database(db_path)
+            config={"sources":[{"name":"Management Science","type":"crossref","issn":"0025-1909"}]}
+            package=self.metadata_package();path=root/"result.json"
+            package["failures"]=[{"source_name":"Other source","reason":"TLS failure"}]
+            path.write_text(json.dumps(package))
+            failed=preview_official_import(db_path,config,path)
+            self.assertTrue(failed["errors"])
+            self.assertEqual(failed["metadata_refreshes"],[])
+            with self.assertRaises(ValueError):apply_official_import(db_path,failed)
+            package["failures"]=[];package["sources"][0]["issues"].pop()
+            path.write_text(json.dumps(package))
+            partial=preview_official_import(db_path,config,path)
+            self.assertEqual(partial["metadata_refreshes"],[])
+            applied=apply_official_import(db_path,partial)
+            self.assertEqual(applied["metadata_refreshed"],0)
+            with connect(db_path) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM official_issue_checks WHERE issue_key LIKE 'metadata-latest-two-as-of-%'").fetchone()[0],0)
+
+    def test_missing_abstract_cannot_bypass_identity_date_or_empty_directory_checks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);db_path=root/"papers.sqlite3";upgrade_database(db_path)
+            config={"sources":[{"name":"Ergonomics","type":"crossref","issn":"0014-0139"}]}
+            with connect(db_path) as db:
+                db.execute("INSERT INTO papers(identity,doi,title,abstract,authors_json,first_seen,updated_at) VALUES(?,?,?,?,?,?,?)",
+                           ("doi:10.1/x","10.1/x","Original paper title","","[]","before","before"))
+            paper={"doi":"10.1/x","title":"Entirely different article","abstract":"",
+                   "abstract_unavailable_traceable":True,"abstract_failure_reason":"Original abstract unavailable",
+                   "source_url":"https://www.tandfonline.com/doi/full/10.1/x"}
+            issue={"issue_key":"69-10","issue_url":"https://www.tandfonline.com/toc/terg20/69/10","papers":[paper]}
+            package={"as_of_date":"2026-10-09","sources":[{"source_name":"Ergonomics","issues":[issue]}]}
+            path=root/"result.json"
+            def preview():
+                path.write_text(json.dumps(package));return preview_official_import(db_path,config,path)
+            self.assertIn("标题不一致",preview()["errors"][0]["reason"])
+            paper["title"]="Original paper title";paper["published"]="2099-10-01"
+            self.assertIn("出版日期晚于",preview()["errors"][0]["reason"])
+            issue["papers"]=[]
+            self.assertIn("非空数组",preview()["errors"][0]["reason"])
+
+    def test_print_metadata_issue_does_not_claim_publisher_page_was_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);db_path=root/"papers.sqlite3";upgrade_database(db_path)
+            config={"sources":[{"name":"Management Science","type":"crossref","issn":"0025-1909"}]}
+            package={"as_of_date":"2026-10-09","sources":[{"source_name":"Management Science","issues":[{
+                "issue_key":"72-10","issue_url":"https://pubsonline.informs.org/toc/mnsc/72/10",
+                "issue_evidence_type":"publisher_deposited_metadata","issue_evidence_url":"https://api.crossref.org/journals/0025-1909/works",
+                "papers":[{"doi":"10.1287/mnsc.example","title":"Original paper title","abstract":"",
+                           "published":"2026-10-01","published_precision":"month",
+                           "source_url":"https://pubsonline.informs.org/doi/10.1287/mnsc.example",
+                           "abstract_unavailable_traceable":True,"abstract_failure_reason":"Exact DOI sources provide no abstract"}]}]}]}
+            path=root/"result.json";path.write_text(json.dumps(package))
+            preview=preview_official_import(db_path,config,path)
+            self.assertEqual(preview["counts"]["failed"],0)
+            self.assertTrue(preview["accepted"][0]["papers"][0]["published_date_uncertain"])
+            apply_official_import(db_path,preview)
+            with connect(db_path) as db:detail=db.execute("SELECT detail FROM official_issue_checks").fetchone()[0]
+            self.assertIn("出版商提交的卷期元数据",detail)
+            self.assertNotIn("已逐篇核验官网",detail)
+            self.assertIn("具体出版日期未确认",detail)
+
+    def test_sciencedirect_volume_only_issues_are_collected(self):
+        from academic_radar.official import _collect_print_metadata_source
+        abstract="Complete publisher-deposited original abstract with traceable evidence. " * 3
+        records=[{"DOI":f"10.1016/j.ijhcs.2026.{volume}","title":[f"Study {volume}"],
+                  "volume":str(volume),"published-print":{"date-parts":[date]},"abstract":abstract}
+                 for volume,date in [(215,[2026,10]),(214,[2026,9]),(216,[2099,1])]]
+        spec={"provider":"Elsevier ScienceDirect","issues_url":"https://www.sciencedirect.com/journal/international-journal-of-human-computer-studies/issues"}
+        with patch("academic_radar.official._fetch_json",return_value={"message":{"items":records}}) as fetch:
+            result=_collect_print_metadata_source({"name":"IJHCS","issn":"1071-5819"},spec,"2026-10-09")
+        self.assertEqual([i["issue_key"] for i in result["issues"]],["volume-215","volume-214"])
+        self.assertTrue(result["issues"][0]["issue_url"].endswith("/vol/215"))
+        self.assertIn("from-print-pub-date%3A2025-01-01",fetch.call_args.args[0])
+        self.assertIn("sort=created",fetch.call_args.args[0])
+        self.assertNotIn("sort=published-print",fetch.call_args.args[0])
+        self.assertEqual(result["issues"][0]["papers"][0]["published_precision"],"month")
+
+    def test_print_metadata_paginates_and_keeps_complete_issue(self):
+        from academic_radar.official import _collect_print_metadata_source
+        abstract="Complete publisher-deposited original abstract with traceable evidence. " * 3
+        def record(number,issue,date):
+            return {"DOI":f"10.1287/mnsc.{number}","title":[f"Study {number}"],"volume":"72","issue":str(issue),
+                    "published-print":{"date-parts":[date]},"abstract":abstract}
+        first=[record(n,10,[2026,10,1]) for n in range(1000)]
+        second=[record(1000,10,[2026,10,1]),record(1001,9,[2026,9,1])]
+        spec={"provider":"INFORMS PubsOnline","issues_url":"https://pubsonline.informs.org/loi/mnsc"}
+        with patch("academic_radar.official._fetch_json",side_effect=[
+            {"message":{"items":first,"next-cursor":"more","total-results":1002}},
+            {"message":{"items":second,"total-results":1002}},
+        ]) as fetch:
+            result=_collect_print_metadata_source({"name":"Management Science","issn":"0025-1909"},spec,"2026-10-09")
+        self.assertEqual(fetch.call_count,2)
+        self.assertIn("cursor=more",fetch.call_args_list[1].args[0])
+        self.assertEqual(len(result["issues"][0]["papers"]),1001)
+
+    def test_missing_abstract_fallback_failure_does_not_erase_print_evidence(self):
+        from academic_radar.official import _collect_print_metadata_source
+        import urllib.error
+        items=[{"DOI":f"10.1287/mnsc.{issue}","title":[f"Study {issue}"],"volume":"72","issue":str(issue),
+                "published-print":{"date-parts":[[2026,issue,1]]}} for issue in [10,9]]
+        spec={"provider":"INFORMS PubsOnline","issues_url":"https://pubsonline.informs.org/loi/mnsc"}
+        def fetch(url):
+            if "api.crossref.org/journals/" in url:return {"message":{"items":items}}
+            raise urllib.error.HTTPError(url,404,"not found",{},None)
+        with patch("academic_radar.official._fetch_json",side_effect=fetch):
+            result=_collect_print_metadata_source({"name":"Management Science","issn":"0025-1909"},spec,"2026-10-09")
+        paper=result["issues"][0]["papers"][0]
+        self.assertTrue(paper["abstract_unavailable_traceable"])
+        self.assertIn("lookup failed",paper["abstract_failure_reason"])
+
     def test_ejor_and_transportation_science_have_verified_official_mappings(self):
         ejor = configure_official_source({"name": "EJOR", "type": "crossref", "issn": "0377-2217"})
         trsc = configure_official_source({"name": "Transportation Science", "type": "crossref", "issn": "0041-1655"})

@@ -8,11 +8,28 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from academic_radar.engagement import seed_active_profile
-from academic_radar.operations import install_web_service, setup_installation, verify_installation, web_service_status, recommendation_freshness
+from academic_radar.operations import install_sync_service, install_web_service, setup_installation, verify_installation, web_service_status, recommendation_freshness
 from academic_radar.storage import connect, upgrade_database
 
 
 class OperationsTests(unittest.TestCase):
+    def test_sync_service_uses_private_config_and_periodic_background_process(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); config = root / "config.toml"
+            config.write_text('state_dir = "."\n[cloud_sync]\nenabled = true\n')
+            completed = __import__("subprocess").CompletedProcess([], 0, stdout="")
+            with patch("academic_radar.operations.Path.home", return_value=root), \
+                 patch("academic_radar.operations.sys.platform", "darwin"), \
+                 patch("academic_radar.operations.subprocess.run", return_value=completed) as run:
+                result = install_sync_service(config, interval=300)
+                with self.assertRaises(ValueError):install_sync_service(config, interval=59)
+            path = Path(result["plist"]); payload = plistlib.loads(path.read_bytes())
+            self.assertEqual(payload["StartInterval"], 300)
+            self.assertTrue(payload["RunAtLoad"])
+            self.assertEqual(payload["ProgramArguments"], [sys.executable, "-m", "academic_radar.cli", "sync", "--config", str(config.resolve())])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(run.call_count, 2)
+
     def test_old_import_is_overdue_even_when_collection_succeeded(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td)/"papers.sqlite3"

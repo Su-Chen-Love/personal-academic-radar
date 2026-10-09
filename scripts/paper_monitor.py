@@ -10,13 +10,20 @@ from typing import Any
 
 PROJECT_SRC=Path(__file__).resolve().parents[1]/"src"
 if PROJECT_SRC.exists() and str(PROJECT_SRC) not in sys.path: sys.path.insert(0,str(PROJECT_SRC))
-from academic_radar.enrichment import enrich_abstracts as run_enrichment
-from academic_radar.governance import publication_decision
-from academic_radar.product import abstract_source_for, classify_low_priority, manual_identity_for_title
+from academic_radar.enrichment import enrich_abstracts as run_enrichment, clean_abstract
+from academic_radar.governance import (
+    publication_decision, should_preserve_publication_metadata, source_kind_from_evidence,
+)
+from academic_radar.product import abstract_source_for, classify_low_priority, manual_identity_for_title, publication_date_label
 from academic_radar.storage import latest_schema_version, upgrade_database
-from academic_radar.recommendations import snapshot_run
+from academic_radar.recommendations import (
+    snapshot_run, SCREENING_SCHEMA_VERSION, SCREENING_RUBRIC_VERSION,
+    SCREENING_DIMENSIONS, REASONING_MIN_LENGTHS,
+    RECOMMENDATION_REASON_MIN_LENGTH, RECOMMENDATION_REASON_MAX_LENGTH,
+    evaluation_policy, unit_number, validate_judgment_evidence, calibrated_score,
+)
 
-VERSION = "0.10.1"
+VERSION = "0.11.0"
 
 try:
     import tomllib
@@ -56,6 +63,16 @@ class Paper:
     abstract_source: str = ""; low_priority: bool = False; low_priority_reason: str = ""
     publication_type_raw: str = ""; publication_type_source: str = ""; source_kind: str = ""
     publication_type: str = ""
+    abstract_source_url: str = ""
+    published_precision: str = "unknown"
+
+
+class CollectionIncomplete(RuntimeError):
+    """Keep collected records while reporting that the bounded scan was incomplete."""
+
+    def __init__(self, provider: str, papers: list[Paper], detail: str) -> None:
+        super().__init__(f"{provider} collection incomplete: {detail}")
+        self.papers = papers
 
 class AutoClosingConnection(sqlite3.Connection):
     """Close runner connections during exception unwinding as a final safeguard."""
@@ -80,14 +97,19 @@ def identity(doi: str, title: str) -> str:
     norm = re.sub(r"[^a-z0-9]+", "", title.lower())
     return "title:" + hashlib.sha256(norm.encode()).hexdigest()
 
-def date_parts(item: dict[str, Any]) -> str:
+def date_parts_with_precision(item: dict[str, Any]) -> tuple[str, str]:
     for key in ("published-online", "published-print", "published", "created"):
         parts = item.get(key, {}).get("date-parts", [[]])[0]
         if parts:
             vals = list(parts) + [1, 1]
-            try: return dt.date(int(vals[0]), int(vals[1]), int(vals[2])).isoformat()
-            except ValueError: pass
-    return ""
+            try:
+                value = dt.date(int(vals[0]), int(vals[1]), int(vals[2])).isoformat()
+                return value, "day" if len(parts) >= 3 else "month" if len(parts) == 2 else "year"
+            except (ValueError, TypeError): pass
+    return "", "unknown"
+
+def date_parts(item: dict[str, Any]) -> str:
+    return date_parts_with_precision(item)[0]
 
 def request_json(url: str, headers: dict[str,str], timeout: int, retries: int, backoff: float,
                  payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -193,8 +215,8 @@ def db_open(path: Path) -> sqlite3.Connection:
     db.commit(); return db
 
 def crossref_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> list[Paper]:
-    c = cfg.get("collection", {}); rows = min(1000,int(c.get("rows_per_page",c.get("rows_per_source",80))))
-    max_pages=max(1,int(c.get("max_pages_per_source",3)))
+    c = cfg.get("collection", {}); rows = max(1,min(1000,int(source.get("rows_per_page",c.get("rows_per_page",c.get("rows_per_source",80))))))
+    max_pages=max(1,int(source.get("max_pages_per_source",c.get("max_pages_per_source",3))))
     base = "https://api.crossref.org"
     params: dict[str, str] = {"rows":str(rows), "select":"DOI,title,abstract,container-title,published-online,published-print,published,created,URL,author,type,ISSN"}
     filters = [f"from-created-date:{since}"]
@@ -204,11 +226,14 @@ def crossref_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> l
         url = f"{base}/works"; filters.extend(["prefix:10.1145", "type:proceedings-article"])
         params["query.container-title"] = source["query_container"]
     params["filter"] = ",".join(filters); params["sort"]="created"; params["order"]="desc"; params["cursor"]="*"
-    result=[]; seen=set()
-    for _ in range(max_pages):
+    result=[]; seen=set(); cursors={"*"}; downloaded=0
+    for page in range(max_pages):
         data = request_json(url+"?"+urllib.parse.urlencode(params), {"User-Agent":cfg.get("user_agent","ResearchPaperMonitor/1.0")},
                             int(c.get("timeout_seconds",30)), int(c.get("max_retries",3)), float(c.get("backoff_seconds",2)))
-        message=data.get("message",{}); items=message.get("items",[])
+        message=data.get("message",{}); items=message.get("items")
+        if not isinstance(items,list):
+            raise CollectionIncomplete("Crossref",result,"response has no valid items array")
+        downloaded += len(items)
         for item in items:
             venue = clean_text(item.get("container-title"))
             if source["type"] == "crossref-query":
@@ -222,16 +247,24 @@ def crossref_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> l
             if ident in seen: continue
             seen.add(ident)
             authors=[clean_text(" ".join(filter(None,(a.get("given"),a.get("family"))))) for a in item.get("author",[])]
-            abstract=clean_text(item.get("abstract"))
+            abstract=clean_abstract(item.get("abstract"))
             raw_type=str(item.get("type") or "")
             decision=publication_decision(title,venue or source["name"],raw_type,"crossref")
             low=decision["eligibility_status"]!="eligible"; low_reason=decision.get("exclusion_reason") or ""
             result.append(Paper(ident,doi,title,abstract,venue or source["name"],
                                 date_parts(item),item.get("URL","") or ("https://doi.org/"+doi if doi else ""),authors,source["name"],
                                 abstract_source_for(abstract,"crossref"),low,low_reason,raw_type,"crossref","",
-                                decision.get("publication_type") or ""))
+                                decision.get("publication_type") or "",
+                                "https://api.crossref.org/works/"+urllib.parse.quote(doi,safe="") if abstract and doi else "",
+                                date_parts_with_precision(item)[1]))
         next_cursor=message.get("next-cursor")
-        if not next_cursor or len(items)<rows: break
+        total=message.get("total-results")
+        if not next_cursor or len(items)<rows or (isinstance(total,int) and downloaded>=total): break
+        if next_cursor in cursors:
+            raise CollectionIncomplete("Crossref",result,"pagination cursor did not advance")
+        if page+1==max_pages:
+            raise CollectionIncomplete("Crossref",result,f"page limit {max_pages} reached after {downloaded} records; more results remain")
+        cursors.add(next_cursor)
         params["cursor"]=next_cursor
     return result
 
@@ -242,31 +275,35 @@ def openalex_abstract(doi: str, cfg: dict[str,Any]) -> str:
     if mail: url += "?mailto=" + urllib.parse.quote(mail.group(1))
     try: data=request_json(url,{"User-Agent":cfg.get("user_agent","")},int(c.get("timeout_seconds",30)),1,1)
     except Exception: return ""
+    if normalize_doi(str(data.get("doi") or ""))!=normalize_doi(doi): return ""
     inv=data.get("abstract_inverted_index") or {}; words=[]
     for word, positions in inv.items():
         for pos in positions: words.append((pos,word))
-    return " ".join(word for _,word in sorted(words))
+    return clean_abstract(" ".join(word for _,word in sorted(words)))
 
 def inverted_abstract(data: dict[str,Any]) -> str:
     words=[]
     for word,positions in (data.get("abstract_inverted_index") or {}).items():
         words.extend((pos,word) for pos in positions)
-    return " ".join(word for _,word in sorted(words))
+    return clean_abstract(" ".join(word for _,word in sorted(words)))
 
 def openalex_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> list[Paper]:
     source_id=source.get("openalex_id")
-    if not source_id or not cfg.get("collection",{}).get("openalex_fallback",True): return []
-    c=cfg.get("collection",{}); rows=min(100,int(c.get("rows_per_page",c.get("rows_per_source",80))))
-    max_pages=max(1,int(c.get("max_pages_per_source",3)))
+    if not source_id or (source.get("type")!="openalex" and not cfg.get("collection",{}).get("openalex_fallback",True)): return []
+    c=cfg.get("collection",{}); rows=max(1,min(100,int(source.get("rows_per_page",c.get("rows_per_page",c.get("rows_per_source",80))))))
+    max_pages=max(1,int(source.get("max_pages_per_source",c.get("max_pages_per_source",3))))
     params={"filter":f"primary_location.source.id:{source_id},from_publication_date:{since}",
             "sort":"publication_date:desc","per-page":str(rows),"cursor":"*"}
     mail=re.search(r"mailto:([^\s;)]+)",cfg.get("user_agent",""))
     if mail: params["mailto"]=mail.group(1)
-    result=[]; seen=set()
-    for _ in range(max_pages):
+    result=[]; seen=set(); cursors={"*"}; downloaded=0
+    for page in range(max_pages):
         data=request_json("https://api.openalex.org/works?"+urllib.parse.urlencode(params),
           {"User-Agent":cfg.get("user_agent","")},int(c.get("timeout_seconds",30)),int(c.get("max_retries",3)),float(c.get("backoff_seconds",2)))
-        items=data.get("results",[])
+        items=data.get("results")
+        if not isinstance(items,list):
+            raise CollectionIncomplete("OpenAlex",result,"response has no valid results array")
+        downloaded += len(items)
         for item in items:
             title=clean_text(item.get("title")); doi=normalize_doi(item.get("doi",""))
             if not title: continue
@@ -284,9 +321,17 @@ def openalex_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> l
             result.append(Paper(ident,doi,title,abstract,venue,
               item.get("publication_date","") or "",loc.get("landing_page_url","") or ("https://doi.org/"+doi if doi else ""),authors,source["name"]+" / OpenAlex",
               abstract_source_for(abstract,"openalex"),low,low_reason,raw_type,"openalex",source_kind,
-              decision.get("publication_type") or ""))
+              decision.get("publication_type") or "",
+              "https://api.openalex.org/works/"+str(item.get("id") or "").rsplit("/",1)[-1] if abstract and item.get("id") else "",
+              "day" if item.get("publication_date") else "unknown"))
         next_cursor=(data.get("meta") or {}).get("next_cursor")
-        if not next_cursor or len(items)<rows: break
+        total=(data.get("meta") or {}).get("count")
+        if not next_cursor or len(items)<rows or (isinstance(total,int) and downloaded>=total): break
+        if next_cursor in cursors:
+            raise CollectionIncomplete("OpenAlex",result,"pagination cursor did not advance")
+        if page+1==max_pages:
+            raise CollectionIncomplete("OpenAlex",result,f"page limit {max_pages} reached after {downloaded} records; more results remain")
+        cursors.add(next_cursor)
         params["cursor"]=next_cursor
     return result
 
@@ -299,25 +344,6 @@ def extract_json(text: str) -> dict[str,Any]:
     value["relevant"]=bool(value["relevant"]); value["reasons"]=clean_text(value["reasons"])
     value["matched_themes"]=[clean_text(x) for x in value["matched_themes"]][:8]
     return value
-
-
-SCREENING_SCHEMA_VERSION = 4
-SCREENING_RUBRIC_VERSION = "evidence-v2"
-SCREENING_DIMENSIONS = {
-    "core_relevance": 0.40,
-    "mechanism_alignment": 0.25,
-    "method_transfer": 0.20,
-    "evidence_quality": 0.15,
-}
-
-REASONING_MIN_LENGTHS = {
-    "evidence_summary": 24,
-    "profile_connection": 18,
-    "transfer_value": 18,
-    "limitations": 18,
-}
-RECOMMENDATION_REASON_MIN_LENGTH = 48
-RECOMMENDATION_REASON_MAX_LENGTH = 360
 
 
 def legacy_reason_text(reasoning: dict[str,str]) -> str:
@@ -378,7 +404,8 @@ def structured_judgment(item: dict[str,Any], paper: sqlite3.Row, threshold: floa
     if not required_dimensions.issubset(dimensions):
         raise ValueError("score_dimensions missing fields")
     clean_dimensions = {
-        key: max(0.0, min(1.0, float(dimensions[key]))) for key in required_dimensions
+        key: unit_number(dimensions[key],key) if schema_version>=5
+        else max(0.0,min(1.0,float(dimensions[key]))) for key in required_dimensions
     }
     score = sum(clean_dimensions[key] * weight for key,weight in SCREENING_DIMENSIONS.items())
     score -= 0.35 * clean_dimensions["boundary_penalty"]
@@ -394,10 +421,14 @@ def structured_judgment(item: dict[str,Any], paper: sqlite3.Row, threshold: floa
     themes = item.get("matched_themes")
     if not isinstance(themes, list):
         raise ValueError("matched_themes must be a list")
-    confidence = max(0.0, min(1.0, float(item.get("confidence", 0))))
+    confidence = unit_number(item.get("confidence",0),"confidence") if schema_version>=5 else max(0.0,min(1.0,float(item.get("confidence",0))))
     if abstract_missing:
         confidence = min(confidence, 0.5)
     reasons = recommendation_reason(item, clean_reasoning, required=schema_version >= 4)
+    if schema_version>=5:
+        quality=validate_judgment_evidence(item,paper)
+        score=calibrated_score(clean_dimensions,quality["recommendation_type"],abstract_missing)
+        clean_reasoning.update(quality)
     return {
         "relevant": score >= threshold,
         "score": score,
@@ -406,7 +437,7 @@ def structured_judgment(item: dict[str,Any], paper: sqlite3.Row, threshold: floa
         "confidence": confidence,
         "reasoning": clean_reasoning,
         "score_dimensions": clean_dimensions,
-        "rubric_version": SCREENING_RUBRIC_VERSION,
+        "rubric_version": SCREENING_RUBRIC_VERSION if schema_version>=5 else ("evidence-v2" if schema_version>=4 else "evidence-v1"),
     }
 
 def upsert(db: sqlite3.Connection, p: Paper, now: str) -> bool:
@@ -422,48 +453,71 @@ def upsert(db: sqlite3.Connection, p: Paper, now: str) -> bool:
         p.low_priority,p.low_priority_reason=classify_low_priority(p.title,p.venue)
     p.abstract_source=abstract_source_for(p.abstract,p.abstract_source)
     decision=publication_decision(p.title,p.venue,p.publication_type_raw,p.publication_type_source,p.source_kind)
+    incoming_publication_raw=p.publication_type_raw
+    incoming_publication_source=p.publication_type_source
+    incoming_publication_status=decision['eligibility_status']
     prior=db.execute("SELECT * FROM papers WHERE identity=?", (p.identity,)).fetchone()
-    if prior and (
-        (prior['publication_type_source']=='publisher-official' and p.publication_type_source!='publisher-official')
-        or (prior['eligibility_status']!='quarantine' and decision['eligibility_status']=='quarantine')
-        or (prior['eligibility_status']=='excluded' and p.publication_type_raw.lower() in {'article','journal-article','review'})
+    if prior and should_preserve_publication_metadata(
+        prior['publication_type_source'], prior['eligibility_status'],
+        p.publication_type_source, decision['eligibility_status'],
     ):
-        decision={
-            'publication_type':prior['publication_type'],
-            'eligibility_status':prior['eligibility_status'],
-            'exclusion_reason':prior['exclusion_reason'],
-            'evidence':json.loads(prior['publication_type_evidence_json'] or '[]'),
-        }
+        decision=publication_decision(
+            p.title,p.venue,prior['publication_type_raw'] or '',prior['publication_type_source'] or '',
+            source_kind_from_evidence(prior['publication_type_evidence_json']),
+        )
         p.publication_type_raw=prior['publication_type_raw'] or ''
         p.publication_type_source=prior['publication_type_source'] or ''
-        p.low_priority=bool(prior['low_priority'])
-        p.low_priority_reason=prior['low_priority_reason'] or ''
+    if prior:
+        prior_evidence=json.loads(prior['publication_type_evidence_json'] or '[]')
+        if isinstance(prior_evidence,list):
+            decision['evidence'].extend(item for item in prior_evidence if isinstance(item,dict)
+              and item.get('kind') in {'metadata_conflict','verified_record'} and item not in decision['evidence'])
+        if (prior['publication_type_raw'],prior['publication_type_source']) != (p.publication_type_raw,p.publication_type_source):
+            decision['evidence'].append({'kind':'metadata_conflict','source':prior['publication_type_source'] or 'metadata',
+              'value':prior['publication_type_raw'] or '', 'prior_status':prior['eligibility_status']})
+        elif should_preserve_publication_metadata(
+            prior['publication_type_source'],prior['eligibility_status'],
+            incoming_publication_source, incoming_publication_status,
+        ):
+            conflict={'kind':'metadata_conflict','source':incoming_publication_source or 'metadata',
+              'value':incoming_publication_raw, 'prior_status':incoming_publication_status}
+            if conflict not in decision['evidence']:decision['evidence'].append(conflict)
     db.execute("""INSERT INTO papers(
       identity,doi,title,abstract,venue,published,url,authors_json,first_seen,updated_at,
       abstract_source,low_priority,low_priority_reason,publication_type,publication_type_raw,
-      publication_type_source,publication_type_evidence_json,eligibility_status,exclusion_reason,needs_rescreen
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET
+      publication_type_source,publication_type_evidence_json,eligibility_status,exclusion_reason,needs_rescreen,
+      abstract_source_url,abstract_retrieved_at,published_precision
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET
       doi=CASE WHEN excluded.doi<>'' THEN excluded.doi ELSE papers.doi END,
       title=excluded.title, abstract=CASE WHEN length(excluded.abstract)>length(papers.abstract) THEN excluded.abstract ELSE papers.abstract END,
       abstract_source=CASE WHEN length(excluded.abstract)>length(papers.abstract) THEN excluded.abstract_source ELSE papers.abstract_source END,
-      venue=excluded.venue, published=excluded.published, url=excluded.url, authors_json=excluded.authors_json,
+      abstract_source_url=CASE WHEN length(excluded.abstract)>length(papers.abstract) THEN excluded.abstract_source_url ELSE papers.abstract_source_url END,
+      abstract_retrieved_at=CASE WHEN length(excluded.abstract)>length(papers.abstract) THEN excluded.abstract_retrieved_at ELSE papers.abstract_retrieved_at END,
+      venue=excluded.venue, published=CASE WHEN excluded.published<>'' THEN excluded.published ELSE papers.published END,
+      published_precision=CASE WHEN excluded.published='' THEN papers.published_precision
+        WHEN excluded.published_precision<>'unknown' THEN excluded.published_precision
+        WHEN excluded.published=papers.published THEN papers.published_precision ELSE 'unknown' END,
+      url=excluded.url, authors_json=excluded.authors_json,
       low_priority=excluded.low_priority, low_priority_reason=excluded.low_priority_reason,
       publication_type=excluded.publication_type,publication_type_raw=excluded.publication_type_raw,
       publication_type_source=excluded.publication_type_source,
       publication_type_evidence_json=excluded.publication_type_evidence_json,
       eligibility_status=excluded.eligibility_status,exclusion_reason=excluded.exclusion_reason,
-      needs_rescreen=CASE WHEN length(excluded.abstract)>length(papers.abstract) THEN 1 ELSE papers.needs_rescreen END,
+      needs_rescreen=CASE WHEN length(excluded.abstract)>length(papers.abstract)
+        OR excluded.eligibility_status<>papers.eligibility_status OR excluded.publication_type<>papers.publication_type
+        THEN 1 ELSE papers.needs_rescreen END,
       updated_at=excluded.updated_at""",
       (p.identity,p.doi,p.title,p.abstract,p.venue,p.published,p.url,json.dumps(p.authors,ensure_ascii=False),now,now,
        p.abstract_source,int(p.low_priority),p.low_priority_reason or None,decision["publication_type"],
        p.publication_type_raw or None,p.publication_type_source or None,json.dumps(decision["evidence"],ensure_ascii=False),
-       decision["eligibility_status"],decision.get("exclusion_reason"),0))
+       decision["eligibility_status"],decision.get("exclusion_reason"),0,
+       p.abstract_source_url or None,now if p.abstract else None,p.published_precision))
     db.execute("INSERT OR IGNORE INTO observations VALUES(?,?,?)",(p.identity,p.source,now)); return not exists
 
 def render_digest(papers: list[tuple[Paper,dict[str,Any]]], failures: list[dict[str,str]], run_id: str) -> tuple[str,str]:
     md=[f"# Research paper digest — {run_id[:10]}","",f"Relevant new papers: **{len(papers)}**",""]
     for p,s in papers:
-        md += [f"## [{p.title}]({p.url})",f"- Venue: {p.venue}",f"- Published: {p.published or 'unknown'}",
+        md += [f"## [{p.title}]({p.url})",f"- Venue: {p.venue}",f"- Published: {publication_date_label(p.published,p.published_precision)}",
                f"- Relevance: {s['score']:.2f} ({s['reasons']})","",p.abstract or "*Abstract unavailable.*",""]
     if not papers: md += ["No new papers met the relevance threshold.",""]
     if failures:
@@ -472,7 +526,7 @@ def render_digest(papers: list[tuple[Paper,dict[str,Any]]], failures: list[dict[
     body=[f"<h1>Research paper digest — {html.escape(run_id[:10])}</h1><p>Relevant new papers: <b>{len(papers)}</b></p>"]
     for p,s in papers:
         body += [f'<h2><a href="{html.escape(p.url)}">{html.escape(p.title)}</a></h2>',
-                 f"<p><b>Venue:</b> {html.escape(p.venue)}<br><b>Published:</b> {html.escape(p.published or 'unknown')}<br><b>Relevance:</b> {s['score']:.2f} — {html.escape(s['reasons'])}</p>",
+                 f"<p><b>Venue:</b> {html.escape(p.venue)}<br><b>Published:</b> {html.escape(publication_date_label(p.published,p.published_precision))}<br><b>Relevance:</b> {s['score']:.2f} — {html.escape(s['reasons'])}</p>",
                  f"<p>{html.escape(p.abstract or 'Abstract unavailable.')}</p>"]
     if not papers: body.append("<p>No new papers met the relevance threshold.</p>")
     if failures: body.append("<h2>Source warnings</h2><ul>"+"".join(f"<li>{html.escape(x['source'])}: {html.escape(x['error'])}</li>" for x in failures)+"</ul>")
@@ -508,7 +562,9 @@ def row_to_paper(row: sqlite3.Row) -> Paper:
       row["publication_type_raw"] if "publication_type_raw" in row.keys() else "",
       row["publication_type_source"] if "publication_type_source" in row.keys() else "",
       "",
-      row["publication_type"] if "publication_type" in row.keys() else "")
+      row["publication_type"] if "publication_type" in row.keys() else "",
+      row["abstract_source_url"] if "abstract_source_url" in row.keys() else "",
+      row["published_precision"] if "published_precision" in row.keys() else "unknown")
 
 def confirmed_profile(db: sqlite3.Connection, profile_path: Path) -> sqlite3.Row:
     # Hash the exact bytes written at profile confirmation. ``read_text``
@@ -541,7 +597,9 @@ def update_source_health(db: sqlite3.Connection, source: str, status: str, now: 
     prior=db.execute("SELECT * FROM source_health WHERE source=?",(source,)).fetchone()
     failures=(int(prior["consecutive_failures"]) if prior else 0) + (1 if status=="failed" else 0)
     if status!="failed": failures=0
-    last_success=now if status in ("healthy","degraded") else (prior["last_success_at"] if prior else None)
+    # A fallback success does not prove that the other provider's window was
+    # covered. Keep the previous complete checkpoint for recovery next time.
+    last_success=now if status=="healthy" else (prior["last_success_at"] if prior else None)
     last_failure=now if status in ("degraded","failed") else (prior["last_failure_at"] if prior else None)
     db.execute("""INSERT INTO source_health VALUES(?,?,?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET
       status=excluded.status, consecutive_failures=excluded.consecutive_failures,
@@ -551,22 +609,29 @@ def update_source_health(db: sqlite3.Connection, source: str, status: str, now: 
 
 def enrich_missing_abstracts(papers: list[Paper], cfg: dict[str,Any], db: sqlite3.Connection | None=None) -> None:
     grouped: dict[str,list[Paper]]={}
-    for paper in papers: grouped.setdefault(paper.identity,[]).append(paper)
+    for paper in papers:
+        paper.abstract=clean_abstract(paper.abstract)
+        grouped.setdefault(paper.identity,[]).append(paper)
     for group in grouped.values():
-        abstract=max((paper.abstract for paper in group),key=len,default="")
-        source=""
+        origin=max(group,key=lambda paper:len(paper.abstract))
+        abstract=origin.abstract
+        source=origin.abstract_source
+        source_url=origin.abstract_source_url
         if not abstract and db is not None:
-            prior=db.execute("SELECT abstract FROM papers WHERE identity=?",(group[0].identity,)).fetchone()
-            abstract=(prior[0] or "") if prior else ""
-            source="existing" if abstract else ""
+            prior=db.execute("SELECT abstract,abstract_source,abstract_source_url FROM papers WHERE identity=?",(group[0].identity,)).fetchone()
+            abstract=clean_abstract(prior[0]) if prior else ""
+            source=(prior[1] or "existing") if abstract else ""
+            source_url=(prior[2] or "") if abstract else ""
         if not abstract:
             abstract=openalex_abstract(group[0].doi,cfg)
             source="openalex-doi" if abstract else ""
+            source_url="https://api.openalex.org/works/https://doi.org/"+urllib.parse.quote(group[0].doi,safe="") if abstract else ""
         if abstract:
             for paper in group:
                 if not paper.abstract:
                     paper.abstract=abstract
                     paper.abstract_source=source
+                    paper.abstract_source_url=source_url
         for paper in group:
             if not paper.low_priority:
                 paper.low_priority,paper.low_priority_reason=classify_low_priority(paper.title,paper.venue)
@@ -588,14 +653,20 @@ def collect_into_db(cfg: dict[str,Any], db: sqlite3.Connection, now: str, run_id
         if source.get("type") in ("crossref","crossref-query"):
             attempted += 1
             try: papers.extend(crossref_collect(source,cfg,since)); succeeded += 1
-            except Exception as e: errors.append("Crossref: "+f"{type(e).__name__}: {str(e)[:200]}")
-        if source.get("openalex_id") and cfg.get("collection",{}).get("openalex_fallback",True):
+            except Exception as e:
+                if isinstance(e,CollectionIncomplete): papers.extend(e.papers)
+                errors.append("Crossref: "+f"{type(e).__name__}: {str(e)[:200]}")
+        if source.get("openalex_id") and (source.get("type")=="openalex" or cfg.get("collection",{}).get("openalex_fallback",True)):
             attempted += 1
             try: papers.extend(openalex_collect(source,cfg,since)); succeeded += 1
-            except Exception as e: errors.append("OpenAlex: "+f"{type(e).__name__}: {str(e)[:200]}")
+            except Exception as e:
+                if isinstance(e,CollectionIncomplete): papers.extend(e.papers)
+                errors.append("OpenAlex: "+f"{type(e).__name__}: {str(e)[:200]}")
+        if not attempted:
+            errors.append("No usable collection adapter is enabled for this source")
         if papers: enrich_missing_abstracts(papers,cfg,db)
         collected.extend(papers)
-        status="healthy" if succeeded==attempted else ("degraded" if succeeded else "failed")
+        status="healthy" if attempted and succeeded==attempted else ("degraded" if succeeded or papers else "failed")
         err="; ".join(errors)
         unique_count=len({paper.identity for paper in papers})
         db.execute("""INSERT OR REPLACE INTO source_runs(run_id,source,status,count,error,finished_at,since)
@@ -648,7 +719,7 @@ def collect_only(config_path: Path) -> int:
 
 
 def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False,
-                 batch_run: str | None=None) -> int:
+                 batch_run: str | None=None, limit: int | None=None) -> int:
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
     profile_path=state/cfg["profile_file"]
     now=dt.datetime.now(dt.timezone.utc).isoformat(); run_id=now.replace(":","-"); db=db_open(state/"papers.sqlite3")
@@ -694,8 +765,16 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
     else:
         rows=db.execute("""SELECT p.* FROM papers p WHERE (
           p.needs_rescreen=1 OR NOT EXISTS(
-          SELECT 1 FROM screenings s WHERE s.identity=p.identity AND s.profile_hash=? AND s.provider='codex-agent')
-          ) AND p.eligibility_status='eligible' ORDER BY p.first_seen""",(phash,)).fetchall()
+          SELECT 1 FROM screenings s WHERE s.identity=p.identity AND s.profile_hash=? AND s.provider='codex-agent'
+          AND s.rubric_version=?)
+          ) AND p.eligibility_status='eligible' ORDER BY
+          CASE WHEN EXISTS(SELECT 1 FROM screenings visible WHERE visible.identity=p.identity
+            AND visible.profile_hash=? AND visible.provider='codex-agent' AND visible.score>=?) THEN 0
+            WHEN p.needs_rescreen=1 THEN 1 ELSE 2 END,p.first_seen DESC,p.identity""",
+          (phash,SCREENING_RUBRIC_VERSION,phash,float(cfg.get("relevance_threshold",0.70)))).fetchall()
+    total_candidates=len(rows)
+    batch_limit=max(1,int(limit if limit is not None else cfg.get("max_candidates",120)))
+    rows=rows[:batch_limit]
     papers=[asdict(row_to_paper(row)) for row in rows]
     queue_dir=state/"agent_queue"; queue_dir.mkdir(exist_ok=True)
     queue_path=queue_dir/f"{run_id.replace('+','_')}.json"
@@ -704,30 +783,13 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
              "profile_confirmed_at":active["confirmed_at"],"profile_path":str(profile_path),
              "feedback_examples":examples,"threshold":float(cfg.get("relevance_threshold",0.70)),
              "papers":papers,"source_failures":failures,"collection_run_id":batch_run,
-             "evaluation_policy":{
-               "rubric_version":SCREENING_RUBRIC_VERSION,
-               "result_fields":["identity","reasoning","score_dimensions","matched_themes","confidence","recommendation_reason"],
-               "reasoning_fields":["evidence_summary","profile_connection","transfer_value","limitations"],
-               "minimum_reasoning_characters":REASONING_MIN_LENGTHS,
-               "recommendation_reason_contract":{
-                 "minimum_characters":RECOMMENDATION_REASON_MIN_LENGTH,
-                 "maximum_characters":RECOMMENDATION_REASON_MAX_LENGTH,
-                 "purpose":"Natural reader-facing Chinese synthesis; separate from the four audit fields.",
-               },
-               "score_dimensions":SCREENING_DIMENSIONS | {"boundary_penalty":-0.35},
-               "requirements":[
-                 "Base evidence_summary on the abstract's actual question, method, mechanism, and finding; do not copy or truncate the abstract.",
-                 "Name the precise profile mechanism and a concrete transferable design, measure, hypothesis, or method; venue or keyword overlap is insufficient.",
-                 "State the main evidence boundary and why it limits transfer, rather than naming only the application domain.",
-                 "Write recommendation_reason as natural Chinese analytical prose: lead with the paper's distinctive mechanism or finding, explain why it matters to the active research, name the most concrete transfer, and close with the decisive caveat.",
-                 "Do not concatenate audit labels, merely restate the title, praise the venue, list keywords, or use generic claims such as 有参考价值 without saying what transfers and why.",
-                 "For a missing abstract, evidence_summary must explicitly say 摘要缺失 or 摘要不可得; score cannot reach 0.70 and confidence cannot exceed 0.50.",
-               ],
-             }}
+             "total_candidates":total_candidates,"deferred_candidates":total_candidates-len(papers),
+             "evaluation_policy":evaluation_policy()}
     queue_path.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
     summary={"run_id":run_id,"collected":len(collected),"new":len(new),"candidates":len(papers),
              "queue_path":str(queue_path),"profile_path":str(profile_path),"source_failures":failures,
-             "collection_run_id":batch_run}
+             "collection_run_id":batch_run,"total_candidates":total_candidates,
+             "deferred_candidates":total_candidates-len(papers),"batch_limit":batch_limit}
     if enrichment is not None: summary["enrichment"]=enrichment
     run_status="running"  # An exported queue is not a completed recommendation update.
     profile_row=db.execute("SELECT id FROM profile_versions WHERE profile_hash=? AND status='active'",(phash,)).fetchone()
@@ -845,8 +907,19 @@ def agent_import(config_path: Path, results_path: Path) -> int:
         if digest_replaced and digest_path.exists(): digest_path.unlink()
         raise
     db.close()
-    print(json.dumps({"run_id":run_id,"imported":imported,"relevant":len(selected),"digest_path":str(digest_path)},ensure_ascii=False,indent=2))
-    return 0
+    summary={"run_id":run_id,"imported":imported,"relevant":len(selected),"digest_path":str(digest_path)}
+    try:
+        from academic_radar.cloud_sync import sync_configured
+        summary["cloud_sync"]=sync_configured(config_path)
+    except ImportError:
+        if cfg.get("cloud_sync",{}).get("enabled"):
+            summary["cloud_sync"]={"status":"failed","error":"Cloud synchronization module is unavailable; local judgment import remains committed"}
+        else:
+            summary["cloud_sync"]={"status":"skipped","reason":"Cloud synchronization is not configured"}
+    except Exception as exc:
+        summary["cloud_sync"]={"status":"failed","error":f"{type(exc).__name__}: {str(exc)[:300]}","local_import_committed":True}
+    print(json.dumps(summary,ensure_ascii=False,indent=2))
+    return 1 if summary["cloud_sync"].get("status")=="failed" else 0
 
 def backfill_history(config_path: Path) -> int:
     """Recover overwritten judgments only from their matching frozen import artifacts."""
@@ -936,6 +1009,7 @@ def main() -> int:
             p.add_argument("--rescreen",action="store_true",help="export all stored papers, including previously judged papers")
             p.add_argument("--no-collect",action="store_true",help="export from the database without network collection")
             p.add_argument("--batch-run",help="collection run to carry into this frozen queue")
+            p.add_argument("--limit",type=int,help="maximum candidates in one complete frozen queue (config max_candidates, default 120)")
         elif name=="agent-import":
             p.add_argument("--results",required=True,type=Path)
         elif name=="enrich-abstracts":
@@ -944,7 +1018,7 @@ def main() -> int:
     try:
         if a.command=="doctor": return doctor(a.config)
         if a.command=="collect-only": return collect_only(a.config)
-        if a.command=="agent-export": return agent_export(a.config,a.rescreen,a.no_collect,a.batch_run)
+        if a.command=="agent-export": return agent_export(a.config,a.rescreen,a.no_collect,a.batch_run,a.limit)
         if a.command=="agent-import": return agent_import(a.config,a.results)
         if a.command=="enrich-abstracts": return enrich_abstracts(a.config,a.limit)
         if a.command=="backfill-history": return backfill_history(a.config)

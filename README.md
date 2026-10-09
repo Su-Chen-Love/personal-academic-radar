@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/Su-Chen-Love/personal-academic-radar/actions/workflows/test.yml/badge.svg)](https://github.com/Su-Chen-Love/personal-academic-radar/actions/workflows/test.yml)
 
-Personal Academic Assistant 是面向单个研究者的本地优先文献助手。代码可以公开；配置、研究兴趣、SQLite、反馈、队列、摘要结果、日志和 PDF 始终保存在私有状态目录，默认是 `~/.local/share/personal-academic-radar`。
+Personal Academic Assistant 是面向单个研究者的本地优先文献助手。代码可以公开；配置、SQLite、队列、摘要结果、日志和 PDF 保存在私有状态目录，默认是 `~/.local/share/personal-academic-radar`。
 
 语义判断只使用 Codex 宿主的“导出队列 → 结构化证据判断 → 原子导入”流程，不需要也不支持独立模型 API。推荐理由必须分别说明论文证据、研究画像连接、可迁移价值与局限，并由分维度评分计算最终匹配度。摘要只从可追溯元数据或官方论文页获取，绝不生成或改写后冒充原始摘要。
 
@@ -36,7 +36,7 @@ Linux 和 Windows 会完成初始化与验证，但不会自动安装后台服�
 
 ## 每日 Codex 流程
 
-本地定时任务需要电脑开机且 Codex 应用保持运行。网页后台服务负责浏览，不会自行完成语义评分。首页按北京时间区分今日和历史推荐；超过 36 小时没有完成评分导入，或已有新采集尚未导入时，`verify` 会提示。漏跑后 API 采集会按各来源最近成功日期扩展默认 14 天窗口。
+本地定时任务需要电脑开机且 Codex 应用保持运行。网页后台服务负责浏览，不会自行完成语义评分。可选 Sites 数据同步见 [云端部署与同步](docs/cloud-sync.md)。首页按北京时间区分今日和历史推荐；超过 36 小时没有完成评分导入，或已有新采集尚未导入时，`verify` 会提示。漏跑后 API 采集会按各来源最近成功日期扩展默认 14 天窗口。
 
 摘要补全默认使用 180 秒预算，优先检查尚未尝试或较久未检查的记录；预算耗尽会保存进度并返回 `partial` 与 `deferred`，应继续评分导入。可通过配置的 `[enrichment] time_budget_seconds` 调整预算。官网临时网络错误会有限重试；无法核验的来源必须保留失败记录，不能将其报告为完整覆盖。
 
@@ -111,7 +111,7 @@ academic-radar service logs --config ~/.local/share/personal-academic-radar/conf
 
 - GitHub 只保存代码、测试、迁移和通用示例。
 - 不提交 `state/`、配置、SQLite/WAL、备份、队列、结果、PDF、日志、`.env` 或任何密钥。
-- 网页默认只绑定 `127.0.0.1`；本版本不提供公共网站、云同步、共享数据库或多用户部署。
+- 本地网页默认只绑定 `127.0.0.1`。可按用户授权部署 Sites 版并同步应用记录到 D1；公开浏览与本人修改权限分开。参见 [云端部署与同步](docs/cloud-sync.md)。
 - 来源配置以原子方式写入并先备份；SQLite 恢复要求显式 `--replace`，且会先保存当前库。
 - PDF 保存在私有目录，校验类型和大小，并用 SHA-256 去重。
 
@@ -136,3 +136,7 @@ python scripts/paper_monitor.py backfill-history --config ~/.local/share/persona
 ```
 
 恢复操作可重复执行，只补充缺失快照，不重新评分。缺少可核验原始文件时保留入选记录，并明确显示原始评分不可恢复。没有更新的日期不会标成“没有入选论文”。
+
+### 最新推荐标准
+
+新队列使用 evidence-v3/schema 5，逐篇保存可核验的原摘要引用，区分核心相关、具体方法借鉴、邻近背景和范围外。高分必须说明精确机制，方法借鉴封顶 0.84，邻近背景低于推荐阈值。旧判断按可恢复的完整批次重评，默认每批 120；历史推荐快照保持原貌。`agent-export --limit` 可调整批量，`verify` 明确报告旧标准剩余量。

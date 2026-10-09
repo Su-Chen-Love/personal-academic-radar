@@ -11,6 +11,7 @@ from academic_radar.product import (
     classify_low_priority,
     import_fulltext,
     initialize_installation,
+    publication_date_label,
     migrate_legacy_model_config,
     source_candidates,
     source_coverage,
@@ -19,6 +20,15 @@ from academic_radar.storage import connect, upgrade_database
 
 
 class ProductTests(unittest.TestCase):
+    def test_publication_date_label_does_not_invent_a_day(self):
+        self.assertEqual(publication_date_label("2026-10-01", "month"), "2026-10")
+        self.assertEqual(publication_date_label("2026-01-01", "year"), "2026")
+        self.assertEqual(publication_date_label("2026-10-09", "day"), "2026-10-09")
+        self.assertEqual(publication_date_label(None), "日期未知")
+
+    def test_user_correction_research_is_not_publication_erratum(self):
+        self.assertFalse(classify_low_priority("Understanding User Correction of AI Errors: Effects on Trust")[0])
+        self.assertTrue(classify_low_priority("Correction: Understanding AI Errors")[0])
     def test_packaged_installation_assets_match_repository_examples(self):
         root = Path(__file__).resolve().parents[1]
         for name in ("config.example.toml", "research-profile.example.md"):
@@ -115,6 +125,15 @@ class ProductTests(unittest.TestCase):
         low, reason = classify_low_priority("Editorial Board", "Journal")
         self.assertTrue(low)
         self.assertIn("editorial", reason)
+
+    def test_correction_prefix_covers_actual_errata_without_excluding_research(self):
+        for title in ("Correction", "Author Correction: Original Study", "Publisher Correction: Original Study",
+                      "Corrigendum to ‘Original Study’", "Correction to Original Study", "Erratum: Original Study"):
+            with self.subTest(title=title):
+                self.assertTrue(classify_low_priority(title, "A Journal")[0])
+        for title in ("Correction of AI errors through feedback", "Understanding User Correction of AI Errors"):
+            with self.subTest(title=title):
+                self.assertFalse(classify_low_priority(title, "A Journal")[0])
 
     def test_import_fulltext_deduplicates_pdf(self):
         with tempfile.TemporaryDirectory() as td:

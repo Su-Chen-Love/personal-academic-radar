@@ -28,6 +28,41 @@ from .storage import connect, database_status, latest_schema_version, migrate_st
 
 
 WEB_SERVICE_LABEL = "com.personal-academic-radar.web"
+SYNC_SERVICE_LABEL = "com.personal-academic-radar.sync"
+
+
+def install_sync_service(config_path: Path, interval: int = 300) -> dict[str, Any]:
+    """Run the deterministic synchronizer without creating a second AI task."""
+    if sys.platform != "darwin":
+        raise ValueError("Automatic cloud sync service installation currently supports macOS")
+    config_path = config_path.expanduser().resolve()
+    config = _load_config(config_path)
+    if not config.get("cloud_sync", {}).get("enabled"):
+        raise ValueError("Configure and verify cloud_sync before installing its service")
+    if interval < 60:
+        raise ValueError("Synchronization interval must be at least 60 seconds")
+    state = _state_for_config(config_path)
+    payload = {
+        "Label": SYNC_SERVICE_LABEL,
+        "ProgramArguments": [sys.executable, "-m", "academic_radar.cli", "sync", "--config", str(config_path)],
+        "RunAtLoad": True, "StartInterval": interval,
+        "ProcessType": "Background",
+        "StandardOutPath": str(state / "sync.stdout.log"),
+        "StandardErrorPath": str(state / "sync.stderr.log"),
+    }
+    path = Path.home() / "Library/LaunchAgents" / f"{SYNC_SERVICE_LABEL}.plist"
+    import plistlib
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_bytes(plistlib.dumps(payload))
+    os.chmod(temp, 0o600)
+    os.replace(temp, path)
+    target = f"gui/{os.getuid()}/{SYNC_SERVICE_LABEL}"
+    subprocess.run(["launchctl", "bootout", target], capture_output=True)
+    result = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(path)], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError("Cloud synchronization service could not be loaded")
+    return {"installed": True, "label": SYNC_SERVICE_LABEL, "interval_seconds": interval, "plist": str(path)}
 
 
 def recommendation_freshness(database: Any, timezone: str = "Asia/Shanghai") -> dict[str, Any]:
@@ -185,6 +220,7 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
         source_rows = database.execute(
             "SELECT source,status,last_success_at,last_error FROM source_health"
         ).fetchall()
+        source_rows = [item for item in source_rows if item["source"] in configured]
         observed = {item["source"] for item in source_rows}
         missing_sources = sorted(configured - observed)
         check(
@@ -219,7 +255,7 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
             row["source_name"]: int(row["count"])
             for row in database.execute(
                 """SELECT source_name,COUNT(*) count FROM official_issue_checks
-                WHERE status='succeeded' GROUP BY source_name"""
+                WHERE status='succeeded' AND issue_key NOT LIKE 'metadata-latest-two-as-of-%' GROUP BY source_name"""
             )
         }
         incomplete_official = [
@@ -229,7 +265,7 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
         check(
             "official_issue_coverage",
             not incomplete_official,
-            "全部官网来源历史上至少核验过两期；是否为最新卷期需本轮官网计划确认" if not incomplete_official
+            "各出版来源历史上至少记录过两期；最新性、日期精度和核验方式见本轮卷期审计" if not incomplete_official
             else "官网两期核验尚未完成：" + "、".join(incomplete_official),
             "warning",
             "运行 official plan/collect-supported，并继续核验未完成的官网卷期",
@@ -244,7 +280,7 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
         check(
             "official_issue_failures",
             not latest_official_failures,
-            "最近官网核验无失败卷期" if not latest_official_failures else
+            "最近卷期核验无失败；部分通过出版商元数据复核" if not latest_official_failures else
             "官网待重试：" + "；".join(
                 f"{item['source_name']} {item['issue_key']}（{item['detail']}）"
                 for item in latest_official_failures
@@ -286,11 +322,18 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
         rescreen_count = int(database.execute(
             "SELECT COUNT(*) FROM papers WHERE eligibility_status='eligible' AND needs_rescreen=1"
         ).fetchone()[0])
-        semantic_ok = (eligible_count == screened_count and rescreen_count == 0) or eligible_count == 0
+        from .recommendations import SCREENING_RUBRIC_VERSION
+        current_rubric_count = int(database.execute("""SELECT COUNT(*) FROM (
+          SELECT identity,rubric_version,ROW_NUMBER() OVER(PARTITION BY identity ORDER BY screened_at DESC,rowid DESC) rank
+          FROM screenings WHERE provider='codex-agent'
+          AND profile_hash=(SELECT profile_hash FROM profile_versions WHERE status='active'))
+          WHERE rank=1 AND rubric_version=? AND identity IN (SELECT identity FROM papers WHERE eligibility_status='eligible')""",
+          (SCREENING_RUBRIC_VERSION,)).fetchone()[0])
+        semantic_ok = (eligible_count == current_rubric_count and rescreen_count == 0) or eligible_count == 0
         check(
             "semantic_coverage",
             semantic_ok,
-            f"可筛选论文={eligible_count}；已判断={screened_count}；待重评={rescreen_count}",
+            f"可筛选论文={eligible_count}；已判断={screened_count}；当前标准={current_rubric_count}；待重评={rescreen_count}；旧标准/未判={eligible_count-current_rubric_count}",
             "warning",
             "运行 agent-export --no-collect/agent-import 补齐未判断或待重评论文",
         )
@@ -307,6 +350,17 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
         database.close()
 
     service = web_service_status(config_path)
+    if config.get("cloud_sync", {}).get("enabled"):
+        import json
+        try:
+            sync = json.loads((state / "cloud-sync-status.json").read_text())
+            stamp = dt.datetime.fromisoformat(sync.get("synced_at", ""))
+            recent = dt.datetime.now(dt.timezone.utc) - stamp.astimezone(dt.timezone.utc) < dt.timedelta(minutes=15)
+            sync_ok = sync.get("status") in {"succeeded", "unchanged"} and recent
+        except (OSError, ValueError, TypeError):
+            sync, sync_ok = {}, False
+        check("cloud_sync", sync_ok, "云端同步正常" if sync_ok else "云端同步失败或超过15分钟未校验", "warning",
+              f"运行 academic-radar sync --config {config_path} 并检查本地 sync.stderr.log")
     service_action = (
         "已有后台服务使用另一份配置；确认要切换后再运行 service install-web"
         if service["mode"] == "other-config"

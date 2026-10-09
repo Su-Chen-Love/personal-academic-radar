@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .governance import publication_decision
+from .enrichment import clean_abstract
 from .product import manual_identity_for_title
 from .storage import connect, upgrade_database, utc_now
 
@@ -177,6 +178,7 @@ def build_official_plan(db_path: Path, config: dict[str, Any]) -> dict[str, Any]
             checked = [dict(row) for row in db.execute(
                 """SELECT issue_key,issue_url,status,article_count,imported_count,checked_at
                 FROM official_issue_checks WHERE source_name=? AND status='succeeded'
+                AND issue_key NOT LIKE 'metadata-latest-two-as-of-%'
                 ORDER BY checked_at DESC LIMIT 12""",
                 (source["name"],),
             )]
@@ -284,6 +286,10 @@ def _metadata_issue_url(spec: dict[str, Any], volume: str, issue: str) -> str:
         separator = "&" if "?" in spec["issues_url"] else "?"
         return f'{spec["issues_url"]}{separator}volume={urllib.parse.quote(volume)}&issue={urllib.parse.quote(issue)}'
     if provider == "Elsevier ScienceDirect":
+        if not issue:
+            # Several ScienceDirect journals publish standalone volumes and
+            # legitimately omit Crossref's issue field.
+            return spec["issues_url"].removesuffix("/issues") + f"/vol/{urllib.parse.quote(volume)}"
         return spec["issues_url"].removesuffix("/issues") + f"/vol/{urllib.parse.quote(volume)}/issue/{urllib.parse.quote(issue)}"
     if provider == "INFORMS PubsOnline":
         code = urllib.parse.urlparse(spec["issues_url"]).path.rstrip("/").split("/")[-1]
@@ -341,19 +347,39 @@ def _collect_print_metadata_source(
     if not issn:
         raise ValueError("期刊 ISSN 无效")
     year = dt.date.fromisoformat(as_of_date).year
-    query = urllib.parse.urlencode({
+    params = {
         "filter": (
-            f"from-print-pub-date:{year}-01-01,until-print-pub-date:{as_of_date},"
+            f"from-print-pub-date:{year-1}-01-01,until-print-pub-date:{as_of_date},"
             "type:journal-article"
         ),
         "rows": "1000",
+        # Crossref rejects published-print sorting with cursor pagination.
+        # Download the complete bounded print window using a supported sort,
+        # then rank the issues by their print dates locally.
+        "sort": "created",
+        "order": "desc",
+        "cursor": "*",
         "select": "DOI,title,abstract,published-print,volume,issue,author,URL,type,publisher,resource,link",
-    })
-    crossref_url = f"https://api.crossref.org/journals/{issn}/works?{query}"
-    response = _fetch_json(crossref_url).get("message")
-    records = response.get("items") if isinstance(response, dict) else None
-    if not isinstance(records, list):
-        raise ValueError("Crossref 没有返回出版商提交的论文记录")
+    }
+    records: list[dict[str, Any]] = []
+    cursors = {"*"}
+    for _ in range(10):
+        crossref_url = f"https://api.crossref.org/journals/{issn}/works?{urllib.parse.urlencode(params)}"
+        response = _fetch_json(crossref_url).get("message")
+        items = response.get("items") if isinstance(response, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("Crossref 没有返回出版商提交的论文记录")
+        records.extend(items)
+        next_cursor = response.get("next-cursor")
+        total = response.get("total-results")
+        if len(items) < 1000 or not next_cursor or (isinstance(total, int) and len(records) >= total):
+            break
+        if next_cursor in cursors:
+            raise ValueError("Crossref 卷期游标未推进，不能确认完整目录")
+        cursors.add(next_cursor)
+        params["cursor"] = next_cursor
+    else:
+        raise ValueError("Crossref 卷期分页达到上限，不能将截断目录标记为完整")
 
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     group_dates: dict[tuple[str, str], str] = {}
@@ -363,7 +389,7 @@ def _collect_print_metadata_source(
         volume = _clean(record.get("volume"))
         issue = _clean(record.get("issue"))
         published = _date_parts(record.get("published-print"))
-        if not volume or not issue or not published or published > as_of_date:
+        if not volume or (not issue and spec["provider"] != "Elsevier ScienceDirect") or not published or published > as_of_date:
             continue
         key = (volume, issue)
         grouped[key].append(record)
@@ -376,18 +402,23 @@ def _collect_print_metadata_source(
         doi = _clean(record.get("DOI")).lower()
         title_values = record.get("title")
         title = _clean(title_values[0] if isinstance(title_values, list) and title_values else title_values)
-        abstract = _clean(record.get("abstract"))
+        abstract = clean_abstract(record.get("abstract"))
         evidence_url = f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"
         evidence_type = "publisher_deposited_metadata"
+        fallback_error = ""
         if not abstract and doi:
             openalex_url = (
                 "https://api.openalex.org/works/https://doi.org/" +
                 urllib.parse.quote(doi, safe="")
             )
-            openalex = _fetch_json(openalex_url)
+            try:
+                openalex = _fetch_json(openalex_url)
+            except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+                openalex = {}
+                fallback_error = f"; exact-DOI OpenAlex lookup failed: {type(exc).__name__}: {str(exc)[:200]}"
             expected_doi = "https://doi.org/" + doi
             if str(openalex.get("doi") or "").lower() == expected_doi:
-                candidate = _clean(_openalex_abstract(openalex.get("abstract_inverted_index")))
+                candidate = clean_abstract(_openalex_abstract(openalex.get("abstract_inverted_index")))
                 if candidate:
                     abstract = candidate
                     evidence_url = openalex_url
@@ -412,12 +443,17 @@ def _collect_print_metadata_source(
             expected_host = urllib.parse.urlparse(spec["issues_url"]).hostname or ""
             if urllib.parse.urlparse(candidate_url).hostname == expected_host:
                 article_url = candidate_url
+        print_dates=(record.get("published-print") or {}).get("date-parts") or []
+        date_parts=print_dates[0] if print_dates and isinstance(print_dates[0],list) else []
+        date_precision={1:"year",2:"month"}.get(len(date_parts),"day" if len(date_parts)>=3 else "unknown")
         return {
             "doi": doi,
             "title": title,
             "abstract": abstract,
             "authors": authors,
             "published": _date_parts(record.get("published-print")),
+            "published_precision": date_precision,
+            "published_raw_date_parts": date_parts,
             "source_url": article_url,
             "publication_type_raw": _metadata_publication_type(title),
             **({
@@ -428,7 +464,7 @@ def _collect_print_metadata_source(
                 "abstract_unavailable_traceable": True,
                 "abstract_failure_reason": (
                     "Crossref publisher metadata and the exact-DOI OpenAlex record "
-                    "did not expose a complete abstract at collection time"
+                    "did not expose a complete abstract at collection time" + fallback_error
                 ),
             } if not abstract else {}),
         }
@@ -438,8 +474,10 @@ def _collect_print_metadata_source(
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
             papers = list(executor.map(enrich, grouped[(volume, issue)]))
         output_issues.append({
-            "issue_key": f"volume-{volume}-issue-{issue}",
+            "issue_key": f"volume-{volume}-issue-{issue}" if issue else f"volume-{volume}",
             "issue_url": _metadata_issue_url(spec, volume, issue),
+            "issue_evidence_type": "publisher_deposited_metadata",
+            "issue_evidence_url": crossref_url,
             "papers": papers,
         })
     return {"source_name": source["name"], "issues": output_issues}
@@ -658,14 +696,17 @@ def official_status(db_path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 FROM official_issue_checks WHERE source_name=? ORDER BY checked_at DESC""",
                 (source["name"],),
             )]
+            issue_rows=[item for item in rows if not item["issue_key"].startswith("metadata-latest-two-as-of-")]
+            refresh_rows=[item for item in rows if item["issue_key"].startswith("metadata-latest-two-as-of-")]
             sources.append({
                 "source_name": source["name"],
                 "mode": "browser_official",
                 "provider": spec["provider"],
                 "issues_url": spec["issues_url"],
-                "succeeded_issues": sum(item["status"] == "succeeded" for item in rows),
-                "failed_issues": sum(item["status"] == "failed" for item in rows),
+                "succeeded_issues": sum(item["status"] == "succeeded" for item in issue_rows),
+                "failed_issues": sum(item["status"] == "failed" for item in issue_rows),
                 "latest_check": rows[0] if rows else None,
+                "latest_metadata_refresh":refresh_rows[0] if refresh_rows else None,
             })
         return {
             "as_of_date": dt.date.today().isoformat(),
@@ -742,11 +783,22 @@ def preview_official_import(
     db_path: Path, config: dict[str, Any], path: Path,
 ) -> dict[str, Any]:
     upgrade_database(db_path)
+    package=json.loads(path.expanduser().read_text(encoding="utf-8-sig"))
+    as_of_date=dt.date.today()
+    if isinstance(package,dict) and package.get("as_of_date"):
+        as_of_date=dt.date.fromisoformat(str(package["as_of_date"]))
+        if as_of_date>dt.date.today():
+            raise ValueError("官网核验包的截至日期不能晚于今天")
     configured = {str(item.get("name")): item for item in config.get("sources", [])}
     db = connect(db_path)
     accepted: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
     errors: list[dict[str, Any]] = []
+    metadata_refreshes: list[dict[str,Any]]=[]
+    if isinstance(package,dict):
+        for failure in package.get("failures") or []:
+            errors.append({"source":str(failure.get("source_name") or ""),
+                           "reason":"采集包存在失败来源，不能确认完整核验："+str(failure.get("reason") or "unknown")})
     seen_dois: set[str] = set()
     try:
         for source_index, result in enumerate(_load_results(path), 1):
@@ -758,9 +810,12 @@ def preview_official_import(
                 continue
             expected_host = urllib.parse.urlparse(spec["issues_url"]).hostname or ""
             issues = result.get("issues")
-            if not isinstance(issues, list) or len(issues) > 2:
+            if not isinstance(issues, list) or not issues or len(issues) > 2:
                 errors.append({"source": source_name, "reason": "每个来源必须提供不超过两期的 issues 数组"})
                 continue
+            verified_issues=[]
+            source_errors_start=len(errors)
+            seen_issue_keys=set()
             for issue_index, issue in enumerate(issues, 1):
                 issue_key = _clean(issue.get("issue_key"))
                 issue_url = str(issue.get("issue_url") or "").strip()
@@ -768,16 +823,24 @@ def preview_official_import(
                 if not issue_key or issue_host != expected_host:
                     errors.append({"source": source_name, "issue": issue_key, "reason": "卷期标识为空或卷期 URL 不是已验证官网"})
                     continue
+                if issue_key in seen_issue_keys:
+                    errors.append({"source":source_name,"issue":issue_key,"reason":"来源中的卷期标识重复"})
+                    continue
+                seen_issue_keys.add(issue_key)
                 prior = db.execute(
                     "SELECT status FROM official_issue_checks WHERE source_name=? AND issue_key=?",
                     (source_name, issue_key),
                 ).fetchone()
-                if prior and prior["status"] == "succeeded":
-                    skipped.append({"source": source_name, "issue": issue_key, "reason": "该卷期已经成功核验"})
-                    continue
                 papers = issue.get("papers")
-                if not isinstance(papers, list):
-                    errors.append({"source": source_name, "issue": issue_key, "reason": "papers 必须是数组"})
+                if not isinstance(papers, list) or not papers:
+                    errors.append({"source": source_name, "issue": issue_key, "reason": "papers 必须是非空数组，空目录不能确认核验成功"})
+                    continue
+                issue_evidence_type=_clean(issue.get("issue_evidence_type")) or "official_page"
+                issue_evidence_url=str(issue.get("issue_evidence_url") or issue_url)
+                if issue_evidence_type not in {"official_page","publisher_deposited_metadata"} or urllib.parse.urlparse(issue_evidence_url).hostname != (
+                    "api.crossref.org" if issue_evidence_type=="publisher_deposited_metadata" else expected_host
+                ):
+                    errors.append({"source":source_name,"issue":issue_key,"reason":"卷期证据类型与来源URL不一致"})
                     continue
                 accepted_papers: list[dict[str, Any]] = []
                 issue_failed = False
@@ -787,7 +850,7 @@ def preview_official_import(
                     title = _clean(item.get("title"))
                     article_url = str(item.get("source_url") or "").strip()
                     article_host = urllib.parse.urlparse(article_url).hostname or ""
-                    abstract = _clean(item.get("abstract"))
+                    abstract = clean_abstract(item.get("abstract"))
                     abstract_evidence_url = str(item.get("abstract_evidence_url") or "").strip()
                     abstract_evidence_type = _clean(item.get("abstract_evidence_type"))
                     abstract_evidence_host = urllib.parse.urlparse(abstract_evidence_url).hostname or ""
@@ -831,7 +894,7 @@ def preview_official_import(
                             pass
                         else:
                             reason = "研究论文缺少完整原始摘要；若已穷尽可用证据，必须记录可追溯缺失标记和原因"
-                    else:
+                    if not reason:
                         existing = db.execute("SELECT title FROM papers WHERE lower(doi)=?", (doi,)).fetchone()
                         if existing and not _title_matches(existing["title"], title):
                             reason = "DOI 已存在但标题不一致"
@@ -845,9 +908,16 @@ def preview_official_import(
                     seen_dois.add(doi)
                     authors = item.get("authors") if isinstance(item.get("authors"), list) else []
                     published = str(item.get("published") or "").strip()
+                    published_precision=str(item.get("published_precision") or ("day" if published else "unknown"))
+                    if published_precision not in {"day","month","year","unknown"}:
+                        errors.append({"source":source_name,"issue":issue_key,"paper":paper_index,
+                                       "doi":doi,"reason":"published_precision 无效"})
+                        issue_failed=True
+                        continue
+                    published_date_uncertain=False
                     if published:
                         try:
-                            dt.date.fromisoformat(published)
+                            published_date=dt.date.fromisoformat(published)
                         except ValueError:
                             errors.append({
                                 "source": source_name, "issue": issue_key, "paper": paper_index,
@@ -855,6 +925,14 @@ def preview_official_import(
                             })
                             issue_failed = True
                             continue
+                        if published_date>as_of_date:
+                            errors.append({"source":source_name,"issue":issue_key,"paper":paper_index,
+                                           "doi":doi,"reason":"论文出版日期晚于官网核验截至日期"})
+                            issue_failed=True
+                            continue
+                        published_date_uncertain=(
+                            published_precision=="month" and published_date.strftime("%Y-%m")==as_of_date.strftime("%Y-%m")
+                        ) or (published_precision=="year" and published_date.year==as_of_date.year)
                     accepted_papers.append({
                         "identity": "doi:" + doi,
                         "doi": doi,
@@ -862,6 +940,8 @@ def preview_official_import(
                         "abstract": abstract,
                         "authors": [_clean(value) for value in authors if _clean(value)],
                         "published": published,
+                        "published_precision":published_precision,
+                        "published_date_uncertain":published_date_uncertain,
                         "url": article_url,
                         "abstract_evidence_url": abstract_evidence_url or article_url,
                         "abstract_evidence_type": abstract_evidence_type or "official_page",
@@ -872,17 +952,47 @@ def preview_official_import(
                         "decision": decision,
                     })
                 if not issue_failed:
-                    accepted.append({
+                    verified_issue={
                         "source_name": source_name,
                         "issue_key": issue_key,
                         "issue_url": issue_url,
+                        "issue_evidence_type":issue_evidence_type,
+                        "issue_evidence_url":issue_evidence_url,
                         "papers": accepted_papers,
-                    })
+                    }
+                    verified_issues.append(verified_issue)
+                    if prior and prior["status"]=="succeeded":
+                        skipped.append({"source":source_name,"issue":issue_key,"reason":"该卷期已成功核验；本次证据仍通过完整校验"})
+                    else:
+                        accepted.append(verified_issue)
+            if (
+                isinstance(package,dict) and package.get("as_of_date")
+                and len(issues)==2 and len(verified_issues)==2 and len(errors)==source_errors_start
+                and all(issue["issue_evidence_type"]=="publisher_deposited_metadata" for issue in verified_issues)
+            ):
+                metadata_refreshes.append({
+                    "source_name":source_name,"as_of_date":as_of_date.isoformat(),
+                    "issue_key":"metadata-latest-two-as-of-"+as_of_date.isoformat(),
+                    "issue_url":spec["issues_url"],
+                    "evidence_type":"publisher_deposited_metadata",
+                    "phase":"latest_two_metadata_refresh",
+                    "issue_keys":[issue["issue_key"] for issue in verified_issues],
+                    "issues":[{
+                        "issue_key":issue["issue_key"],"issue_url":issue["issue_url"],
+                        "evidence_url":issue["issue_evidence_url"],"article_count":len(issue["papers"]),
+                        "published_precisions":sorted({paper["published_precision"] for paper in issue["papers"]}),
+                        "published_dates":sorted({paper["published"] for paper in issue["papers"]}),
+                        "uncertain_date_count":sum(bool(paper["published_date_uncertain"]) for paper in issue["papers"]),
+                    } for issue in verified_issues],
+                    "summary":"本次完整验证出版商提交的最新两期元数据；不代表逐篇访问官网。当前月或年的粗粒度日期不能确认具体出版日。",
+                })
         return {
             "source": str(path.expanduser().resolve()),
+            "as_of_date":as_of_date.isoformat(),
             "accepted": accepted,
             "skipped": skipped,
             "errors": errors,
+            "metadata_refreshes":metadata_refreshes if not errors else [],
             "counts": {
                 "issues": len(accepted),
                 "papers": sum(len(item["papers"]) for item in accepted),
@@ -940,11 +1050,14 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                         identity,doi,title,abstract,venue,published,url,authors_json,first_seen,updated_at,
                         abstract_source,low_priority,low_priority_reason,publication_type,publication_type_raw,
                         publication_type_source,publication_type_evidence_json,eligibility_status,exclusion_reason,
-                        abstract_source_url,abstract_retrieved_at,abstract_failure_reason,needs_rescreen
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        abstract_source_url,abstract_retrieved_at,abstract_failure_reason,needs_rescreen,published_precision
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(identity) DO UPDATE SET
                         doi=excluded.doi,title=excluded.title,venue=excluded.venue,
                         published=CASE WHEN excluded.published<>'' THEN excluded.published ELSE papers.published END,
+                        published_precision=CASE WHEN excluded.published='' THEN papers.published_precision
+                          WHEN excluded.published_precision<>'unknown' THEN excluded.published_precision
+                          WHEN excluded.published=papers.published THEN papers.published_precision ELSE 'unknown' END,
                         url=excluded.url,authors_json=excluded.authors_json,updated_at=excluded.updated_at,
                         abstract=CASE WHEN length(excluded.abstract)>length(COALESCE(papers.abstract,'')) THEN excluded.abstract ELSE papers.abstract END,
                         abstract_source=CASE WHEN length(excluded.abstract)>length(COALESCE(papers.abstract,'')) THEN excluded.abstract_source ELSE papers.abstract_source END,
@@ -969,6 +1082,7 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                                 paper.get("abstract_failure_reason") or "官网卷期未提供摘要"
                             ),
                             1 if decision["eligibility_status"] == "eligible" else 0,
+                            paper.get("published_precision", "unknown"),
                         ),
                     )
                     observation = issue["source_name"] + " / Official issue " + issue["issue_key"]
@@ -1041,8 +1155,12 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                     paper.get("abstract_evidence_type") == "scholarly_metadata"
                     for paper in issue["papers"]
                 )
-                detail = "已逐篇核验官网标题与摘要"
+                metadata_issue=issue.get("issue_evidence_type")=="publisher_deposited_metadata"
+                detail = "已核验出版商提交的卷期元数据" if metadata_issue else "已逐篇核验官网标题与摘要"
                 metadata_parts: list[str] = []
+                uncertain_dates=sum(bool(paper.get("published_date_uncertain")) for paper in issue["papers"])
+                if uncertain_dates:
+                    metadata_parts.append(f"{uncertain_dates} 篇出版日期仅精确到月或年，截至核验日的具体出版日期未确认")
                 if publisher_metadata_count:
                     metadata_parts.append(
                         f"{publisher_metadata_count} 篇摘要来自出版商提交的 Crossref 元数据"
@@ -1056,7 +1174,7 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                 if traceable_missing:
                     metadata_parts.append(f"{traceable_missing} 篇研究论文摘要暂不可得并已记录证据链")
                 if metadata_parts:
-                    detail = "已逐篇核验官网目录；" + "；".join(metadata_parts)
+                    detail = ("已核验出版商提交的卷期元数据；" if metadata_issue else "已逐篇核验官网目录；") + "；".join(metadata_parts)
                 db.execute(
                     """INSERT INTO official_issue_checks(
                     source_name,issue_key,issue_url,status,article_count,imported_count,detail,checked_at
@@ -1067,12 +1185,23 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                     (issue["source_name"], issue["issue_key"], issue["issue_url"], len(issue["papers"]),
                      imported, detail, now),
                 )
+            for refresh in preview.get("metadata_refreshes",[]):
+                db.execute("""INSERT INTO official_issue_checks(
+                    source_name,issue_key,issue_url,status,article_count,imported_count,detail,checked_at
+                    ) VALUES(?,?,?,'succeeded',?,0,?,?)
+                    ON CONFLICT(source_name,issue_key) DO UPDATE SET
+                    issue_url=excluded.issue_url,status=excluded.status,article_count=excluded.article_count,
+                    imported_count=0,detail=excluded.detail,checked_at=excluded.checked_at""",
+                    (refresh["source_name"],refresh["issue_key"],refresh["issue_url"],
+                     sum(issue["article_count"] for issue in refresh["issues"]),
+                     json.dumps(refresh,ensure_ascii=False,sort_keys=True),now))
         return {
             "issues": len(preview["accepted"]),
             "papers": sum(len(item["papers"]) for item in preview["accepted"]),
             "inserted": inserted,
             "abstracts_updated": updated,
             "skipped": len(preview.get("skipped", [])),
+            "metadata_refreshed":len(preview.get("metadata_refreshes",[])),
         }
     finally:
         db.close()

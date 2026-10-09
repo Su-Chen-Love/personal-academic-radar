@@ -45,6 +45,7 @@ from .product import (
     add_manual_abstract,
     add_manual_paper,
     human_time,
+    publication_date_label,
     import_fulltext,
     initialize_installation,
     source_candidates,
@@ -198,6 +199,7 @@ def preview_source(source: dict[str, Any], user_agent: str, lookback_days: int) 
 
 def _toml_text(value: Any) -> str:
     if isinstance(value,bool): return "true" if value else "false"
+    if isinstance(value,(int,float)): return str(value)
     if isinstance(value,list): return "["+", ".join(_toml_text(item) for item in value)+"]"
     return json.dumps(str(value),ensure_ascii=False)
 
@@ -208,6 +210,7 @@ def write_sources(config_path: Path, sources: list[dict[str, Any]]) -> Path:
     order=(
         "name","type","required","issn","openalex_id","query_container","container_title_contains",
         "exclude_container_contains","official_status","official_provider","official_issues_url","official_feed_url",
+        "rows_per_page","max_pages_per_source",
     )
     for source in sources:
         lines=["[[sources]]"]+[f"{key} = {_toml_text(source[key])}" for key in order if key in source]
@@ -271,6 +274,7 @@ def create_app(config_path: Path) -> FastAPI:
     app.state.source_candidates = {}
     templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
     templates.env.filters["human_time"] = human_time
+    templates.env.filters["publication_date"] = publication_date_label
     def authors_label(value: str) -> str:
         try: names=json.loads(value or "[]")
         except (json.JSONDecodeError,TypeError): names=[]
@@ -302,6 +306,8 @@ def create_app(config_path: Path) -> FastAPI:
         "semantic_coverage": "相关性判断覆盖",
         "abstract_coverage": "摘要覆盖",
         "web_service": "后台网页服务",
+        "cloud_sync": "云端数据同步",
+        "recommendation_freshness": "推荐更新时效",
     }.get(str(value), str(value))
     app.mount("/static", StaticFiles(directory=str(PACKAGE_DIR / "static")), name="static")
 
@@ -315,11 +321,18 @@ def create_app(config_path: Path) -> FastAPI:
         return response
 
     def context(request: Request, page: str, **values: Any) -> dict[str, Any]:
+        sync_status = {}
+        try:
+            sync_status = json.loads((state / "cloud-sync-status.json").read_text())
+        except (OSError, ValueError):
+            pass
         return {
             "request": request,
             "page": page,
             "csrf_token": app.state.csrf_token,
             "state_path": str(state),
+            "cloud_url": str(config.get("cloud_sync", {}).get("endpoint", "")),
+            "cloud_sync_status": sync_status,
             **values,
         }
 
@@ -498,7 +511,7 @@ def create_app(config_path: Path) -> FastAPI:
             official_counts={item["source_name"]:dict(item) for item in rows(db,"""SELECT source_name,
               COUNT(*) issue_count,MAX(checked_at) last_checked_at,
               SUM(article_count) article_count
-              FROM official_issue_checks WHERE status='succeeded' GROUP BY source_name""")}
+              FROM official_issue_checks WHERE status='succeeded' AND issue_key NOT LIKE 'metadata-latest-two-as-of-%' GROUP BY source_name""")}
             official_latest={item["source_name"]:dict(item) for item in rows(db,"""SELECT * FROM (
               SELECT source_name,issue_key,status,detail,checked_at,
               ROW_NUMBER() OVER(PARTITION BY source_name ORDER BY checked_at DESC) rank

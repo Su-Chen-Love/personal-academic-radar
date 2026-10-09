@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable
 
-from .governance import publication_decision
+from .governance import publication_decision, should_preserve_publication_metadata
 from .storage import connect, utc_now
 
 
@@ -45,7 +45,13 @@ def clean_abstract(value: Any) -> str:
     if not value:
         return ""
     text = re.sub(r"<[^>]+>", " ", str(value))
-    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+    text=re.sub(r"\s+", " ", html.unescape(text)).strip()
+    if text.lower().rstrip(".") in {
+        "international audience","national audience","no abstract available",
+        "abstract not available","no abstract","no abstract provided",
+    }:
+        return ""
+    return text
 
 
 def inverted_abstract(value: dict[str, list[int]] | None) -> str:
@@ -87,7 +93,7 @@ class OfficialMetaParser(HTMLParser):
 
 
 class ProviderTemporarilyUnavailable(RuntimeError):
-    """Stop repeated calls after a provider has explicitly rate-limited the run."""
+    """Stop repeated calls after a provider's retries have been exhausted."""
 
 
 class EnrichmentBudgetExceeded(TimeoutError):
@@ -126,7 +132,7 @@ class MetadataClient:
         backoff = self.provider_backoff_until.get(provider, 0.0) - time.monotonic()
         if backoff > 0:
             raise ProviderTemporarilyUnavailable(
-                f"{provider} 因 429 限流暂停本轮后续请求（约 {int(backoff)} 秒）"
+                f"{provider} 暂停本轮后续请求，保留此前失败证据（约 {int(backoff)} 秒）"
             )
         elapsed = time.monotonic() - self.last_request.get(provider, 0.0)
         delay = self.minimum_interval.get(provider, 0.2) - elapsed
@@ -166,6 +172,17 @@ class MetadataClient:
                         self.provider_backoff_until[provider] = max(
                             self.provider_backoff_until.get(provider, 0.0),
                             time.monotonic() + max(600.0, wait),
+                        )
+                    elif provider!="publisher" and (
+                        status in {500,502,503,504} or
+                        (status is None and isinstance(exc,(urllib.error.URLError,TimeoutError)))
+                    ):
+                        # Central API transport failures should not spend the
+                        # entire daily budget retrying the same outage for each
+                        # DOI. Publisher requests may target different hosts.
+                        self.provider_backoff_until[provider]=max(
+                            self.provider_backoff_until.get(provider,0.0),
+                            time.monotonic()+300.0,
                         )
                     raise
                 remaining = self.deadline - time.monotonic() if self.deadline is not None else 30.0
@@ -239,6 +256,8 @@ def lookup_openalex(_: sqlite3.Connection, paper: dict[str, Any], client: Metada
         params["mailto"] = _mailto(client.user_agent)
     url = "https://api.openalex.org/works/" + urllib.parse.quote(identifier, safe=":") + "?" + urllib.parse.urlencode(params)
     item, final_url = client.json("openalex", url)
+    if str(item.get("doi") or "").lower().removeprefix("https://doi.org/") != doi.lower():
+        return None
     actual_title = str(item.get("title") or "")
     if actual_title and not _title_matches(paper.get("title", ""), actual_title):
         return None
@@ -551,7 +570,7 @@ def enrich_abstracts(
                 if time.monotonic() >= client.deadline:
                     budget_exhausted = True
                     break
-                if abstract_found and type_found:
+                if (abstract_found and type_found) or paper.get("eligibility_status")=="excluded":
                     break
                 if not retry:
                     recent = db.execute(
@@ -576,6 +595,10 @@ def enrich_abstracts(
                     break
                 except Exception as exc:
                     detail = f"{type(exc).__name__}: {str(exc)[:300]}"
+                    if isinstance(exc,urllib.error.HTTPError) and exc.code==404:
+                        _record_attempt(db,task_id,paper["identity"],provider,"not_found",detail="精确标识未收录（HTTP 404）")
+                        db.commit()
+                        continue
                     failures.append(f"{PROVIDER_LABELS[provider]}：{detail}")
                     _record_attempt(db, task_id, paper["identity"], provider, "failed", detail=detail)
                     db.commit()
@@ -607,36 +630,64 @@ def enrich_abstracts(
                         updated += 1
                         changed = True
                         provider_found[provider] = provider_found.get(provider, 0) + 1
-                    if decision and (
-                        not type_found or provider == "crossref" or decision["eligibility_status"] == "excluded"
-                    ):
+                    result_source = str(result.get("publication_type_source") or provider)
+                    preserve_type = decision and should_preserve_publication_metadata(
+                        str(paper.get("publication_type_source") or ""), str(paper.get("eligibility_status") or "quarantine"),
+                        result_source, decision["eligibility_status"],
+                    )
+                    prior_evidence = json.loads(paper.get("publication_type_evidence_json") or "[]")
+                    if not isinstance(prior_evidence, list):
+                        prior_evidence = []
+                    if decision and not preserve_type:
+                        decision["evidence"].extend(item for item in prior_evidence if isinstance(item, dict)
+                          and item.get("kind") in {"metadata_conflict", "verified_record"} and item not in decision["evidence"])
+                        if paper.get("publication_type_raw") and (
+                            paper.get("publication_type_raw"), paper.get("publication_type_source")
+                        ) != (raw_type, result_source):
+                            decision["evidence"].append({"kind": "metadata_conflict",
+                              "source": paper.get("publication_type_source") or "metadata",
+                              "value": paper.get("publication_type_raw") or "", "prior_status": paper["eligibility_status"]})
                         db.execute(
                             """UPDATE papers SET publication_type=?,publication_type_raw=?,
                             publication_type_source=?,publication_type_evidence_json=?,eligibility_status=?,
-                            exclusion_reason=? WHERE identity=?""",
+                            exclusion_reason=?,needs_rescreen=CASE WHEN eligibility_status<>? OR publication_type<>?
+                            THEN 1 ELSE needs_rescreen END WHERE identity=?""",
                             (
                                 decision["publication_type"], raw_type,
-                                result.get("publication_type_source") or provider,
+                                result_source,
                                 json.dumps(decision["evidence"], ensure_ascii=False),
-                                decision["eligibility_status"], decision.get("exclusion_reason"), paper["identity"],
+                                decision["eligibility_status"], decision.get("exclusion_reason"),
+                                decision["eligibility_status"], decision["publication_type"], paper["identity"],
                             ),
                         )
                         paper["publication_type"] = decision["publication_type"]
+                        paper["publication_type_raw"] = raw_type
+                        paper["publication_type_source"] = result_source
+                        paper["publication_type_evidence_json"] = json.dumps(decision["evidence"], ensure_ascii=False)
                         paper["eligibility_status"] = decision["eligibility_status"]
                         type_found = decision["eligibility_status"] != "quarantine"
                         type_updated += 1
                         changed = True
+                    elif preserve_type:
+                        conflict = {"kind": "metadata_conflict", "source": result_source,
+                                    "value": raw_type, "prior_status": decision["eligibility_status"]}
+                        if conflict not in prior_evidence:
+                            prior_evidence.append(conflict)
+                            paper["publication_type_evidence_json"] = json.dumps(prior_evidence, ensure_ascii=False)
+                            db.execute("UPDATE papers SET publication_type_evidence_json=? WHERE identity=?",
+                                       (paper["publication_type_evidence_json"], paper["identity"]))
                     _record_attempt(
                         db, task_id, paper["identity"], provider,
                         "found" if changed else "not_found", result.get("source_url", ""),
-                        result.get("evidence_type", ""), "摘要或出版类型证据已采用" if changed else "记录无可用新证据",
+                        result.get("evidence_type", ""), "摘要或出版类型证据已采用" if changed else (
+                            "较弱类型证据已记录为来源冲突，未覆盖当前类型" if preserve_type else "记录无可用新证据"),
                     )
                 if changed and abstract_found and type_found:
                     break
             if budget_exhausted:
                 break
             checked = index
-            if not abstract_found:
+            if not abstract_found and paper.get("eligibility_status")!="excluded":
                 reason = "；".join(failures[-3:]) if failures else "所有公开渠道均未返回可核验的原始摘要"
                 with db:
                     db.execute("UPDATE papers SET abstract_failure_reason=? WHERE identity=?", (reason, paper["identity"]))

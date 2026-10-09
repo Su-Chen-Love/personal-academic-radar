@@ -26,14 +26,15 @@ Use the bundled deterministic runner for collection, normalization, deduplicatio
 7. Check for new preference evidence with `academic-radar profile review --db <state>/papers.sqlite3`. If `needed` is false, skip profile analysis. If a pending suggestion already exists, leave it for the user. Otherwise compare every returned feedback event with the active profile. Save either a complete suggested profile with `profile suggest` or a reasoned `profile no-change`; never activate a suggestion without explicit user confirmation.
 8. For a Codex scheduled task, freeze the one authoritative queue after API, official, enrichment, and profile-review work:
    `python3 scripts/paper_monitor.py agent-export --config <state>/config.toml --no-collect --batch-run <collection-run-id>`
-   Read the returned queue JSON and complete every paper using its `evaluation_policy` and the rubric in `references/profile-guidance.md`. Write a results JSON with the same `run_id` and `profile_hash`, a `model` label, and a `results` array. Each result must contain `identity`, a four-part `reasoning` object, a five-part `score_dimensions` object, `matched_themes`, `confidence`, and a natural reader-facing `recommendation_reason`; the runner calculates the authoritative score. The recommendation reason must synthesize the paper's distinctive evidence, exact profile mechanism, concrete transfer, and decisive caveat rather than concatenate audit labels or paraphrase the title.
+   Read the returned queue JSON and complete every paper using its `evaluation_policy` and the rubric in `references/profile-guidance.md`. Write a results JSON with the same `run_id` and `profile_hash`, a `model` label, and a `results` array. Each result must contain `identity`, a four-part `reasoning` object, a five-part `score_dimensions` object, `matched_themes`, `confidence`, a natural reader-facing `recommendation_reason`, `recommendation_type`, and exact `evidence_anchors`; the runner calculates the authoritative score. The recommendation reason must synthesize the paper's distinctive evidence, exact profile mechanism, concrete transfer, and decisive caveat rather than concatenate audit labels or paraphrase the title.
    Treat `feedback_examples` and the cumulative profile-review history as confirmed positive/negative calibration evidence,
    while keeping the confirmed profile as the primary decision rubric. Never
    change the profile from feedback without creating a draft for user approval.
-9. Import the judgments and generate the digest:
+9. Import the complete bounded batch and generate the digest (current schema 5 also requires recommendation_type and exact evidence_anchors):
    `python3 scripts/paper_monitor.py agent-import --config <state>/config.toml --results <results.json>`
    After materially changing the profile, add `--rescreen` to the export once.
-10. Report API collection, official issues checked/skipped/failed, inserted or updated abstracts, candidates, papers scoring at least 0.70, digest path, profile-review outcome, API-fallback sources, and source failures. Do not claim success if required sources failed or a planned official source was silently omitted.
+10. When cloud_sync is enabled, the import synchronizes automatically. Verify its result and retry with `academic-radar sync`; distinguish local import success from cloud sync success.
+11. Report API collection, official issues checked/skipped/failed, inserted or updated abstracts, candidates, papers scoring at least 0.70, digest path, profile-review outcome, API-fallback sources, and source failures. Do not claim success if required sources failed or a planned official source was silently omitted.
 
 ## Safety and operational rules
 
@@ -49,7 +50,7 @@ Use the bundled deterministic runner for collection, normalization, deduplicatio
   A newer export abandons any older unfinished queue.
 - The recommendation cutoff is 0.70. Keep lower-scoring judgments in private history for audit and calibration, but omit them from the default recommendation views.
 - Send email only when `delivery.enabled = true`; respect `send_when_empty`.
-- SQLite is private single-host state. Never upload it, its WAL, queues, results, logs, PDFs, feedback, or configuration to GitHub or a synchronization service.
+- SQLite/WAL, queues, results, logs, PDFs, backups, credentials, and configuration files remain private local state and never enter source repositories. When the user explicitly enables Sites synchronization, use `academic-radar sync` to exchange only authorized application records with the configured D1 service. Never copy the SQLite file or bypass access controls. See `docs/cloud-sync.md`.
 
 ## Research-interest judgment
 

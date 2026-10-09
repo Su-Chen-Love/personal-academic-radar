@@ -5,7 +5,7 @@
     {% if paper.score is not none %}<strong>{{ "%.0f"|format(paper.score * 100) }}</strong><span>匹配度</span>{% else %}<strong>—</strong><span>待判断</span>{% endif %}
   </div>
   <div class="paper-body">
-    <div class="eyebrow"><span>{{ paper.venue or '未知来源' }}</span><time>{{ paper.published or '日期未知' }}</time></div>
+    <div class="eyebrow"><span>{{ paper.venue or '未知来源' }}</span><time>{{ paper.published|publication_date(paper.published_precision|default('unknown')) }}</time></div>
     <div class="paper-title-row"><h2>{% if paper.url %}<a class="paper-title-link" href="{{ paper.url }}" target="_blank" rel="noreferrer">{{ paper.title }}</a>{% else %}{{ paper.title }}{% endif %}</h2>
       <button type="button" class="favorite-button {{ 'is-favorite' if paper.favorite }}" data-favorite data-identity="{{ paper.identity }}" aria-pressed="{{ 'true' if paper.favorite else 'false' }}" aria-label="{{ '取消收藏' if paper.favorite else '收藏到本地文献库' }}">{{ '★' if paper.favorite else '☆' }}</button>
     </div>
@@ -21,6 +21,7 @@
     {% if paper.evidence_source == 'unavailable' %}<p class="reason">当时的推荐记录已保留，原始评分详情暂不可恢复。</p>{% endif %}
     {% if anchor_prefix and paper.eligibility_status != 'eligible' %}<p class="reason">当前收录状态：{{ paper.eligibility_status|status_label }}</p>{% endif %}
     {% if paper.reasons %}<p class="reason"><strong>AI 阅读判断：</strong>{{ paper.reasons }}</p>{% endif %}
+    {% if paper.needs_rescreen and not anchor_prefix %}<p class="warning">资料或研究偏好有更新，这条推荐理由待重新核验。</p>{% endif %}
     <details class="paper-details">
       <summary>展开详情</summary>
       <div class="paper-detail-content">

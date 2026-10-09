@@ -12,3 +12,8 @@ The web application binds to loopback by default and has no public-user
 authentication. Treat `--allow-remote` as an expert-only escape hatch, not as a
 deployment recipe.
 
+The opt-in Sites deployment publishes papers and recommendations. It requires
+the owner's ChatGPT sign-in for profiles and feedback; synchronization uses a
+separate server-side bearer check and an atomic, verified snapshot. Keep the
+private credentials file and all application records out of Git. Cloud sync
+never uploads SQLite files, local PDFs, filesystem paths, or collector keys.

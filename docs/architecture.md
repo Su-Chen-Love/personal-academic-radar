@@ -1,6 +1,6 @@
 # 架构
 
-Personal Academic Radar v0.8.0 固定为本地优先、单用户、私有数据和本地 SQLite。云端同步、共享数据库、公共网站与多租户不在本版本范围内。
+Personal Academic Radar 采用本地优先、单用户和私有 SQLite。可选 Sites 版用 D1 保存授权的应用记录并回传反馈，公共浏览与本人修改分开。SQLite/WAL 与 PDF 不共享，语义判断由本地 Codex 宿主完成。详情见 [云端部署与同步](cloud-sync.md)。
 
 ## 信任边界
 

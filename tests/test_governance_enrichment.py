@@ -9,9 +9,11 @@ from academic_radar.enrichment import (
     MetadataClient,
     ProviderTemporarilyUnavailable,
     apply_manual_import,
+    clean_abstract,
     enrich_abstracts,
     export_missing_task_package,
     lookup_elsevier,
+    lookup_openalex,
     lookup_semantic_scholar,
     lookup_publisher,
     prime_semantic_scholar_batch,
@@ -22,11 +24,25 @@ from academic_radar.governance import (
     governance_stats,
     preview_cleanup,
     publication_decision,
+    should_preserve_publication_metadata,
 )
 from academic_radar.storage import connect, upgrade_database, utc_now
 
 
 class GovernanceEnrichmentTests(unittest.TestCase):
+    def test_placeholder_abstract_is_not_original_evidence(self):
+        self.assertEqual(clean_abstract("<p>International audience</p>"),"")
+        self.assertEqual(clean_abstract("No abstract available"),"")
+        self.assertEqual(clean_abstract("The study examined an international audience."),"The study examined an international audience.")
+
+    def test_openalex_requires_exact_doi_before_using_abstract(self):
+        class Client:
+            user_agent="test"
+            def json(self,*args):
+                return {"doi":"https://doi.org/10.1/other","title":"Matching paper title",
+                        "abstract_inverted_index":{"Unsafe":[0]}},"https://api.openalex.org/works/example"
+        self.assertIsNone(lookup_openalex(None,{"doi":"10.1/expected","title":"Matching paper title"},Client()))
+
     def test_budget_preserves_progress_and_defers_remaining_without_false_failure(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td)/"papers.sqlite3"
@@ -53,6 +69,34 @@ class GovernanceEnrichmentTests(unittest.TestCase):
             with self.assertRaises(ProviderTemporarilyUnavailable):
                 client.request("openalex", "https://example.test/next")
         self.assertEqual(request.call_count, 1)
+
+    def test_central_transport_outage_does_not_repeat_for_every_doi(self):
+        client=MetadataClient({"collection":{"max_retries":0}})
+        with patch("urllib.request.urlopen",side_effect=urllib.error.URLError("TLS EOF")) as request:
+            with self.assertRaises(urllib.error.URLError):client.request("pubmed","https://example.test/one")
+            with self.assertRaises(ProviderTemporarilyUnavailable):client.request("pubmed","https://example.test/two")
+        self.assertEqual(request.call_count,1)
+
+    def test_metadata_404_is_not_misreported_as_provider_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/"papers.sqlite3";self.add_paper(path)
+            def absent(*_):raise urllib.error.HTTPError("https://example.test",404,"not found",{},None)
+            with patch("academic_radar.enrichment.PROVIDERS",[("openalex",absent)]):
+                result=enrich_abstracts(path,{})
+            with connect(path) as db:
+                self.assertEqual(db.execute("SELECT status FROM abstract_attempts").fetchone()[0],"not_found")
+                self.assertNotIn("HTTPError",db.execute("SELECT abstract_failure_reason FROM papers").fetchone()[0])
+
+    def test_excluded_type_does_not_consume_more_enrichment_requests(self):
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/"papers.sqlite3";self.add_paper(path)
+            def exclude(*_):
+                return {"abstract":"","source_name":"crossref","publication_type_raw":"editorial",
+                        "publication_type_source":"crossref","source_url":"https://example.test"}
+            with patch("academic_radar.enrichment.PROVIDERS",[("crossref",exclude),("pubmed",lambda *_:self.fail("Excluded paper must stop enrichment"))]):
+                result=enrich_abstracts(path,{})
+            self.assertEqual(result["unresolved"],0)
+            with connect(path) as db:self.assertEqual(db.execute("SELECT eligibility_status FROM papers").fetchone()[0],"excluded")
 
     def add_paper(self, db_path: Path, identity: str = "doi:10.1/x", abstract: str = "") -> None:
         upgrade_database(db_path)
@@ -89,6 +133,102 @@ class GovernanceEnrichmentTests(unittest.TestCase):
     def test_unknown_type_is_quarantined(self):
         result = publication_decision("Research-looking title", "Unknown", "", "")
         self.assertEqual(result["eligibility_status"], "quarantine")
+
+    def test_research_on_commentary_and_error_correction_is_not_excluded(self):
+        for title in (
+            "Effects of Human-AI Voice Interaction in Sports Commentary on Perceived Credibility, Emotional Response, and Cognitive Recall",
+            "Correction of AI Errors Through User Feedback",
+        ):
+            with self.subTest(title=title):
+                result = publication_decision(title, "Journal", "journal-article", "crossref")
+                self.assertEqual(result["eligibility_status"], "eligible")
+        for title in (
+            "Correction", "Correction: Original Study", "Correction to Original Study",
+            "From Shadow AI to Governed AI Review: A Commentary on an Original Study",
+            "Commentary on a Field Experiment",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(publication_decision(title, "Journal", "journal-article", "crossref")["eligibility_status"], "excluded")
+
+    def test_publication_evidence_precedence_allows_correcting_bad_aggregator_type(self):
+        self.assertTrue(should_preserve_publication_metadata("crossref", "eligible", "openalex", "excluded"))
+        self.assertFalse(should_preserve_publication_metadata("openalex", "excluded", "crossref", "eligible"))
+        self.assertTrue(should_preserve_publication_metadata("publisher-official", "excluded", "crossref", "eligible"))
+        self.assertTrue(should_preserve_publication_metadata("elsevier-official-api", "eligible", "openalex", "excluded"))
+        self.assertTrue(should_preserve_publication_metadata("crossref", "eligible", "", "quarantine"))
+        self.assertFalse(should_preserve_publication_metadata("crossref", "quarantine", "openalex", "eligible"))
+
+    def test_enrichment_records_weak_type_conflict_and_continues_to_original_abstract(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "papers.sqlite3"
+            self.add_paper(path)
+            with connect(path) as db:
+                db.execute("""UPDATE papers SET publication_type='Journal Article',publication_type_raw='journal-article',
+                  publication_type_source='crossref',eligibility_status='eligible',publication_type_evidence_json=?""",
+                  (json.dumps([{"kind": "metadata_type", "source": "crossref", "value": "journal-article"}]),))
+            weak = {"abstract": "", "source_name": "openalex", "publication_type_raw": "paratext",
+                    "publication_type_source": "openalex", "source_url": "https://api.openalex.org/works/x"}
+            original = {"abstract": "The original paper analyzes how index inaccuracy affects farmers' optimal subsidies.",
+                        "source_name": "publisher-official", "publication_type_raw": "journal-article",
+                        "publication_type_source": "publisher-official", "source_url": "https://publisher.example/article"}
+            with patch("academic_radar.enrichment.PROVIDERS", [("openalex", lambda *_: weak), ("publisher", lambda *_: original)]):
+                result = enrich_abstracts(path, {})
+            self.assertEqual(result["updated"], 1)
+            with connect(path) as db:
+                row = db.execute("SELECT * FROM papers").fetchone()
+                self.assertEqual((row["eligibility_status"], row["publication_type_source"]), ("eligible", "publisher-official"))
+                evidence = json.loads(row["publication_type_evidence_json"])
+                self.assertTrue(any(e.get("source") == "openalex" and e.get("value") == "paratext" and e["kind"] == "metadata_conflict" for e in evidence))
+
+    def publication_review_fixture(self, root):
+        path = root / "papers.sqlite3"
+        self.add_paper(path, "doi:10.1287/mnsc.2024.05008")
+        title = "Index-Based Yield Protection for Smallholder Farmers"
+        with connect(path) as db:
+            db.execute("""UPDATE papers SET title=?,publication_type='Front/Back Matter',publication_type_raw='paratext',
+              publication_type_source='openalex',eligibility_status='excluded',exclusion_reason='前置或后置材料'""", (title,))
+        review = {"identity": "doi:10.1287/mnsc.2024.05008", "doi": "10.1287/mnsc.2024.05008", "title": title,
+                  "raw_type": "journal-article", "source": "publisher-official", "source_kind": "journal",
+                  "source_url": "https://pubsonline.informs.org/doi/10.1287/mnsc.2024.05008",
+                  "verified_at": "2026-10-09T05:40:00+00:00"}
+        return path, review
+
+    def test_reviewed_original_types_restore_through_backed_up_cleanup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path, review = self.publication_review_fixture(root)
+            preview = preview_cleanup(path, root, 0.70, publication_reviews=[review])
+            self.assertEqual(preview["planned"]["eligible"], 1)
+            with connect(path) as db:
+                self.assertEqual(db.execute("SELECT eligibility_status FROM papers").fetchone()[0], "excluded")
+            applied = apply_cleanup_preview(path, root, Path(preview["report_path"]))
+            with connect(path) as db:
+                row = db.execute("SELECT * FROM papers").fetchone()
+                self.assertEqual((row["publication_type_raw"], row["publication_type_source"], row["eligibility_status"], row["needs_rescreen"]),
+                                 ("journal-article", "publisher-official", "eligible", 1))
+                self.assertTrue(any(e["kind"] == "metadata_conflict" and e["value"] == "paratext" for e in json.loads(row["publication_type_evidence_json"])))
+            import sqlite3
+            with sqlite3.connect(applied["backup"]) as db:
+                self.assertEqual(db.execute("SELECT eligibility_status FROM papers").fetchone()[0], "excluded")
+            again = preview_cleanup(path, root, 0.70)
+            self.assertTrue(any(e["kind"] == "verified_record" for e in again["items"][0]["decision"]["evidence"]))
+
+    def test_cleanup_rejects_changed_or_unmatched_review_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path, review = self.publication_review_fixture(root)
+            with self.assertRaisesRegex(ValueError, "标题不匹配"):
+                preview_cleanup(path, root, 0.70, publication_reviews=[dict(review, title="Another paper")])
+            with self.assertRaisesRegex(ValueError, "身份不存在或重复"):
+                preview_cleanup(path, root, 0.70, publication_reviews=[review, review])
+            with self.assertRaisesRegex(ValueError, "原始证据"):
+                preview_cleanup(path, root, 0.70, publication_reviews=[dict(review, source="openalex")])
+            preview = preview_cleanup(path, root, 0.70, publication_reviews=[review])
+            changed = json.loads(Path(preview["report_path"]).read_text())
+            changed["publication_reviews"][0]["source_url"] = "https://publisher.example/changed"
+            Path(preview["report_path"]).write_text(json.dumps(changed))
+            with self.assertRaisesRegex(ValueError, "核查证据在预览后改变"):
+                apply_cleanup_preview(path, root, Path(preview["report_path"]))
 
     def test_specific_publisher_type_overrules_generic_crossref_article(self):
         result=publication_decision("A title","Journal","Correspondence","publisher-official","journal")

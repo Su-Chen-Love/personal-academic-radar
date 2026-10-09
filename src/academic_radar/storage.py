@@ -227,6 +227,8 @@ def database_status(path: Path) -> dict[str, object]:
 def backup_database(source: Path, output: Path) -> dict[str, object]:
     source = source.expanduser().resolve()
     output = output.expanduser().resolve()
+    if source == output:
+        raise ValueError("Backup source and output must differ")
     if not source.exists():
         raise FileNotFoundError(source)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -245,6 +247,9 @@ def backup_database(source: Path, output: Path) -> dict[str, object]:
         # while it is being checked, so do not force a read-only URI here.
         check = sqlite3.connect(temp)
         try:
+            # Backups are standalone snapshots. Checkpoint their transient
+            # WAL and use rollback mode before moving the main file.
+            check.execute("PRAGMA journal_mode=DELETE")
             integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
         finally:
             check.close()
@@ -259,6 +264,8 @@ def backup_database(source: Path, output: Path) -> dict[str, object]:
 def restore_database(backup: Path, destination: Path, replace: bool = False) -> dict[str, object]:
     backup = backup.expanduser().resolve()
     destination = destination.expanduser().resolve()
+    if backup == destination:
+        raise ValueError("Backup and restore destination must differ")
     if not backup.exists():
         raise FileNotFoundError(backup)
     check = sqlite3.connect(backup)
@@ -272,18 +279,24 @@ def restore_database(backup: Path, destination: Path, replace: bool = False) -> 
     if destination.exists():
         if not replace:
             raise FileExistsError("Destination exists; pass --replace to preserve and replace it")
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         preserved = destination.with_name(f"{destination.stem}.pre-restore-{stamp}{destination.suffix}")
         backup_database(destination, preserved)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp", dir=destination.parent)
-    os.close(fd)
-    temp = Path(temp_name)
+    # Replacing only the main file can replay the destination's old WAL over
+    # the restored snapshot, and existing readers would retain the old inode.
+    # SQLite's online backup replaces the database in one transaction while
+    # keeping its WAL and any live readers coherent.
+    source_db = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    destination_db = sqlite3.connect(destination, timeout=30)
     try:
-        shutil.copy2(backup, temp)
-        os.replace(temp, destination)
+        source_db.backup(destination_db)
+        restored_integrity = destination_db.execute("PRAGMA integrity_check").fetchone()[0]
+        if restored_integrity != "ok":
+            raise RuntimeError(f"Restored database integrity check failed: {restored_integrity}")
     finally:
-        temp.unlink(missing_ok=True)
+        destination_db.close()
+        source_db.close()
     return {
         "backup": str(backup),
         "database": str(destination),

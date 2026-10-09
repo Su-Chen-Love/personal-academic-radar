@@ -144,6 +144,9 @@ def parser() -> argparse.ArgumentParser:
     restart_service.add_argument("--port", default=8765, type=int)
     logs_service = service_commands.add_parser("logs")
     logs_service.add_argument("--config", required=True, type=Path)
+    sync_service = service_commands.add_parser("install-sync")
+    sync_service.add_argument("--config", required=True, type=Path)
+    sync_service.add_argument("--interval", type=int, default=300)
     service_commands.add_parser("uninstall-web")
 
     abstracts = groups.add_parser("abstracts", help="enrich, export, and import traceable abstracts")
@@ -152,6 +155,10 @@ def parser() -> argparse.ArgumentParser:
     enrich.add_argument("--config", required=True, type=Path)
     enrich.add_argument("--limit", type=int, default=500)
     enrich.add_argument("--retry", action="store_true")
+    provenance = abstract_commands.add_parser("verify-provenance")
+    provenance.add_argument("--config", required=True, type=Path)
+    provenance.add_argument("--limit", type=int, default=100)
+    provenance.add_argument("--budget", type=int, default=180)
     export_missing = abstract_commands.add_parser("export-missing")
     export_missing.add_argument("--config", required=True, type=Path)
     export_missing.add_argument("--output", required=True, type=Path)
@@ -189,12 +196,19 @@ def parser() -> argparse.ArgumentParser:
     cleanup_apply = cleanup_commands.add_parser("apply")
     cleanup_apply.add_argument("--config", required=True, type=Path)
     cleanup_apply.add_argument("--report", required=True, type=Path)
+    sync = groups.add_parser("sync", help="synchronize the opted-in Sites database")
+    sync.add_argument("--config", required=True, type=Path)
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.group == "sync":
+            from .cloud_sync import sync_configured
+            result = sync_configured(args.config)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if result.get("status") in {"succeeded", "unchanged", "disabled", "busy"} else 1
         if args.group == "init":
             result=init_installation(args.state,args.config)
             print(json.dumps(result,ensure_ascii=False,indent=2))
@@ -205,7 +219,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result,ensure_ascii=False,indent=2))
             return 0 if result.get("ok") else 1
         if args.group == "service":
-            if args.command == "install-web":
+            if args.command == "install-sync":
+                from .operations import install_sync_service
+                result = install_sync_service(args.config, args.interval)
+            elif args.command == "install-web":
                 result = install_web_service(args.config, port=args.port)
             elif args.command == "restart-web":
                 result = restart_web_service(args.config, args.port)
@@ -229,6 +246,9 @@ def main(argv: list[str] | None = None) -> int:
             cfg=load_config(args.config); state_dir=resolve_state(args.config,cfg); db_path=state_dir/"papers.sqlite3"
             if args.group=="abstracts":
                 if args.command=="enrich": result=enrich_abstracts(db_path,cfg,limit=args.limit,retry=args.retry)
+                elif args.command=="verify-provenance":
+                    from .provenance import verify_provenance
+                    result=verify_provenance(db_path,cfg,args.limit,args.budget)
                 elif args.command=="export-missing": result=export_missing_task_package(db_path,args.output)
                 else:
                     preview=preview_manual_import(db_path,args.file)

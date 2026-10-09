@@ -1,0 +1,12 @@
+import {createServer} from 'node:http';
+import {readFileSync} from 'node:fs';
+import worker from '../worker/index.js';
+import {database} from './d1-local.mjs';
+const DB=database(),generation='preview';
+if(!process.argv[2])throw new Error('Usage: node scripts/preview.mjs /absolute/path/to/private-records.json');
+const records=JSON.parse(readFileSync(process.argv[2],'utf8'));
+DB.sql.prepare('INSERT INTO pointers(key,value) VALUES(?,?)').run('active',generation);
+DB.sql.prepare('INSERT INTO pointers(key,value) VALUES(?,?)').run('synced_at',new Date().toISOString());
+for(const r of records)DB.sql.prepare('INSERT INTO records VALUES(?,?,?,?,?)').run(generation,r.kind,r.key,r.data,r.checksum);
+const env={DB,SYNC_TOKEN:'preview-only',OWNER_EMAIL:'preview-owner@example.test'};
+createServer(async(req,res)=>{try{const request=new Request('http://127.0.0.1:8776'+req.url,{method:req.method,headers:req.headers});const result=await worker.fetch(request,env);res.writeHead(result.status,Object.fromEntries(result.headers));res.end(Buffer.from(await result.arrayBuffer()));}catch(error){res.writeHead(500);res.end('Preview error');}}).listen(8776,'127.0.0.1',()=>console.log('Local: http://127.0.0.1:8776/library'));

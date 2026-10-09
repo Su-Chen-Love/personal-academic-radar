@@ -20,7 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 from .engagement import seed_active_profile
-from .governance import publication_decision
+from .governance import CORRECTION_TITLE_PATTERN, publication_decision
 from .storage import backup_database, connect, database_status, latest_schema_version, upgrade_database, utc_now
 
 
@@ -58,7 +58,7 @@ LOW_PRIORITY_PATTERNS = [
     (r"\beditorial\b", "editorial item"),
     (r"\beditors?'?\s+note\b", "editor note"),
     (r"\beditorial\s+board\b", "editorial board item"),
-    (r"\bcorrection\b|\berratum\b", "correction or erratum"),
+    (CORRECTION_TITLE_PATTERN, "correction or erratum"),
     (r"\bannouncement\b", "announcement"),
     (r"\bbook\s+review\b", "book review"),
     (r"\bcall\s+for\s+papers\b", "call for papers"),
@@ -189,7 +189,7 @@ def initialize_installation(state_dir: Path = DEFAULT_STATE_DIR, config_path: Pa
 
 
 def classify_low_priority(title: str, venue: str = "") -> tuple[bool, str]:
-    text = f"{title} {venue}".lower()
+    text = (title or "").lower()
     for pattern, reason in LOW_PRIORITY_PATTERNS:
         if re.search(pattern, text):
             return True, reason
@@ -205,7 +205,7 @@ def repair_product_metadata(db_path: Path) -> dict[str, int]:
     confidence_capped = 0
     try:
         paper_rows = database.execute(
-            "SELECT identity,title,venue,abstract,abstract_source,low_priority FROM papers"
+            "SELECT identity,title,venue,abstract,abstract_source,low_priority,low_priority_reason FROM papers"
         ).fetchall()
         with database:
             for paper in paper_rows:
@@ -213,12 +213,11 @@ def repair_product_metadata(db_path: Path) -> dict[str, int]:
                 if paper["abstract_source"] in {None, "", "unknown"}:
                     updates["abstract_source"] = "existing" if (paper["abstract"] or "").strip() else "missing"
                     abstract_sources += 1
-                if not paper["low_priority"]:
-                    is_low, reason = classify_low_priority(paper["title"], paper["venue"] or "")
-                    if is_low:
-                        updates["low_priority"] = 1
-                        updates["low_priority_reason"] = reason
-                        low_priority += 1
+                is_low, reason = classify_low_priority(paper["title"], paper["venue"] or "")
+                if bool(paper["low_priority"]) != is_low or (paper["low_priority_reason"] or "") != reason:
+                    updates["low_priority"] = int(is_low)
+                    updates["low_priority_reason"] = reason
+                    low_priority += 1
                 if updates:
                     assignments = ",".join(f"{column}=?" for column in updates)
                     database.execute(
@@ -631,6 +630,17 @@ def source_candidates(query: str, user_agent: str = "PersonalAcademicRadar/0.8")
     if not providers_ok:
         raise RuntimeError("Crossref 和 OpenAlex 当前都无法响应，请检查网络后重试")
     return list(candidates.values())[:8]
+
+
+def publication_date_label(value: str | None, precision: str = "unknown") -> str:
+    """Display only the granularity actually supplied by publication metadata."""
+    if not value:
+        return "日期未知"
+    if precision == "month":
+        return value[:7]
+    if precision == "year":
+        return value[:4]
+    return value
 
 
 def human_time(value: str | None) -> str:

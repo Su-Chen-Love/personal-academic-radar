@@ -1,0 +1,12 @@
+{
+  "name": "personal-academic-radar-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "validate": "node scripts/validate-artifact.mjs",
+    "db:generate": "drizzle-kit generate"
+  },
+  "dependencies": {"drizzle-orm": "^0.44.7"},
+  "devDependencies": {"drizzle-kit": "^0.31.5"}
+}

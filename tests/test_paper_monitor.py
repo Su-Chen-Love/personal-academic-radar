@@ -9,6 +9,48 @@ sys.modules[spec.name] = pm
 spec.loader.exec_module(pm)
 
 class MonitorTests(unittest.TestCase):
+    def test_partial_publication_dates_keep_precision_and_empty_updates_preserve_date(self):
+        for parts, expected in [([2026], ("2026-01-01", "year")), ([2026, 10], ("2026-10-01", "month")),
+                                ([2026, 10, 9], ("2026-10-09", "day"))]:
+            self.assertEqual(pm.date_parts_with_precision({"published-print": {"date-parts": [parts]}}), expected)
+        with tempfile.TemporaryDirectory() as td:
+            db = pm.db_open(Path(td) / "papers.sqlite3")
+            paper = pm.Paper("doi:10.1/date", "10.1/date", "Research title", "", "Journal", "2026-10-01", "", [], "Crossref",
+                             published_precision="month")
+            pm.upsert(db, paper, "before")
+            paper.published = ""; paper.published_precision = "unknown"
+            pm.upsert(db, paper, "after")
+            restored = pm.row_to_paper(db.execute("SELECT * FROM papers").fetchone())
+            self.assertEqual((restored.published, restored.published_precision), ("2026-10-01", "month"))
+            paper.published = "2026-10-09"; paper.published_precision = "day"
+            pm.upsert(db, paper, "latest")
+            restored = pm.row_to_paper(db.execute("SELECT * FROM papers").fetchone())
+            self.assertEqual((restored.published, restored.published_precision), ("2026-10-09", "day"))
+            db.close()
+
+    def test_openalex_paratext_cannot_overwrite_doi_deposit_and_crossref_can_repair_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = pm.db_open(Path(td) / "papers.sqlite3")
+            doi = "10.1287/mnsc.2024.05008"
+            title = "Index-Based Yield Protection for Smallholder Farmers"
+            registry = pm.Paper("doi:" + doi, doi, title, "", "Management Science", "2026-09-18", "", [], "Crossref",
+                                publication_type_raw="journal-article", publication_type_source="crossref")
+            pm.upsert(db, registry, "first")
+            weak = pm.Paper("doi:" + doi, doi, title, "", "Management Science", "2026-09-18", "", [], "OpenAlex",
+                            publication_type_raw="paratext", publication_type_source="openalex")
+            pm.upsert(db, weak, "second")
+            saved = db.execute("SELECT * FROM papers").fetchone()
+            self.assertEqual((saved["eligibility_status"], saved["publication_type_raw"], saved["publication_type_source"]),
+                             ("eligible", "journal-article", "crossref"))
+            self.assertTrue(any(e.get("source") == "openalex" and e.get("value") == "paratext" for e in json.loads(saved["publication_type_evidence_json"])))
+            db.execute("UPDATE papers SET publication_type_raw='paratext',publication_type_source='openalex',eligibility_status='excluded',publication_type='Front/Back Matter'")
+            repaired = pm.Paper("doi:" + doi, doi, title, "", "Management Science", "2026-09-18", "", [], "Crossref",
+                               publication_type_raw="journal-article", publication_type_source="crossref")
+            pm.upsert(db, repaired, "third")
+            saved = db.execute("SELECT * FROM papers").fetchone()
+            self.assertEqual((saved["eligibility_status"], saved["needs_rescreen"]), ("eligible", 1))
+            db.close()
+
     def test_generic_api_type_cannot_overwrite_official_comment(self):
         with tempfile.TemporaryDirectory() as td:
             db=pm.db_open(Path(td)/'papers.sqlite3')
@@ -49,6 +91,8 @@ class MonitorTests(unittest.TestCase):
             "matched_themes": ["interactive optimization"],
             "confidence": confidence,
             "recommendation_reason": "摘要显示研究通过人在回路的偏好表达推进候选方案迭代；其价值在于把交互式优化机制转成可复用的实验任务和过程指标，可迁移到车辆路径决策支持，但应用场景与外部效度仍需进一步核验。",
+            "recommendation_type": "core",
+            "evidence_anchors": [{"source":"abstract","quote":"Abstract","claim":"原始摘要为本次判断提供了可追溯的内容证据"}],
         }
 
     def test_doi_normalization_and_identity(self):
@@ -59,6 +103,39 @@ class MonitorTests(unittest.TestCase):
     def test_clean_structured_abstract(self):
         raw = "<jats:p>Preference &amp; routing</jats:p>\n  test"
         self.assertEqual(pm.clean_text(raw), "Preference & routing test")
+
+    def test_placeholder_abstract_cannot_block_real_enrichment(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=pm.db_open(Path(td)/"x.sqlite3")
+            paper=pm.Paper("doi:10.1/x","10.1/x","A","International audience","V","","",[],"s")
+            pm.upsert(db,paper,"before")
+            pending=pm.Paper("doi:10.1/x","10.1/x","A","","V","","",[],"s")
+            with patch.object(pm,"openalex_abstract",return_value="A real original abstract with study evidence") as lookup:
+                pm.enrich_missing_abstracts([pending],{},db)
+            lookup.assert_called_once()
+            self.assertEqual(pending.abstract,"A real original abstract with study evidence")
+            self.assertIn("api.openalex.org",pending.abstract_source_url)
+            pm.upsert(db,pending,"after")
+            saved=pm.row_to_paper(db.execute("SELECT * FROM papers").fetchone())
+            self.assertEqual(saved.abstract_source_url,pending.abstract_source_url)
+            self.assertEqual(db.execute("SELECT abstract_retrieved_at FROM papers").fetchone()[0],"after")
+            shorter=pm.Paper("doi:10.1/x","10.1/x","A","Short","V","","",[],"s",abstract_source_url="https://wrong.test")
+            pm.upsert(db,shorter,"later")
+            self.assertEqual(db.execute("SELECT abstract_source_url FROM papers").fetchone()[0],pending.abstract_source_url)
+            db.close()
+
+    def test_openalex_abstract_rejects_other_doi_and_placeholder(self):
+        for doi,text in [("10.1/other","Original evidence"),("10.1/x","International audience")]:
+            words={word:[index] for index,word in enumerate(text.split())}
+            with patch.object(pm,"request_json",return_value={"doi":doi,"abstract_inverted_index":words}):
+                self.assertEqual(pm.openalex_abstract("10.1/x",{}),"")
+
+    def test_duplicate_collection_preserves_original_abstract_source(self):
+        first=pm.Paper("doi:10.1/x","10.1/x","A","Original evidence","V","","",[],"s",abstract_source="crossref",abstract_source_url="https://api.crossref.org/works/x")
+        second=pm.Paper("doi:10.1/x","10.1/x","A","","V","","",[],"s")
+        pm.enrich_missing_abstracts([first,second],{})
+        self.assertEqual(second.abstract_source,"crossref")
+        self.assertEqual(second.abstract_source_url,first.abstract_source_url)
 
     def test_crossref_parsing_and_chi_filter(self):
         fixture = json.loads((Path(__file__).parent/"fixtures"/"crossref.json").read_text())
@@ -80,6 +157,51 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual([p.doi for p in papers],["10.1/a","10.1/b"])
         self.assertEqual(request.call_count,2)
         self.assertIn("cursor=next",request.call_args_list[1].args[0])
+
+    def test_truncated_collection_keeps_records_and_complete_checkpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=pm.db_open(Path(td)/"x.sqlite3")
+            pm.update_source_health(db,"V","healthy","2020-01-01T00:00:00+00:00")
+            payload={"message":{"items":[{"DOI":"10.1/a","title":["A"],"abstract":"Evidence"}],
+                                "next-cursor":"more","total-results":20}}
+            cfg={"collection":{"rows_per_page":1,"max_pages_per_source":1,"openalex_fallback":False},
+                 "sources":[{"name":"V","type":"crossref","issn":"1234"}]}
+            with patch.object(pm,"request_json",return_value=payload):
+                collected,new,failures=pm.collect_into_db(cfg,db,"2026-10-09T00:00:00+00:00","run")
+            self.assertEqual((len(collected),len(new)),(1,1))
+            self.assertEqual(failures[0]["status"],"degraded")
+            self.assertIn("page limit",failures[0]["error"])
+            self.assertEqual(db.execute("SELECT last_success_at FROM source_health").fetchone()[0],"2020-01-01T00:00:00+00:00")
+            db.close()
+
+    def test_disabled_or_unconfigured_source_cannot_be_healthy(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=pm.db_open(Path(td)/"x.sqlite3")
+            _,_,failures=pm.collect_into_db({"sources":[{"name":"V","type":"openalex"}]},db,"now","run")
+            self.assertEqual(failures[0]["status"],"failed")
+            self.assertEqual(db.execute("SELECT status FROM source_health").fetchone()[0],"failed")
+            db.close()
+
+    def test_primary_openalex_remains_enabled_when_fallback_is_disabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=pm.db_open(Path(td)/"x.sqlite3")
+            cfg={"collection":{"openalex_fallback":False},"sources":[{"name":"V","type":"openalex","openalex_id":"S1"}]}
+            with patch.object(pm,"openalex_collect",return_value=[]) as collect:
+                _,_,failures=pm.collect_into_db(cfg,db,"now","run")
+            collect.assert_called_once()
+            self.assertEqual(failures,[])
+            db.close()
+
+    def test_invalid_provider_payload_is_a_failure(self):
+        with patch.object(pm,"request_json",return_value={"message":{}}):
+            with self.assertRaises(pm.CollectionIncomplete):
+                pm.crossref_collect({"name":"V","type":"crossref","issn":"1234"},{},"2026-01-01")
+
+    def test_source_specific_limits_can_cover_large_conference_query(self):
+        source={"name":"V","type":"crossref","issn":"1234","rows_per_page":1000,"max_pages_per_source":5}
+        with patch.object(pm,"request_json",return_value={"message":{"items":[]}}) as request:
+            pm.crossref_collect(source,{"collection":{"rows_per_page":80}},"2026-01-01")
+        self.assertIn("rows=1000",request.call_args.args[0])
 
     def test_retry_honors_retry_after_then_succeeds(self):
         error=urllib.error.HTTPError("https://example.test",429,"limited",{"Retry-After":"0"},io.BytesIO())
@@ -295,7 +417,7 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual((row[0],row[1],row[2]),("codex-agent",1,0.88))
             self.assertIn("人在回路",row[3])
             self.assertNotIn("论文证据：",row[3])
-            self.assertEqual(row[4],"evidence-v2")
+            self.assertEqual(row[4],"evidence-v3")
             saved=dict(db.execute("SELECT * FROM recommendation_snapshots").fetchone())
             self.assertEqual((saved['run_id'],saved['score'],saved['reasons']),(run_id,row[2],row[3]))
             with db:
@@ -328,6 +450,48 @@ class MonitorTests(unittest.TestCase):
             with patch('builtins.print') as output:
                 pm.backfill_history(root/'config.toml')
             self.assertEqual(json.loads(output.call_args.args[0]),{'recovered':1,'unavailable':0})
+
+    def test_new_rubric_migration_is_bounded_and_resumes_after_import(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/"research-profile.md").write_text("profile")
+            config=root/"config.toml"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\nmax_candidates = 1\n[[sources]]\nname = "V"\ntype = "crossref"\nissn = "1234"\n')
+            db=pm.db_open(root/"papers.sqlite3")
+            phash=__import__("hashlib").sha256(b"profile").hexdigest()
+            for suffix,score in [("visible",.8),("low",.1)]:
+                paper=pm.Paper(f"doi:10.1/{suffix}",f"10.1/{suffix}",suffix,"Abstract","V","2026-01-01","",[],"s",
+                               publication_type_raw="journal-article",publication_type_source="crossref")
+                pm.upsert(db,paper,"now")
+                db.execute("INSERT INTO screenings(identity,profile_hash,provider,model,relevant,score,screened_at,rubric_version) VALUES(?,?,'codex-agent','old',?,?,?,'evidence-v2')",
+                           (paper.identity,phash,int(score>=.7),score,"before"))
+            db.execute("UPDATE papers SET needs_rescreen=0"); db.commit(); db.close()
+            with patch("builtins.print") as output:pm.agent_export(config,no_collect=True)
+            summary=json.loads(output.call_args.args[0]);queue=json.loads(Path(summary["queue_path"]).read_text())
+            self.assertEqual((summary["candidates"],summary["deferred_candidates"]),(1,1))
+            self.assertEqual(queue["papers"][0]["identity"],"doi:10.1/visible")
+            result_path=root/"results.json"
+            result_path.write_text(json.dumps({"run_id":queue["run_id"],"profile_hash":phash,"model":"test","results":[self.structured_result("doi:10.1/visible")]}))
+            with patch("academic_radar.cloud_sync.sync_configured",side_effect=RuntimeError("Cloud unavailable")),patch("builtins.print") as output:
+                self.assertEqual(pm.agent_import(config,result_path),1)
+            self.assertEqual(json.loads(output.call_args.args[0])["cloud_sync"]["status"],"failed")
+            db=pm.db_open(root/"papers.sqlite3")
+            self.assertEqual(db.execute("SELECT status FROM agent_jobs WHERE run_id=?",(queue["run_id"],)).fetchone()[0],"imported")
+            db.close()
+            with patch("builtins.print") as output:pm.agent_export(config,no_collect=True)
+            summary=json.loads(output.call_args.args[0]);queue=json.loads(Path(summary["queue_path"]).read_text())
+            self.assertEqual(queue["papers"][0]["identity"],"doi:10.1/low")
+            self.assertEqual(summary["deferred_candidates"],0)
+
+    def test_schema_four_does_not_get_mislabeled_as_new_rubric(self):
+        paper={"abstract":"Abstract","title":"Paper"}
+        item=self.structured_result("doi:10.1/x");item.pop("evidence_anchors");item.pop("recommendation_type")
+        result=pm.structured_judgment(item,paper,.7,4)
+        self.assertEqual(result["rubric_version"],"evidence-v2")
+
+    def test_schema_five_rejects_nonfinite_scores(self):
+        item=self.structured_result("doi:10.1/x");item["score_dimensions"]["core_relevance"]=float("nan")
+        with self.assertRaisesRegex(ValueError,"finite"):
+            pm.structured_judgment(item,{"abstract":"Abstract","title":"Paper"},.7,5)
 
     def test_agent_import_reports_all_shallow_results_without_writing_digest(self):
         with tempfile.TemporaryDirectory() as td:
@@ -444,8 +608,8 @@ class MonitorTests(unittest.TestCase):
             with patch("builtins.print") as output:
                 pm.agent_export(config,no_collect=True)
             summary=json.loads(output.call_args.args[0]); queue=json.loads(Path(summary["queue_path"]).read_text())
-            self.assertEqual(queue["schema_version"],4)
-            self.assertEqual(queue["evaluation_policy"]["rubric_version"],"evidence-v2")
+            self.assertEqual(queue["schema_version"],5)
+            self.assertEqual(queue["evaluation_policy"]["rubric_version"],"evidence-v3")
             self.assertIn("reasoning", queue["evaluation_policy"]["result_fields"])
             self.assertIn("recommendation_reason", queue["evaluation_policy"]["result_fields"])
             self.assertEqual(queue["evaluation_policy"]["minimum_reasoning_characters"]["limitations"],18)

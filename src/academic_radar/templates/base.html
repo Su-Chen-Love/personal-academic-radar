@@ -28,6 +28,10 @@
     <div class="sidebar-foot">
       <span class="pulse"></span> 本地私有数据
       <small>{{ state_path }}</small>
+      {% if cloud_url %}
+      <small><a href="{{ cloud_url }}" target="_blank" rel="noopener noreferrer">打开云端站点</a></small>
+      <small>{% if cloud_sync_status.status in ['succeeded','unchanged'] %}云端同步：{{ cloud_sync_status.synced_at|human_time }}{% elif cloud_sync_status.status == 'failed' %}云端同步失败，等待重试{% else %}云端等待同步{% endif %}</small>
+      {% endif %}
     </div>
   </aside>
   <main>

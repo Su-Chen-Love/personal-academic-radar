@@ -20,3 +20,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e '.[test]'
       - run: python -m unittest discover -s tests -v
+  cloud-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: node sites/scripts/test-worker.mjs

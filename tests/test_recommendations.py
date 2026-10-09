@@ -1,4 +1,5 @@
 import datetime as dt
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,9 +8,136 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from academic_radar.engagement import seed_active_profile
-from academic_radar.recommendations import recommendation_days, recommendations_on, snapshot_run
+from academic_radar.recommendations import (
+    SCREENING_RUBRIC_VERSION, calibrated_score, evaluation_policy,
+    recommendation_days, recommendations_on, snapshot_run,
+    unit_number, validate_judgment_evidence,
+)
 from academic_radar.storage import connect, load_migrations, upgrade_database
 from academic_radar.web import create_app
+
+
+class RecommendationQualityTests(unittest.TestCase):
+    def setUp(self):
+        self.paper = {
+            "title": "Preference-conditioned dispatching",
+            "abstract": (
+                "The policy receives a preference vector and calibrates its dispatch decisions. "
+                "Simulation improves preference matching, but no user study was conducted."
+            ),
+        }
+        self.item = {
+            "recommendation_type": "core",
+            "matched_themes": ["preference integration"],
+            "reasoning": {
+                "evidence_summary": "算法在仿真中接收偏好向量并校准调度决策，但没有进行用户实验。",
+                "profile_connection": "偏好直接进入搜索策略，与用户引导优化的机制一致。",
+                "transfer_value": "可测试偏好权重变化后路线策略的响应稳定性。",
+                "limitations": "仿真性能不能证明人的表达成本或人机联合收益。",
+            },
+            "evidence_anchors": [{
+                "source": "abstract",
+                "quote": "The policy receives a preference vector and calibrates its dispatch decisions.",
+                "claim": "原文支持偏好进入策略及输出校准这一机制，但不支持用户收益结论。",
+            }],
+        }
+        self.dimensions = {
+            "core_relevance": 1.0, "mechanism_alignment": 1.0,
+            "method_transfer": 1.0, "evidence_quality": 1.0,
+            "boundary_penalty": 0.0,
+        }
+
+    def test_anchors_preserve_exact_source_and_separate_proposed_transfer(self):
+        quality = validate_judgment_evidence(self.item, self.paper)
+        self.assertEqual(quality["recommendation_type"], "core")
+        self.assertEqual(quality["evidence_anchors"], self.item["evidence_anchors"])
+        self.assertNotIn("score", quality)
+
+    def test_invented_result_is_rejected_even_when_relevance_dimensions_are_high(self):
+        self.item["evidence_anchors"][0]["quote"] = "A user study of 48 people improved joint decision quality."
+        with self.assertRaisesRegex(ValueError, "not present"):
+            validate_judgment_evidence(self.item, self.paper)
+
+    def test_formatted_publisher_excerpt_matches_without_paraphrase(self):
+        self.paper["abstract"] = "<jats:p>The policy receives a preference\u00a0vector &amp; calibrates dispatch decisions.</jats:p>"
+        self.item["evidence_anchors"][0]["quote"] = "The policy receives a preference vector & calibrates dispatch decisions."
+        self.assertEqual(len(validate_judgment_evidence(self.item, self.paper)["evidence_anchors"]), 1)
+        self.item["evidence_anchors"][0]["quote"] = "The policy receives user feedback & calibrates dispatch decisions."
+        with self.assertRaisesRegex(ValueError, "not present"):
+            validate_judgment_evidence(self.item, self.paper)
+
+    def test_title_only_cannot_ignore_an_available_abstract(self):
+        self.item["evidence_anchors"][0].update(source="title", quote=self.paper["title"])
+        with self.assertRaisesRegex(ValueError, "available abstract"):
+            validate_judgment_evidence(self.item, self.paper)
+        self.paper["abstract"] = ""
+        self.assertEqual(validate_judgment_evidence(self.item, self.paper)["evidence_anchors"][0]["source"], "title")
+        self.assertLess(calibrated_score(self.dimensions, "core", abstract_missing=True), .70)
+
+    def test_duplicate_trivial_and_unattributed_anchors_are_rejected(self):
+        for mutation, message in (
+            (lambda item: item["evidence_anchors"].append(copy.deepcopy(item["evidence_anchors"][0])), "duplicate"),
+            (lambda item: item["evidence_anchors"][0].update(quote="policy"), "too short"),
+            (lambda item: item["evidence_anchors"][0].update(source="model-summary"), "source"),
+            (lambda item: item["evidence_anchors"][0].update(claim="有价值"), "substantive"),
+            (lambda item: item.update(evidence_anchors=[]), "1 to 3"),
+        ):
+            with self.subTest(message=message):
+                item = copy.deepcopy(self.item)
+                mutation(item)
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_judgment_evidence(item, self.paper)
+
+    def test_core_and_method_transfer_require_a_named_profile_theme(self):
+        for kind in ("core", "method_transfer"):
+            for themes in ([], [" "], None, "preference"):
+                with self.subTest(kind=kind, themes=themes):
+                    self.item.update(recommendation_type=kind, matched_themes=themes)
+                    with self.assertRaisesRegex(ValueError, "named matched theme"):
+                        validate_judgment_evidence(self.item, self.paper)
+        self.item.update(recommendation_type="outside", matched_themes=[])
+        self.assertEqual(validate_judgment_evidence(self.item, self.paper)["recommendation_type"], "outside")
+
+    def test_copying_one_audit_sentence_into_every_field_is_rejected(self):
+        self.item["reasoning"] = dict.fromkeys(self.item["reasoning"], "论文与当前研究主题有联系，具备一定的参考价值和迁移潜力。")
+        with self.assertRaisesRegex(ValueError, "distinct evidence"):
+            validate_judgment_evidence(self.item, self.paper)
+
+    def test_relationship_class_prevents_adjacent_or_method_only_score_inflation(self):
+        expected = {"core": 1.0, "method_transfer": .84, "adjacent": .69, "outside": .29}
+        for kind, cap in expected.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(calibrated_score(self.dimensions, kind), cap)
+        self.dimensions.update(core_relevance=.9, mechanism_alignment=.8,
+                               method_transfer=.7, evidence_quality=.6, boundary_penalty=.2)
+        self.assertEqual(calibrated_score(self.dimensions, "core"), .72)
+        self.assertEqual(calibrated_score(self.dimensions, "method_transfer"), .72)
+        self.assertEqual(calibrated_score(self.dimensions, "adjacent"), .69)
+
+    def test_numbers_reject_non_finite_overflow_boolean_strings_and_out_of_range(self):
+        for value in (float("nan"), float("inf"), -float("inf"), 10**1000,
+                      True, False, "0.9", None, -.01, 1.01):
+            with self.subTest(value=repr(value)[:32]):
+                with self.assertRaises(ValueError):
+                    unit_number(value, "confidence")
+                self.dimensions["evidence_quality"] = value
+                with self.assertRaises(ValueError):
+                    calibrated_score(self.dimensions, "core")
+        self.assertEqual(unit_number(0, "confidence"), 0.0)
+        self.assertEqual(unit_number(1, "confidence"), 1.0)
+
+    def test_queue_policy_is_fresh_and_carries_executable_and_semantic_rules(self):
+        first = evaluation_policy()
+        self.assertEqual(first["rubric_version"], SCREENING_RUBRIC_VERSION)
+        self.assertIn("evidence_anchors", first["result_fields"])
+        self.assertIn("recommendation_type", first["result_fields"])
+        self.assertEqual(first["score_caps"]["method_transfer"], .84)
+        self.assertTrue(any("non-significant" in rule for rule in first["requirements"]))
+        first["score_caps"]["method_transfer"] = 1
+        first["minimum_reasoning_characters"]["limitations"] = 1
+        second = evaluation_policy()
+        self.assertEqual(second["score_caps"]["method_transfer"], .84)
+        self.assertEqual(second["minimum_reasoning_characters"]["limitations"], 18)
 
 
 class RecommendationHistoryTests(unittest.TestCase):
@@ -23,7 +151,7 @@ class RecommendationHistoryTests(unittest.TestCase):
         (self.root / 'research-profile.md').write_text('profile')
         # Exercise the real upgrade path with historical data already present.
         migrations = load_migrations()
-        with patch('academic_radar.storage.load_migrations', return_value=migrations[:-1]):
+        with patch('academic_radar.storage.load_migrations', return_value=[m for m in migrations if m.version < 14]):
             upgrade_database(self.path)
             self.profile = seed_active_profile(self.path, 'profile')
         self.db = connect(self.path)

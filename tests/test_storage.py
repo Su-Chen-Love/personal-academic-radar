@@ -16,9 +16,137 @@ from academic_radar.storage import (
     restore_database,
     upgrade_database,
 )
+from academic_radar.governance import apply_cleanup_preview, preview_cleanup
 
 
 class StorageTests(unittest.TestCase):
+    def cleanup_fixture(self, root):
+        path = root / "papers.sqlite3"
+        upgrade_database(path)
+        db = sqlite3.connect(path)
+        with db:
+            db.execute("""INSERT INTO papers(
+              identity,doi,title,venue,first_seen,updated_at,publication_type_raw,publication_type_source
+              ) VALUES('doi:10.1/x','10.1/x','A research paper','Journal','now','now','journal-article','crossref')""")
+        db.close()
+        return path
+
+    def test_cleanup_rejects_changed_paper_and_preserves_feedback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = self.cleanup_fixture(root)
+            preview = preview_cleanup(db_path, root, 0.70)
+            db = sqlite3.connect(db_path)
+            with db:
+                db.execute("UPDATE papers SET title='Editorial Board'")
+                db.execute("""INSERT INTO paper_feedback(identity,favorite,created_at,updated_at)
+                  VALUES('doi:10.1/x',1,'now','now')""")
+            db.close()
+
+            with self.assertRaisesRegex(ValueError, "预览后改变"):
+                apply_cleanup_preview(db_path, root, Path(preview["report_path"]))
+
+            db = sqlite3.connect(db_path)
+            self.assertEqual(db.execute("SELECT title,eligibility_status FROM papers").fetchone(),
+                             ("Editorial Board", "quarantine"))
+            self.assertEqual(db.execute("SELECT favorite FROM paper_feedback").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT status FROM cleanup_audits").fetchone()[0], "preview")
+            db.close()
+
+    def test_cleanup_rejects_other_database_and_replaced_backup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = self.cleanup_fixture(root)
+            preview = preview_cleanup(db_path, root, 0.70)
+            other = root / "other.sqlite3"
+            upgrade_database(other)
+            with self.assertRaisesRegex(ValueError, "其他数据库"):
+                apply_cleanup_preview(other, root, Path(preview["report_path"]))
+            backup_database(other, Path(preview["backup"]))
+            with self.assertRaisesRegex(ValueError, "备份与预览快照不一致"):
+                apply_cleanup_preview(db_path, root, Path(preview["report_path"]))
+
+    def test_cleanup_rejects_tampered_decision_and_duplicate_items(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = self.cleanup_fixture(root)
+            preview = preview_cleanup(db_path, root, 0.70)
+            report_path = Path(preview["report_path"])
+            for altered in (
+                [dict(preview["items"][0], decision={"publication_type": "Editorial", "eligibility_status": "excluded"})],
+                preview["items"] * 2,
+            ):
+                payload = dict(preview, items=altered)
+                report_path.write_text(json.dumps(payload))
+                with self.assertRaisesRegex(ValueError, "清洗决策"):
+                    apply_cleanup_preview(db_path, root, report_path)
+            db = sqlite3.connect(db_path)
+            self.assertEqual(db.execute("SELECT eligibility_status FROM papers").fetchone()[0], "quarantine")
+            db.close()
+
+    def test_cleanup_marks_changed_governance_for_rescreen_and_cannot_reapply(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = self.cleanup_fixture(root)
+            preview = preview_cleanup(db_path, root, 0.70)
+            db = sqlite3.connect(db_path)
+            with db:
+                db.execute("""INSERT INTO paper_feedback(identity,favorite,created_at,updated_at)
+                  VALUES('doi:10.1/x',1,'now','now')""")
+            db.close()
+            applied = apply_cleanup_preview(db_path, root, Path(preview["report_path"]))
+            db = sqlite3.connect(db_path)
+            self.assertEqual(db.execute("SELECT eligibility_status,needs_rescreen FROM papers").fetchone(),
+                             ("eligible", 1))
+            self.assertEqual(db.execute("SELECT favorite FROM paper_feedback").fetchone()[0], 1)
+            db.close()
+            backup = sqlite3.connect(applied["backup"])
+            self.assertEqual(backup.execute("SELECT favorite FROM paper_feedback").fetchone()[0], 1)
+            self.assertEqual(backup.execute("SELECT eligibility_status FROM papers").fetchone()[0], "quarantine")
+            backup.close()
+            with self.assertRaisesRegex(ValueError, "已经应用"):
+                apply_cleanup_preview(db_path, root, Path(preview["report_path"]))
+
+    def test_backup_and_restore_reject_same_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "papers.sqlite3"
+            upgrade_database(path)
+            with self.assertRaisesRegex(ValueError, "must differ"):
+                backup_database(path, path)
+            with self.assertRaisesRegex(ValueError, "must differ"):
+                restore_database(path, path, replace=True)
+            self.assertEqual(database_status(path)["integrity"], "ok")
+
+    def test_restore_replaces_committed_wal_and_live_readers_see_restored_data(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.sqlite3"
+            upgrade_database(source)
+            db = sqlite3.connect(source)
+            with db:
+                db.execute("INSERT INTO meta VALUES('marker','backup')")
+            db.close()
+            snapshot = root / "backup.sqlite3"
+            backup_database(source, snapshot)
+            destination = root / "destination.sqlite3"
+            upgrade_database(destination)
+            live = sqlite3.connect(destination)
+            live.execute("PRAGMA journal_mode=WAL")
+            live.execute("PRAGMA wal_autocheckpoint=0")
+            with live:
+                live.execute("INSERT INTO meta VALUES('marker','newer destination')")
+            self.assertGreater(destination.with_name(destination.name + "-wal").stat().st_size, 0)
+
+            result = restore_database(snapshot, destination, replace=True)
+
+            self.assertEqual(live.execute("SELECT value FROM meta WHERE key='marker'").fetchone()[0], "backup")
+            preserved = sqlite3.connect(result["preserved_previous"])
+            self.assertEqual(preserved.execute("SELECT value FROM meta WHERE key='marker'").fetchone()[0],
+                             "newer destination")
+            preserved.close()
+            live.close()
+            self.assertEqual(database_status(destination)["integrity"], "ok")
+
     def test_upgrade_is_idempotent_and_creates_product_tables(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "papers.sqlite3"

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import re
+import sqlite3
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -44,12 +46,14 @@ RAW_TYPE_MAP = {
     "proceedings": ("Front/Back Matter", "excluded", "整本会议录"),
 }
 
+CORRECTION_TITLE_PATTERN = r"^\s*(?:corrigendum|erratum)\b|^\s*(?:(?:author|publisher)\s+)?correction(?:\s*$|\s*[:\-–—]|\s+to\b)"
+
 NEGATIVE_TITLE_RULES = [
     (r"(?:^|[;:\-–—]\s*)\s*(editorial\s+board|editorial|editor['’]s?\s+note)\b", "Editorial", "编辑性内容"),
     (r"\bextended\s+abstracts?\b", "Extended Abstract", "扩展摘要"),
-    (r"^\s*(corrigendum|correction|erratum)\b", "Correction", "更正或勘误"),
+    (CORRECTION_TITLE_PATTERN, "Correction", "更正或勘误"),
     (r"^\s*(letter\s+to\s+the\s+editor|comment\s+on)\b", "Letter", "来信或评论"),
-    (r"\b(?:a\s+)?commentary\s+on\b", "Comment", "评论性内容"),
+    (r"(?:^|[;:\-–—]\s*)\s*(?:a\s+)?commentary\s+on\b", "Comment", "评论性内容"),
     (r"^\s*(news|announcement)\b", "News", "新闻或公告"),
     (r"\bbook\s+review\b", "Book Review", "书评"),
     (r"\bcall\s+for\s+papers\b", "Call for Papers", "征稿通知"),
@@ -72,7 +76,7 @@ def publication_decision(
         evidence.append({"kind": "metadata_type", "source": source_name or "metadata", "value": raw_type})
 
     negative = None
-    combined = f"{title} {venue}".strip()
+    combined = (title or "").strip()
     for pattern, normalized, reason in NEGATIVE_TITLE_RULES:
         if re.search(pattern, combined, flags=re.IGNORECASE):
             negative = (normalized, reason, pattern)
@@ -125,6 +129,31 @@ def publication_decision(
     }
 
 
+def should_preserve_publication_metadata(
+    prior_source: str,
+    prior_status: str,
+    incoming_source: str,
+    incoming_status: str,
+) -> bool:
+    """Keep stronger type evidence without freezing an erroneous exclusion.
+
+    Publisher classifications are more specific than registry article types.
+    Crossref's DOI deposit takes precedence over OpenAlex's inferred type.
+    Equal or stronger new evidence may correct an old excluded classification.
+    """
+
+    if prior_status == "quarantine":
+        return False
+    if incoming_status == "quarantine":
+        return True
+    prior = (prior_source or "").strip().lower()
+    incoming = (incoming_source or "").strip().lower()
+    publisher_sources = {"publisher-official", "elsevier-official-api", "publisher-deposited-metadata"}
+    if prior in publisher_sources and incoming not in publisher_sources:
+        return True
+    return prior == "crossref" and incoming == "openalex"
+
+
 def latest_scores_sql() -> str:
     return """SELECT * FROM (
       SELECT s.*,ROW_NUMBER() OVER(PARTITION BY s.identity ORDER BY s.screened_at DESC,s.rowid DESC) rn
@@ -145,6 +174,106 @@ def source_kind_from_evidence(value: str) -> str:
         if isinstance(item, dict) and item.get("kind") == "source_type":
             return str(item.get("value") or "")
     return ""
+
+
+def _cleanup_snapshot(db: sqlite3.Connection) -> tuple[list[dict[str, Any]], str]:
+    """Bind a preview to all paper data, including user-supplied abstracts."""
+
+    papers = [dict(row) for row in db.execute("SELECT * FROM papers ORDER BY identity")]
+    payload = json.dumps(papers, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return papers, hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _review_fingerprint(reviews: list[dict[str, Any]]) -> str:
+    payload = json.dumps(reviews, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cleanup_items(
+    papers: list[dict[str, Any]],
+    publication_reviews: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Apply explicitly reviewed records; never infer types from abstracts."""
+
+    by_identity = {paper["identity"]: paper for paper in papers}
+    reviews: dict[str, dict[str, Any]] = {}
+    for review in publication_reviews or []:
+        if not isinstance(review, dict):
+            raise ValueError("出版类型核查记录必须为对象")
+        identity = review.get("identity")
+        paper = by_identity.get(identity)
+        if not paper or identity in reviews:
+            raise ValueError("出版类型核查记录身份不存在或重复")
+        if review.get("doi") != paper["doi"] or review.get("title") != paper["title"]:
+            raise ValueError("出版类型核查记录的 DOI 或标题不匹配")
+        if review.get("source") not in {"crossref", "publisher-official"}:
+            raise ValueError("出版类型核查须使用 Crossref 或出版商原始证据")
+        source_url = str(review.get("source_url") or "")
+        if not re.match(r"^https://[^/\s?#]+/", source_url):
+            raise ValueError("出版类型核查缺少原始 HTTPS 来源地址")
+        try:
+            verified_at = dt.datetime.fromisoformat(str(review.get("verified_at") or ""))
+            if verified_at.tzinfo is None:
+                raise ValueError
+        except ValueError:
+            raise ValueError("出版类型核查缺少有时区的核验时间") from None
+        reviewed = publication_decision(
+            paper["title"], paper["venue"] or "", str(review.get("raw_type") or ""),
+            review["source"], str(review.get("source_kind") or ""),
+        )
+        if reviewed["eligibility_status"] != "eligible":
+            raise ValueError("出版类型恢复证据未确认合格研究条目")
+        reviews[identity] = review
+
+    items = []
+    for paper in papers:
+        raw_type = paper["publication_type_raw"] or ""
+        source = paper["publication_type_source"] or ""
+        kind = source_kind_from_evidence(paper["publication_type_evidence_json"])
+        review = reviews.get(paper["identity"])
+        if review:
+            raw_type, source = review["raw_type"], review["source"]
+            kind = str(review.get("source_kind") or "")
+        decision = publication_decision(paper["title"], paper["venue"] or "", raw_type, source, kind)
+        if review:
+            decision["evidence"].extend([
+                {"kind": "metadata_conflict", "source": paper["publication_type_source"] or "metadata",
+                 "value": paper["publication_type_raw"] or "", "prior_status": paper["eligibility_status"]},
+                {"kind": "verified_record", "source": source, "value": raw_type,
+                 "source_url": review["source_url"], "verified_at": review["verified_at"]},
+            ])
+        else:
+            # Source conflicts remain part of the audit on later cleanups.
+            try:
+                evidence = json.loads(paper["publication_type_evidence_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                evidence = []
+            if isinstance(evidence, list):
+                decision["evidence"].extend(item for item in evidence if isinstance(item, dict)
+                                            and item.get("kind") in {"metadata_conflict", "verified_record"})
+        items.append({
+            "identity": paper["identity"], "doi": paper["doi"] or "",
+            "publication_type_raw": raw_type, "publication_type_source": source,
+            "decision": decision,
+        })
+    return items
+
+
+def _verified_cleanup_backup(path: Path) -> str:
+    path = path.expanduser().resolve()
+    wal = path.with_name(path.name + "-wal")
+    # Older backups retain a WAL-mode header but are complete single-file
+    # snapshots. Immutable reading avoids requiring writable sidecars for
+    # those archives; a populated WAL must still be read normally.
+    suffix = "?mode=ro" if wal.exists() and wal.stat().st_size else "?mode=ro&immutable=1"
+    check = sqlite3.connect(path.as_uri() + suffix, uri=True)
+    check.row_factory = sqlite3.Row
+    try:
+        if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError("清洗备份完整性检查失败")
+        return _cleanup_snapshot(check)[1]
+    finally:
+        check.close()
 
 
 def governance_stats(db_path: Path, threshold: float = 0.70) -> dict[str, Any]:
@@ -241,39 +370,36 @@ def preview_cleanup(
     state_dir: Path,
     threshold: float,
     backup_path: Path | None = None,
+    publication_reviews: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create a non-mutating cleanup preview tied to a verified online backup."""
+    """Preview changes without editing papers and record a recoverable audit."""
 
     state = state_dir.expanduser().resolve()
     audit_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     backup = backup_path or state / "backups" / f"cleanup-{audit_id}.sqlite3"
     if not backup.exists():
         backup_database(db_path, backup)
+    backup_fingerprint = _verified_cleanup_backup(backup)
     before = governance_stats(db_path, threshold)
     db = connect(db_path)
     try:
-        items = []
+        papers, fingerprint = _cleanup_snapshot(db)
+        if fingerprint != backup_fingerprint:
+            raise ValueError("清洗备份与当前论文数据不一致，请重新创建备份和预览")
+        reviews = publication_reviews or []
+        items = _cleanup_items(papers, reviews)
         reason_counts: Counter[str] = Counter()
-        for paper in db.execute(
-            """SELECT identity,doi,title,venue,publication_type_raw,publication_type_source,
-            publication_type_evidence_json FROM papers ORDER BY identity"""
-        ):
-            decision = publication_decision(
-                paper["title"], paper["venue"] or "", paper["publication_type_raw"] or "",
-                paper["publication_type_source"] or "",
-                source_kind_from_evidence(paper["publication_type_evidence_json"]),
-            )
+        for item in items:
+            decision = item["decision"]
             if decision["eligibility_status"] != "eligible":
                 reason_counts[decision["exclusion_reason"] or "未分类"] += 1
-            items.append({
-                "identity": paper["identity"],
-                "doi": paper["doi"] or "",
-                "decision": decision,
-            })
         report = {
             "audit_id": audit_id,
             "created_at": utc_now(),
             "status": "preview",
+            "snapshot_version": 1,
+            "paper_fingerprint": fingerprint,
+            "publication_reviews": reviews,
             "database": str(db_path.expanduser().resolve()),
             "backup": str(backup.expanduser().resolve()),
             "integrity": "ok",
@@ -301,7 +427,9 @@ def preview_cleanup(
                 """INSERT INTO cleanup_audits(
                 audit_id,status,backup_path,report_path,before_json,created_at
                 ) VALUES(?,?,?,?,?,?)""",
-                (audit_id, "preview", str(backup), str(report_path), json.dumps(before, ensure_ascii=False), report["created_at"]),
+                (audit_id, "preview", str(backup), str(report_path),
+                 json.dumps(dict(before, _publication_reviews_fingerprint=_review_fingerprint(reviews)), ensure_ascii=False),
+                 report["created_at"]),
             )
     finally:
         db.close()
@@ -312,33 +440,66 @@ def apply_cleanup_preview(db_path: Path, state_dir: Path, report_path: Path) -> 
     report = json.loads(report_path.expanduser().read_text(encoding="utf-8"))
     if report.get("status") != "preview":
         raise ValueError("清洗报告不是可应用的预览")
+    if report.get("snapshot_version") != 1 or not report.get("paper_fingerprint"):
+        raise ValueError("清洗预览缺少快照校验，请重新生成预览")
+    if Path(report["database"]).expanduser().resolve() != db_path.expanduser().resolve():
+        raise ValueError("清洗预览属于其他数据库")
     backup = Path(report["backup"])
     if not backup.exists():
         raise FileNotFoundError("清洗预览对应的备份不存在")
-    check = connect(backup)
-    try:
-        if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise RuntimeError("清洗备份完整性检查失败")
-    finally:
-        check.close()
+    if _verified_cleanup_backup(backup) != report["paper_fingerprint"]:
+        raise ValueError("清洗备份与预览快照不一致")
     db = connect(db_path)
     try:
         with db:
+            db.execute("BEGIN IMMEDIATE")
+            audit = db.execute(
+                "SELECT status,backup_path,before_json FROM cleanup_audits WHERE audit_id=?",
+                (report["audit_id"],),
+            ).fetchone()
+            if not audit or audit["status"] != "preview":
+                raise ValueError("清洗预览不存在或已经应用，请重新生成预览")
+            if Path(audit["backup_path"]).expanduser().resolve() != backup.expanduser().resolve():
+                raise ValueError("清洗预览与审计记录的备份不一致")
+            reviews = report.get("publication_reviews", [])
+            audit_review_hash = json.loads(audit["before_json"]).get("_publication_reviews_fingerprint")
+            if audit_review_hash != _review_fingerprint(reviews) and (audit_review_hash or reviews):
+                raise ValueError("出版类型核查证据在预览后改变，请重新生成预览")
+            papers, fingerprint = _cleanup_snapshot(db)
+            if fingerprint != report["paper_fingerprint"]:
+                raise ValueError("论文数据已在预览后改变，请重新生成清洗预览")
+            if report["items"] != _cleanup_items(papers, reviews):
+                raise ValueError("清洗决策与当前规则不一致，请重新生成预览")
+            # Feedback and other private history can change without editing
+            # papers. Preserve their latest state immediately before applying.
+            apply_backup = Path(state_dir).expanduser().resolve() / "backups" / f"pre-cleanup-apply-{report['audit_id']}.sqlite3"
+            backup_database(db_path, apply_backup)
+            report["preview_backup"] = str(backup.expanduser().resolve())
+            report["backup"] = str(apply_backup)
+            report["restore"] = f"academic-radar db restore --backup {apply_backup} --db {db_path} --replace"
+            previous = {paper["identity"]: paper for paper in papers}
+            applied_at = utc_now()
             for item in report["items"]:
                 decision = item["decision"]
+                prior = previous[item["identity"]]
+                changed = any(prior[key] != decision[key] for key in (
+                    "publication_type", "eligibility_status", "exclusion_reason",
+                )) or any(prior[key] != item[key] for key in ("publication_type_raw", "publication_type_source"))
                 db.execute(
                     """UPDATE papers SET publication_type=?,eligibility_status=?,exclusion_reason=?,
-                    publication_type_evidence_json=? WHERE identity=?""",
+                    publication_type_evidence_json=?,publication_type_raw=?,publication_type_source=?,
+                    needs_rescreen=CASE WHEN ? THEN 1 ELSE needs_rescreen END,
+                    updated_at=CASE WHEN ? THEN ? ELSE updated_at END WHERE identity=?""",
                     (
                         decision["publication_type"], decision["eligibility_status"],
                         decision.get("exclusion_reason"), json.dumps(decision.get("evidence", []), ensure_ascii=False),
-                        item["identity"],
+                        item["publication_type_raw"], item["publication_type_source"],
+                        changed, changed, applied_at, item["identity"],
                     ),
                 )
-            applied_at = utc_now()
             db.execute(
-                "UPDATE cleanup_audits SET status='applied',applied_at=? WHERE audit_id=? AND status='preview'",
-                (applied_at, report["audit_id"]),
+                "UPDATE cleanup_audits SET status='applied',applied_at=?,backup_path=? WHERE audit_id=? AND status='preview'",
+                (applied_at, str(apply_backup), report["audit_id"]),
             )
     finally:
         db.close()
