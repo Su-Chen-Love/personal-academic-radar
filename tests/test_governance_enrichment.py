@@ -30,6 +30,11 @@ from academic_radar.storage import connect, upgrade_database, utc_now
 
 
 class GovernanceEnrichmentTests(unittest.TestCase):
+    def test_memorial_with_life_dates_is_excluded_without_excluding_memory_research(self):
+        decision = publication_decision("In memory of Professor Colin Laurence Eden, 1943-2026", raw_type="journal-article")
+        self.assertEqual((decision["eligibility_status"], decision["publication_type"]), ("excluded", "Memorial"))
+        self.assertEqual(publication_decision("In memory of past choices: human decision making", raw_type="journal-article")["eligibility_status"], "eligible")
+
     def test_placeholder_abstract_is_not_original_evidence(self):
         self.assertEqual(clean_abstract("<p>International audience</p>"),"")
         self.assertEqual(clean_abstract("No abstract available"),"")

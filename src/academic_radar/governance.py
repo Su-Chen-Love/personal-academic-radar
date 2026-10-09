@@ -58,6 +58,7 @@ NEGATIVE_TITLE_RULES = [
     (r"\bbook\s+review\b", "Book Review", "书评"),
     (r"\bcall\s+for\s+papers\b", "Call for Papers", "征稿通知"),
     (r"^\s*(front\s+matter|back\s+matter)\b", "Front/Back Matter", "前置或后置材料"),
+    (r"^\s*in\s+memoriam\b|^\s*in\s+memory\s+of\s+.+\b(?:18|19|20)\d{2}\s*[-–—]\s*(?:19|20)\d{2}\s*$", "Memorial", "纪念或悼念材料"),
 ]
 
 
