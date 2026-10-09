@@ -365,6 +365,29 @@ class WebTests(unittest.TestCase):
             self.assertIn("A useful paper", after.text)
             self.assertIn("A useful paper", all_reading.text)
 
+    def test_library_uses_latest_host_judgment_with_a_stable_timestamp_tie(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            with connect(db_path) as db:
+                db.execute("""INSERT INTO screenings(identity,profile_hash,provider,model,relevant,score,reasons,
+                  themes_json,confidence,screened_at,profile_version_id,feedback_snapshot_json,run_id)
+                  SELECT identity,profile_hash,'external','foreign',1,.99,'Foreign result',themes_json,confidence,
+                  '2026-07-14T08:00:00+00:00',profile_version_id,feedback_snapshot_json,'foreign-run'
+                  FROM screenings LIMIT 1""")
+            with TestClient(app) as client:
+                page = client.get("/library")
+                self.assertEqual(page.context['papers'][0]['reasons'], 'Direct match')
+                with connect(db_path) as db:
+                    db.execute("""INSERT INTO screenings(identity,profile_hash,provider,model,relevant,score,reasons,
+                      themes_json,confidence,screened_at,profile_version_id,feedback_snapshot_json,run_id)
+                      SELECT identity,profile_hash,'codex-agent','tie',1,.745,'Latest tied host result',themes_json,confidence,
+                      screened_at,profile_version_id,feedback_snapshot_json,'tied-run'
+                      FROM screenings WHERE provider='codex-agent' LIMIT 1""")
+                page = client.get("/library")
+            self.assertEqual(page.context['papers'][0]['reasons'], 'Latest tied host result')
+            self.assertEqual(page.context['papers'][0]['score'], .745)
+            self.assertIn('<strong>75</strong>', page.text)
+
     def test_manual_paper_addition_is_simple_deduplicated_and_queued(self):
         with tempfile.TemporaryDirectory() as td:
             app, db_path, _ = self.make_app(Path(td))

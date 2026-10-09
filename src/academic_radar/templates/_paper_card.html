@@ -2,7 +2,7 @@
 {% set paper_anchor = anchor_prefix ~ 'paper-' ~ paper.identity|replace(':','-')|replace('/','-')|replace('.','-') %}
 <article class="paper-card" id="{{ paper_anchor }}" data-interest="{{ paper.interest or '' }}" data-paper-identity="{{ paper.identity }}">
   <div class="paper-score">
-    {% if paper.score is not none %}<strong>{{ "%.0f"|format(paper.score * 100) }}</strong><span>匹配度</span>{% else %}<strong>—</strong><span>待判断</span>{% endif %}
+    {% if paper.score is not none %}<strong>{{ (paper.score * 100 + 0.5)|int }}</strong><span>匹配度</span>{% else %}<strong>—</strong><span>待判断</span>{% endif %}
   </div>
   <div class="paper-body">
     <div class="eyebrow"><span>{{ paper.venue or '未知来源' }}</span><time>{{ paper.published|publication_date(paper.published_precision|default('unknown')) }}</time></div>
@@ -12,7 +12,7 @@
     <div class="paper-tags">
       {% if paper.publication_type %}<span class="tag">{{ paper.publication_type }}</span>{% endif %}
       {% if paper.fulltext_count %}<span class="tag">全文 {{ paper.fulltext_count }} 个</span>{% endif %}
-      {% if paper.confidence is not none %}<span class="tag">判断置信度 {{ "%.0f"|format(paper.confidence * 100) }}%</span>{% endif %}
+      {% if paper.confidence is not none %}<span class="tag">判断置信度 {{ (paper.confidence * 100 + 0.5)|int }}%</span>{% endif %}
       {% if paper.themes_json and paper.themes_json != '[]' %}<span class="tag">{{ paper.themes_json|list_label }}</span>{% endif %}
       <span class="completion-status {{ paper.interest or 'neutral' }}" data-feedback-status {{ 'hidden' if not paper.interest }}>
         {% if paper.interest == 'interested' %}已完成 · 感兴趣{% elif paper.interest == 'not_interested' %}已完成 · 不感兴趣{% endif %}

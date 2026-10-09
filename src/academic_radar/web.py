@@ -474,8 +474,8 @@ def create_app(config_path: Path) -> FastAPI:
         db=connect(db_path)
         try:
             active=row(db,"SELECT profile_hash FROM profile_versions WHERE status='active'") or {"profile_hash":""}
-            latest="""SELECT * FROM (SELECT s.*,ROW_NUMBER() OVER(PARTITION BY s.identity ORDER BY s.screened_at DESC) rn
-              FROM screenings s WHERE s.profile_hash=?) WHERE rn=1"""
+            latest="""SELECT * FROM (SELECT s.*,ROW_NUMBER() OVER(PARTITION BY s.identity ORDER BY s.screened_at DESC,s.rowid DESC) rn
+              FROM screenings s WHERE s.provider='codex-agent' AND s.profile_hash=?) WHERE rn=1"""
             query=f"""SELECT p.*,s.score,s.relevant,s.reasons,s.confidence,s.themes_json,
               s.reasoning_json,s.score_dimensions_json,s.rubric_version,
               f.interest,f.reason AS feedback_reason,
